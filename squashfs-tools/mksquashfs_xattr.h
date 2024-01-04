@@ -1,10 +1,10 @@
-#ifndef ENDIAN_COMPAT_H
-#define ENDIAN_COMPAT_H
-
+#ifndef MKSQUASHFS_XATTR_H
+#define MKSQUASHFS_XATTR_H
 /*
- * Squashfs
+ * Create a squashfs filesystem.  This is a highly compressed read only
+ * filesystem.
  *
- * Copyright (c) 2021
+ * Copyright (c) 2023
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -21,15 +21,19 @@
  * along with this program; if not, write to the Free Software
  * Foundation, 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  *
- * endian_compat.h
+ * unsquashfs_xattr.h
  */
-#ifndef linux
-#include <sys/types.h>
-#define __BYTE_ORDER BYTE_ORDER
-#define __BIG_ENDIAN BIG_ENDIAN
-#define __LITTLE_ENDIAN LITTLE_ENDIAN
-#else
-#include <endian.h>
-#endif
 
+#ifdef XATTR_SUPPORT
+#ifdef XATTR_OS_SUPPORT
+extern int read_xattrs_from_system(struct dir_ent *dir_ent, char *filename,
+						struct xattr_list **xattrs);
+#else
+static inline int read_xattrs_from_system(struct dir_ent *dir_ent, char *filename,
+						struct xattr_list **xattrs)
+{
+	return 0;
+}
+#endif
+#endif
 #endif
