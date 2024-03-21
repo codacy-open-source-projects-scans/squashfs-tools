@@ -50,11 +50,7 @@
 #include <ctype.h>
 
 #ifdef __linux__
-#include <sys/sysinfo.h>
 #include <sys/sysmacros.h>
-#include <sched.h>
-#else
-#include <sys/sysctl.h>
 #endif
 
 #include "squashfs_fs.h"
@@ -75,6 +71,9 @@
 #include "fnmatch_compat.h"
 #include "tar.h"
 #include "merge_sort.h"
+#include "nprocessors_compat.h"
+#include "memory_compat.h"
+#include "memory.h"
 
 /* Compression options */
 int noF = FALSE;
@@ -176,6 +175,10 @@ int nopad = FALSE;
 
 /* Should Mksquashfs treat normally ignored errors as fatal? */
 int exit_on_error = FALSE;
+
+/* Should Mksquashfs ignore the -mem and -mem-options because the
+ * amount of system memory cannot be obtained? */
+int mem_options_disabled = FALSE;
 
 /* Is filesystem stored at an offset from the start of the block device/file? */
 long long start_offset = 0;
@@ -380,7 +383,6 @@ struct dir_info *scan1_opendir(char *pathname, char *subpath,
 							unsigned int depth);
 static void write_filesystem_tables(struct squashfs_super_block *sBlk);
 unsigned short get_checksum_mem(char *buff, int bytes);
-static void check_usable_phys_mem(int total_mem);
 static void print_summary();
 void write_destination(int fd, long long byte, long long bytes, void *buff);
 static int old_excluded(char *filename, struct stat *buf);
@@ -4854,18 +4856,8 @@ static char *get_filename_from_stdin(char terminator)
 	int used = 0;
 
 	/* Get the maximum pathname size supported on this system */
-	if(path_max == -1) {
-#ifdef PATH_MAX
-		path_max = PATH_MAX;
-#else
-		path_max = pathconf(".", _PC_PATH_MAX);
-		if(path_max <= 0)
-			path_max = 4096;
-#endif
-		/* limit to no more than 64K */
-		if(path_max > 65536)
-			path_max = 65536;
-	}
+	if(path_max == -1)
+		path_max = get_pathmax();
 
 	if(buffer == NULL) {
 		buffer = malloc(4096);
@@ -5195,9 +5187,9 @@ static void add_old_root_entry(char *name, squashfs_inode inode,
 
 
 static void initialise_threads(int readq, int fragq, int bwriteq, int fwriteq,
-	int freelst, char *destination_file)
+	int freelst, char *destination_file, char *command)
 {
-	int i;
+	int i, res;
 	sigset_t sigmask, old_mask;
 	int total_mem = readq;
 	int reader_size;
@@ -5225,7 +5217,11 @@ static void initialise_threads(int readq, int fragq, int bwriteq, int fwriteq,
 		BAD_ERROR("Queue sizes rediculously too large\n");
 	total_mem += fwriteq;
 
-	check_usable_phys_mem(total_mem);
+	if(!mem_options_disabled) {
+		res = check_usable_phys_mem(total_mem, command);
+		if(res != TRUE)
+			EXIT_MKSQUASHFS();
+	}
 
 	/*
 	 * convert from queue size in Mbytes to queue size in
@@ -5272,34 +5268,8 @@ static void initialise_threads(int readq, int fragq, int bwriteq, int fwriteq,
 	if(pthread_sigmask(SIG_BLOCK, &sigmask, &old_mask) != 0)
 		BAD_ERROR("Failed to set signal mask in intialise_threads\n");
 
-	if(processors == -1) {
-#ifdef __linux__
-		cpu_set_t cpu_set;
-		CPU_ZERO(&cpu_set);
-
-		if(sched_getaffinity(0, sizeof cpu_set, &cpu_set) == -1)
-			processors = sysconf(_SC_NPROCESSORS_ONLN);
-		else
-			processors = CPU_COUNT(&cpu_set);
-#else
-		int mib[2];
-		size_t len = sizeof(processors);
-
-		mib[0] = CTL_HW;
-#ifdef HW_AVAILCPU
-		mib[1] = HW_AVAILCPU;
-#else
-		mib[1] = HW_NCPU;
-#endif
-
-		if(sysctl(mib, 2, &processors, &len, NULL, 0) == -1) {
-			ERROR_START("Failed to get number of available "
-				"processors.");
-			ERROR_EXIT("  Defaulting to 1\n");
-			processors = 1;
-		}
-#endif
-	}
+	if(processors == -1)
+		processors = get_nprocessors();
 
 	if(multiply_overflow(processors, 3) ||
 			multiply_overflow(processors * 3, sizeof(pthread_t)))
@@ -6005,87 +5975,6 @@ static int parse_mode(char *arg, mode_t *res)
 }
 
 
-static int get_physical_memory()
-{
-	/*
-	 * Long longs are used here because with PAE, a 32-bit
-	 * machine can have more than 4GB of physical memory
-	 *
-	 * sysconf(_SC_PHYS_PAGES) relies on /proc being mounted.
-	 * If it fails use sysinfo, if that fails return 0
-	 */
-	long long num_pages = sysconf(_SC_PHYS_PAGES);
-	long long page_size = sysconf(_SC_PAGESIZE);
-	int phys_mem;
-
-#ifdef __linux__
-	if(num_pages == -1 || page_size == -1) {
-		struct sysinfo sys;
-		int res = sysinfo(&sys);
-
-		if(res == -1)
-			return 0;
-
-		num_pages = sys.totalram;
-		page_size = sys.mem_unit;
-	}
-#endif
-
-	phys_mem = num_pages * page_size >> 20;
-
-	if(phys_mem < SQUASHFS_LOWMEM)
-		BAD_ERROR("Mksquashfs requires more physical memory than is "
-			"available!\n");
-
-	return phys_mem;
-}
-
-
-static void check_usable_phys_mem(int total_mem)
-{
-	/*
-	 * We want to allow users to use as much of their physical
-	 * memory as they wish.  However, for practical reasons there are
-	 * limits which need to be imposed, to protect users from themselves
-	 * and to prevent people from using Mksquashfs as a DOS attack by using
-	 * all physical memory.   Mksquashfs uses memory to cache data from disk
-	 * to optimise performance.  It is pointless to ask it to use more
-	 * than 75% of physical memory, as this causes thrashing and it is thus
-	 * self-defeating.
-	 */
-	int mem = get_physical_memory();
-
-	mem = (mem >> 1) + (mem >> 2); /* 75% */
-						
-	if(total_mem > mem && mem) {
-		ERROR("Total memory requested is more than 75%% of physical "
-						"memory.\n");
-		ERROR("Mksquashfs uses memory to cache data from disk to "
-						"optimise performance.\n");
-		ERROR("It is pointless to ask it to use more than this amount "
-						"of memory, as this\n");
-		ERROR("causes thrashing and it is thus self-defeating.\n");
-		BAD_ERROR("Requested memory size too large\n");
-	}
-
-	if(sizeof(void *) == 4 && total_mem > 2048) {
-		/*
-		 * If we're running on a kernel with PAE or on a 64-bit kernel,
-		 * then the 75% physical memory limit can still easily exceed
-		 * the addressable memory by this process.
-		 *
-		 * Due to the typical kernel/user-space split (1GB/3GB, or
-		 * 2GB/2GB), we have to conservatively assume the 32-bit
-		 * processes can only address 2-3GB.  So refuse if the user
-		 * tries to allocate more than 2GB.
-		 */
-		ERROR("Total memory requested may exceed maximum "
-				"addressable memory by this process\n");
-		BAD_ERROR("Requested memory size too large\n");
-	}
-}
-
-
 static int get_default_phys_mem()
 {
 	/*
@@ -6101,10 +5990,12 @@ static int get_default_phys_mem()
 
 		ERROR("Warning: Cannot get size of physical memory, probably "
 				"because /proc is missing.\n");
-		ERROR("Warning: Defaulting to minimal use of %d Mbytes, use "
-				"-mem to set a better value,\n", mem);
-		ERROR("Warning: or fix /proc.\n");
-	} else
+		ERROR("Warning: Defaulting to minimal use of %d Mbytes, fix "
+				"/proc to get a better value,\n", mem);
+		mem_options_disabled = TRUE;
+	} else if(mem < SQUASHFS_LOWMEM)
+                BAD_ERROR("Mksquashfs requires more physical memory than is available!\n");
+	else
 		mem /= SQUASHFS_TAKE;
 
 	if(sizeof(void *) == 4 && mem > 640) {
@@ -7166,6 +7057,12 @@ print_sqfstar_compressor_options:
 		} else if(strcmp(argv[i], "-mem") == 0) {
 			long long number;
 
+			if(mem_options_disabled) {
+				ERROR("Ignoring -mem option because amount of "
+					"system memory unknown!\n)");
+				continue;
+			}
+
 			if((++i == dest_index) ||
 					!parse_numberll(argv[i], &number, 1)) {
 				ERROR("%s: -mem missing or invalid mem size\n",
@@ -7194,13 +7091,19 @@ print_sqfstar_compressor_options:
 		} else if(strcmp(argv[i], "-mem-percent") == 0) {
 			int percent, phys_mem;
 
+			if(mem_options_disabled) {
+				ERROR("Ignoring -mem-percent option because amount of "
+					"system memory unknown!\n)");
+				continue;
+			}
+
 			/*
 			 * Percentage of 75% and larger is dealt with later.
 			 * In the same way a fixed mem size if more than 75%
 			 * of memory is dealt with later.
 			 */
 			if((++i == dest_index) ||
-					!parse_number(argv[i], &percent, 1) ||
+					!parse_number(argv[i], &percent, 0) ||
 					(percent < 1)) {
 				ERROR("%s: -mem-percent missing or invalid "
 					"percentage: it should be 1 - 75%\n",
@@ -7212,7 +7115,7 @@ print_sqfstar_compressor_options:
 
 			if(phys_mem == 0) {
 				ERROR("%s: -mem-percent unable to get physical "
-					"memory, use -mem instead\n", argv[0]);
+					"memory\n", argv[0]);
 				exit(1);
 			}
 
@@ -7545,7 +7448,7 @@ print_sqfstar_compressor_options:
 		add_exclude(argv[i]);
 
 	initialise_threads(readq, fragq, bwriteq, fwriteq, !appending,
-		destination_file);
+		destination_file, "Sqfstar");
 
 	res = compressor_init(comp, &stream, SQUASHFS_METADATA_SIZE, 0);
 	if(res)
@@ -8176,6 +8079,12 @@ print_compressor_options:
 		} else if(strcmp(argv[i], "-mem") == 0) {
 			long long number;
 
+			if(mem_options_disabled) {
+				ERROR("Ignoring -mem option because amount of "
+					"system memory unknown!\n)");
+				continue;
+			}
+
 			if((++i == argc) ||
 					!parse_numberll(argv[i], &number, 1)) {
 				ERROR("%s: -mem missing or invalid mem size\n",
@@ -8204,13 +8113,18 @@ print_compressor_options:
 		} else if(strcmp(argv[i], "-mem-percent") == 0) {
 			int percent, phys_mem;
 
+			if(mem_options_disabled) {
+				ERROR("Ignoring -mem-percent option because amount of "
+					"system memory unknown!\n)");
+				continue;
+			}
 			/*
 			 * Percentage of 75% and larger is dealt with later.
 			 * In the same way a fixed mem size if more than 75%
 			 * of memory is dealt with later.
 			 */
 			if((++i == argc) ||
-					!parse_number(argv[i], &percent, 1) ||
+					!parse_number(argv[i], &percent, 0) ||
 					(percent < 1)) {
 				ERROR("%s: -mem-percent missing or invalid "
 					"percentage: it should be 1 - 75%\n",
@@ -8222,7 +8136,7 @@ print_compressor_options:
 
 			if(phys_mem == 0) {
 				ERROR("%s: -mem-percent unable to get physical "
-					"memory, use -mem instead\n", argv[0]);
+					"memory\n", argv[0]);
 				exit(1);
 			}
 
@@ -8685,7 +8599,7 @@ print_compressor_options:
 	}
 
 	initialise_threads(readq, fragq, bwriteq, fwriteq, !appending,
-		destination_file);
+		destination_file, "Mksquashfs");
 
 	res = compressor_init(comp, &stream, SQUASHFS_METADATA_SIZE, 0);
 	if(res)

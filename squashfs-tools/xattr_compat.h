@@ -1,10 +1,9 @@
-#ifndef DATE_H
-#define DATE_H
+#ifndef XATTR_COMPAT_H
+#define XATTR_COMPAT_H
 /*
- * Create a squashfs filesystem.  This is a highly compressed read only
- * filesystem.
+ * Squashfs
  *
- * Copyright (c) 2023
+ * Copyright (c) 2024
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -21,11 +20,17 @@
  * along with this program; if not, write to the Free Software
  * Foundation, 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  *
- * date.h
+ * xattr_compat.h
  */
 
-extern long long read_bytes(int, void *, long long);
+#ifdef XATTR_NOFOLLOW /* Apple's xattrs */
+#define lsetxattr(path_, name_, val_, sz_, flags_) \
+	setxattr(path_, name_, val_, sz_, 0, flags_ | XATTR_NOFOLLOW)
 
-#define TRUE 1
-#define FALSE 0
+#define llistxattr(path_, buf_, sz_) \
+	listxattr(path_, buf_, sz_, XATTR_NOFOLLOW)
+
+#define lgetxattr(path_, name_, val_, sz_) \
+	getxattr(path_, name_, val_, sz_, 0, XATTR_NOFOLLOW)
+#endif
 #endif

@@ -1,10 +1,9 @@
-#ifndef DATE_H
-#define DATE_H
+#ifndef MEMORY_H
+#define MEMORY_H
 /*
- * Create a squashfs filesystem.  This is a highly compressed read only
- * filesystem.
+ * Squashfs
  *
- * Copyright (c) 2023
+ * Copyright (c) 2024
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -21,10 +20,10 @@
  * along with this program; if not, write to the Free Software
  * Foundation, 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  *
- * date.h
+ * memory.h
  */
 
-extern long long read_bytes(int, void *, long long);
+extern int check_usable_phys_mem(int total_mem, char *name);
 
 #define TRUE 1
 #define FALSE 0

@@ -31,13 +31,13 @@
 #include "unsquashfs_info.h"
 #include "stdarg.h"
 #include "fnmatch_compat.h"
+#include "time_compat.h"
+#include "nprocessors_compat.h"
+#include "memory_compat.h"
+#include "memory.h"
 
 #ifdef __linux__
-#include <sched.h>
-#include <sys/sysinfo.h>
 #include <sys/sysmacros.h>
-#else
-#include <sys/sysctl.h>
 #endif
 
 #include <sys/types.h>
@@ -1231,16 +1231,7 @@ int create_inode(char *pathname, struct inode *i)
 			file_count ++;
 			break;
 		case SQUASHFS_SYMLINK_TYPE:
-		case SQUASHFS_LSYMLINK_TYPE: {
-#ifdef __OpenBSD__
-			struct timespec times[2] = {
-#else
-			struct timeval times[2] = {
-#endif
-				{ i->time, 0 },
-				{ i->time, 0 }
-			};
-
+		case SQUASHFS_LSYMLINK_TYPE:
 			TRACE("create_inode: symlink, symlink_size %lld\n",
 				i->data);
 
@@ -1255,11 +1246,7 @@ int create_inode(char *pathname, struct inode *i)
 				goto failed;
 			}
 
-#ifdef __OpenBSD__
-			res = utimensat(AT_FDCWD, pathname, times, AT_SYMLINK_NOFOLLOW);
-#else
-			res = lutimes(pathname, times);
-#endif
+			res = set_timestamp(pathname, i);
 			if(res == -1) {
 				EXIT_UNSQUASH_STRICT("create_inode: failed to"
 					" set time on %s, because %s\n",
@@ -1286,7 +1273,6 @@ int create_inode(char *pathname, struct inode *i)
 
 			sym_count ++;
 			break;
-		}
  		case SQUASHFS_BLKDEV_TYPE:
 	 	case SQUASHFS_CHRDEV_TYPE:
  		case SQUASHFS_LBLKDEV_TYPE:
@@ -2774,33 +2760,8 @@ void initialise_threads(int fragment_buffer_size, int data_buffer_size, int cat_
 			EXIT_UNSQUASH("Failed to set signal mask in initialise_threads\n");
 	}
 
-	if(processors == -1) {
-#ifdef __linux__
-		cpu_set_t cpu_set;
-		CPU_ZERO(&cpu_set);
-
-		if(sched_getaffinity(0, sizeof cpu_set, &cpu_set) == -1)
-			processors = sysconf(_SC_NPROCESSORS_ONLN);
-		else
-			processors = CPU_COUNT(&cpu_set);
-#else
-		int mib[2];
-		size_t len = sizeof(processors);
-
-		mib[0] = CTL_HW;
-#ifdef HW_AVAILCPU
-		mib[1] = HW_AVAILCPU;
-#else
-		mib[1] = HW_NCPU;
-#endif
-
-		if(sysctl(mib, 2, &processors, &len, NULL, 0) == -1) {
-			ERROR("Failed to get number of available processors.  "
-				"Defaulting to 1\n");
-			processors = 1;
-		}
-#endif
-	}
+	if(processors == -1)
+		processors = get_nprocessors();
 
 	if(add_overflow(processors, 3) ||
 			multiply_overflow(processors + 3, sizeof(pthread_t)))
@@ -3870,6 +3831,11 @@ static void print_cat_options(FILE *stream, char *name)
 	fprintf(stream, "\t-p[rocessors] <number>\tuse <number> processors.  ");
 	fprintf(stream, "By default will use\n");
 	fprintf(stream, "\t\t\t\tthe number of processors available\n");
+	fprintf(stream, "\t-mem <size>\t\tuse <size> physical memory for ");
+	fprintf(stream, "caches.  Use K, M\n\t\t\t\tor G to specify Kbytes,");
+	fprintf(stream, " Mbytes or Gbytes\n\t\t\t\trespectively.  Default 512 Mbytes\n");
+	fprintf(stream, "\t-mem-percent <percent>\tuse <percent> physical ");
+	fprintf(stream, "memory for caches.\n");
 	fprintf(stream, "\t-o[ffset] <bytes>\tskip <bytes> at start of FILESYSTEM.\n");
 	fprintf(stream, "\t\t\t\tOptionally a suffix of K, M or G can be given to\n");
 	fprintf(stream, "\t\t\t\tspecify Kbytes, Mbytes or Gbytes respectively\n");
@@ -3879,10 +3845,6 @@ static void print_cat_options(FILE *stream, char *name)
 	fprintf(stream, "\t-st[rict-errors]\ttreat all errors as fatal\n");
 	fprintf(stream, "\t-no-exit[-code]\t\tdon't set exit code (to nonzero) on ");
 	fprintf(stream, "non-fatal\n\t\t\t\terrors\n");
-	fprintf(stream, "\t-da[ta-queue] <size>\tset data queue to <size> Mbytes.  ");
-	fprintf(stream, "Default %d\n\t\t\t\tMbytes\n", DATA_BUFFER_DEFAULT);
-	fprintf(stream, "\t-fr[ag-queue] <size>\tset fragment queue to <size> Mbytes.  ");
-	fprintf(stream, "Default\n\t\t\t\t%d Mbytes\n", FRAGMENT_BUFFER_DEFAULT);
 	fprintf(stream, "\t-no-wild[cards]\t\tdo not use wildcard matching in filenames\n");
 	fprintf(stream, "\t-r[egex]\t\ttreat filenames as POSIX regular ");
 	fprintf(stream, "expressions\n");
@@ -4008,6 +3970,11 @@ static void print_options(FILE *stream, char *name)
 	fprintf(stream, "\t-p[rocessors] <number>\tuse <number> processors.  ");
 	fprintf(stream, "By default will use\n");
 	fprintf(stream, "\t\t\t\tthe number of processors available\n");
+	fprintf(stream, "\t-mem <size>\t\tuse <size> physical memory for ");
+	fprintf(stream, "caches.  Use K, M\n\t\t\t\tor G to specify Kbytes,");
+	fprintf(stream, " Mbytes or Gbytes\n\t\t\t\trespectively.  Default 512 Mbytes\n");
+	fprintf(stream, "\t-mem-percent <percent>\tuse <percent> physical ");
+	fprintf(stream, "memory for caches.\n");
 	fprintf(stream, "\t-q[uiet]\t\tno verbose output\n");
 	fprintf(stream, "\t-n[o-progress]\t\tdo not display the progress ");
 	fprintf(stream, "bar\n");
@@ -4019,12 +3986,6 @@ static void print_options(FILE *stream, char *name)
 	fprintf(stream, "\t-st[rict-errors]\ttreat all errors as fatal\n");
 	fprintf(stream, "\t-no-exit[-code]\t\tdo not set exit code (to ");
 	fprintf(stream, "nonzero) on non-fatal\n\t\t\t\terrors\n");
-	fprintf(stream, "\t-da[ta-queue] <size>\tset data queue to <size> ");
-	fprintf(stream, "Mbytes.  Default ");
-	fprintf(stream, "%d\n\t\t\t\tMbytes\n", DATA_BUFFER_DEFAULT);
-	fprintf(stream, "\t-fr[ag-queue] <size>\tset fragment queue to ");
-	fprintf(stream, "<size> Mbytes.  Default\n\t\t\t\t");
-	fprintf(stream, "%d Mbytes\n", FRAGMENT_BUFFER_DEFAULT);
 	fprintf(stream, "\nMiscellaneous options:\n");
 	fprintf(stream, "\t-h[elp]\t\t\toutput this options text to stdout\n");
 	fprintf(stream, "\t-o[ffset] <bytes>\tskip <bytes> at start of FILESYSTEM.  ");
@@ -4121,6 +4082,74 @@ int parse_cat_options(int argc, char *argv[])
 					argv[0]);
 				exit(1);
 			}
+		} else if(strcmp(argv[i], "-mem") == 0) {
+			long long number;
+
+			if((++i == argc) ||
+					!parse_numberll(argv[i], &number, 1)) {
+				ERROR("%s: -mem missing or invalid mem size\n",
+					 argv[0]);
+				exit(1);
+			}
+
+			/*
+			 * convert from bytes to Mbytes, ensuring the value
+			 * does not overflow a signed int
+			 */
+			if(number >= (1LL << 51)) {
+				ERROR("%s: -mem invalid mem size\n", argv[0]);
+				exit(1);
+			}
+
+			number = number / 1048576;
+			if(number < 2) {
+				ERROR("%s: -mem should be 2 Mbytes or "
+					"larger\n", argv[0]);
+				exit(1);
+			}
+			data_buffer_size = number / 2;
+			fragment_buffer_size = number / 2;
+		} else if(strcmp(argv[i], "-mem-percent") == 0) {
+			int percent, phys_mem;
+
+			/*
+			 * Percentage of 75% and larger is dealt with later.
+			 * In the same way a fixed mem size if more than 75%
+			 * of memory is dealt with later.
+			 */
+			if((++i == argc) ||
+					!parse_number(argv[i], &percent) ||
+					(percent < 1)) {
+				ERROR("%s: -mem-percent missing or invalid "
+					"percentage: it should be 1 - 75%\n",
+					 argv[0]);
+				exit(1);
+			}
+
+			phys_mem = get_physical_memory();
+
+			if(phys_mem == 0) {
+				ERROR("%s: -mem-percent unable to get physical "
+					"memory\n", argv[0]);
+				exit(1);
+			}
+
+			if(multiply_overflow(phys_mem, percent)) {
+				ERROR("%s: -mem-percent requested phys mem too "
+					"large\n", argv[0]);
+				exit(1);
+			}
+
+			phys_mem = phys_mem * percent / 100;
+
+			if(phys_mem < 2) {
+				ERROR("%s: -mem-percent mem too small, should "
+					"be 2 Mbytes or larger\n", argv[0]);
+				exit(1);
+			}
+
+			data_buffer_size = phys_mem / 2;
+			fragment_buffer_size = phys_mem / 2;
 		} else if(strcmp(argv[i], "-data-queue") == 0 ||
 					 strcmp(argv[i], "-da") == 0) {
 			if((++i == argc) ||
@@ -4340,6 +4369,74 @@ int parse_options(int argc, char *argv[])
 					"levels\n", argv[0]);
 				exit(1);
 			}
+		} else if(strcmp(argv[i], "-mem") == 0) {
+			long long number;
+
+			if((++i == argc) ||
+					!parse_numberll(argv[i], &number, 1)) {
+				ERROR("%s: -mem missing or invalid mem size\n",
+					 argv[0]);
+				exit(1);
+			}
+
+			/*
+			 * convert from bytes to Mbytes, ensuring the value
+			 * does not overflow a signed int
+			 */
+			if(number >= (1LL << 51)) {
+				ERROR("%s: -mem invalid mem size\n", argv[0]);
+				exit(1);
+			}
+
+			number = number / 1048576;
+			if(number < 2) {
+				ERROR("%s: -mem should be 2 Mbytes or "
+					"larger\n", argv[0]);
+				exit(1);
+			}
+			data_buffer_size = number / 2;
+			fragment_buffer_size = number / 2;
+		} else if(strcmp(argv[i], "-mem-percent") == 0) {
+			int percent, phys_mem;
+
+			/*
+			 * Percentage of 75% and larger is dealt with later.
+			 * In the same way a fixed mem size if more than 75%
+			 * of memory is dealt with later.
+			 */
+			if((++i == argc) ||
+					!parse_number(argv[i], &percent) ||
+					(percent < 1)) {
+				ERROR("%s: -mem-percent missing or invalid "
+					"percentage: it should be 1 - 75%\n",
+					 argv[0]);
+				exit(1);
+			}
+
+			phys_mem = get_physical_memory();
+
+			if(phys_mem == 0) {
+				ERROR("%s: -mem-percent unable to get physical "
+					"memory\n", argv[0]);
+				exit(1);
+			}
+
+			if(multiply_overflow(phys_mem, percent)) {
+				ERROR("%s: -mem-percent requested phys mem too "
+					"large\n", argv[0]);
+				exit(1);
+			}
+
+			phys_mem = phys_mem * percent / 100;
+
+			if(phys_mem < 2) {
+				ERROR("%s: -mem-percent mem too small, should "
+					"be 2 Mbytes or larger\n", argv[0]);
+				exit(1);
+			}
+
+			data_buffer_size = phys_mem / 2;
+			fragment_buffer_size = phys_mem / 2;
 		} else if(strcmp(argv[i], "-data-queue") == 0 ||
 					 strcmp(argv[i], "-da") == 0) {
 			if((++i == argc) ||
@@ -4567,6 +4664,18 @@ int main(int argc, char *argv[])
 	if(block_size != (1 << block_log))
 		EXIT_UNSQUASH("Block size and block_log do not match."
 			"  File system is corrupt.\n");
+
+	/*
+	 * Check the requested queue sizes do not exceed available
+	 * system memory
+	 */
+	if(add_overflow(data_buffer_size, fragment_buffer_size))
+		EXIT_UNSQUASH("Combined Data and Fragment queue sizes are too large\n");
+
+	res = check_usable_phys_mem(data_buffer_size + fragment_buffer_size,
+		strcmp(command, "sqfscat") == 0 ? "Sqfscat" : "Unsquashfs");
+	if(res == FALSE)
+		exit(1);
 
 	/*
 	 * convert from queue size in Mbytes to queue size in

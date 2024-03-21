@@ -1,10 +1,9 @@
-#ifndef DATE_H
-#define DATE_H
+#ifndef TIME_COMPAT_H
+#define TIME_COMPAT_H
 /*
- * Create a squashfs filesystem.  This is a highly compressed read only
- * filesystem.
+ * Squashfs
  *
- * Copyright (c) 2023
+ * Copyright (c) 2024
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -21,11 +20,28 @@
  * along with this program; if not, write to the Free Software
  * Foundation, 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  *
- * date.h
+ * time_compat.h
  */
 
-extern long long read_bytes(int, void *, long long);
+#ifdef __OpenBSD__
+static inline int set_timestamp(char *pathname, struct inode *i)
+{
+	struct timespec times[2] = {
+		{ i->time, 0 },
+		{ i->time, 0 }
+	};
 
-#define TRUE 1
-#define FALSE 0
+	return utimensat(AT_FDCWD, pathname, times, AT_SYMLINK_NOFOLLOW);
+}
+#else
+static inline int set_timestamp(char *pathname, struct inode *i)
+{
+	struct timeval times[2] = {
+		{ i->time, 0 },
+		{ i->time, 0 }
+	};
+
+	return lutimes(pathname, times);
+}
+#endif
 #endif
