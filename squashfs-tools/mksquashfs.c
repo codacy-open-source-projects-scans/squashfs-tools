@@ -353,7 +353,7 @@ char *sqfstar_option_table[] = { "comp", "b", "mkfs-time", "fstime", "all-time",
 	"default-mode", "default-uid", "default-gid", "mem-percent", NULL
 };
 
-static char *read_from_disk(long long start, unsigned int avail_bytes);
+static char *read_from_disk(long long start, unsigned int avail_bytes, int buff);
 static void add_old_root_entry(char *name, squashfs_inode inode,
 	unsigned int inode_number, int type);
 static struct file_info *duplicate(int *dup, int *block_dup,
@@ -501,7 +501,7 @@ void restorefs()
 }
 
 
-void sighandler(int arg)
+static void sighandler(int arg)
 {
 	EXIT_MKSQUASHFS();
 }
@@ -637,7 +637,7 @@ int read_fs_bytes(int fd, long long byte, long long bytes, void *buff)
 }
 
 
-int write_bytes(int fd, void *buff, long long bytes)
+static int write_bytes(int fd, void *buff, long long bytes)
 {
 	long long res, count;
 
@@ -1498,7 +1498,7 @@ again:
 		if(compressed_buffer)
 			data = compressed_buffer->data;
 		else {
-			data = read_from_disk(start_block, size);
+			data = read_from_disk(start_block, size, 0);
 			if(data == NULL) {
 				ERROR("Failed to read fragment from output"
 					" filesystem\n");
@@ -1808,29 +1808,23 @@ static long long write_fragment_table()
 }
 
 
-char read_from_file_buffer[SQUASHFS_FILE_MAX_SIZE];
-static char *read_from_disk(long long start, unsigned int avail_bytes)
+static char *read_from_disk(long long start, unsigned int avail_bytes, int buff)
 {
 	int res;
+	static char *buffer1 = NULL, *buffer2 = NULL;
+	char **buffer = buff == 0 ? &buffer1 : &buffer2;
 
-	res = read_fs_bytes(fd, start, avail_bytes, read_from_file_buffer);
+	if(*buffer == NULL) {
+		*buffer = malloc(block_size);
+		if(*buffer == NULL)
+			MEM_ERROR();
+	}
+
+	res = read_fs_bytes(fd, start, avail_bytes, *buffer);
 	if(res == 0)
 		return NULL;
 
-	return read_from_file_buffer;
-}
-
-
-char read_from_file_buffer2[SQUASHFS_FILE_MAX_SIZE];
-static char *read_from_disk2(long long start, unsigned int avail_bytes)
-{
-	int res;
-
-	res = read_fs_bytes(fd, start, avail_bytes, read_from_file_buffer2);
-	if(res == 0)
-		return NULL;
-
-	return read_from_file_buffer2;
+	return *buffer;
 }
 
 
@@ -1868,7 +1862,7 @@ static unsigned short get_checksum_disk(long long start, long long l,
 				chksum);
 			cache_block_put(write_buffer);
 		} else {
-			void *data = read_from_disk(start, bytes);
+			void *data = read_from_disk(start, bytes, 0);
 			if(data == NULL) {	
 				ERROR("Failed to checksum data from output"
 					" filesystem\n");
@@ -2269,7 +2263,7 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 				if(target_buffer)
 					target_data = target_buffer->data;
 				else {
-					target_data = read_from_disk(target_start, size);
+					target_data = read_from_disk(target_start, size, 0);
 					if(target_data == NULL) {
 						ERROR("Failed to read data from"
 							" output filesystem\n");
@@ -2288,7 +2282,7 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 				if(dup_buffer)
 					dup_data = dup_buffer->data;
 				else {
-					dup_data = read_from_disk2(dup_start, size);
+					dup_data = read_from_disk(dup_start, size, 1);
 					if(dup_data == NULL) {
 						ERROR("Failed to read data from"
 							" output filesystem\n");
@@ -3659,7 +3653,7 @@ static squashfs_inode scan_encomp(int progress)
 }
 
 
-squashfs_inode dir_scan(int directory, int progress)
+static squashfs_inode dir_scan(int directory, int progress)
 {
 	int single = !keep_as_directory && source == 1;
 
@@ -5846,8 +5840,11 @@ static int _parse_numberll(char *start, long long *res, int size, int base)
 	if(number < 0)
 		return 0;
 
-	if(size) {
+	if(size == 1) {
 		/*
+		 * Allow a multiplier of  k, K, m, M, g, G optionally
+		 * followed by bytes.
+		 *
 		 * Check for multiplier and trailing junk.
 		 * But first check that a number exists before the
 		 * multiplier
@@ -5901,6 +5898,17 @@ static int _parse_numberll(char *start, long long *res, int size, int base)
 			/* trailing junk after number */
 			return 0;
 		}
+	} else if(size == 2) {
+		/*
+		 * Allow number to be followed by %
+		 * But first check that a number exists before any possible %
+		 */
+		if(end == start)
+			return 0;
+
+		if(end[0] != '\0' && (end[0] != '%' || end[1] != '\0'))
+			/* trailing junk after number */
+			return 0;
 	} else if(end[0] != '\0')
 		/* trailing junk after number */
 		return 0;
@@ -6274,17 +6282,20 @@ static void print_options(FILE *stream, char *name, int total_mem)
 	fprintf(stream, "This option sets the default\n\t\t\tdirectory ");
 	fprintf(stream, "permissions to octal <mode>, rather than 0755.\n");
 	fprintf(stream, "\t\t\tThis also sets the root inode mode\n");
-	fprintf(stream, "-default-uid <uid>\ttar files often do not store ");
+	fprintf(stream, "-default-uid <value>\ttar files often do not store ");
 	fprintf(stream, "uids for intermediate\n\t\t\tdirectories.  This ");
 	fprintf(stream, "option sets the default directory\n\t\t\towner to ");
-	fprintf(stream, "<uid>, rather than the user running Mksquashfs.\n");
-	fprintf(stream, "\t\t\tThis also sets the root inode uid\n");
-	fprintf(stream, "-default-gid <gid>\ttar files often do not store ");
+	fprintf(stream, "<value>, rather than the user running\n\t\t\t");
+	fprintf(stream, "Mksquashfs.  <value> can be either an integer uid ");
+	fprintf(stream, "or\n\t\t\tuser name.  This also sets the root ");
+	fprintf(stream, "inode uid\n");
+	fprintf(stream, "-default-gid <value>\ttar files often do not store ");
 	fprintf(stream, "gids for intermediate\n\t\t\tdirectories.  This ");
 	fprintf(stream, "option sets the default directory\n\t\t\tgroup to ");
-	fprintf(stream, "<gid>, rather than the group of the user\n");
-	fprintf(stream, "\t\t\trunning Mksquashfs.  This also sets the root ");
-	fprintf(stream, "inode gid\n");
+	fprintf(stream, "<value>, rather than the group of the user\n");
+	fprintf(stream, "\t\t\trunning Mksquashfs.  <value> can be either an ");
+	fprintf(stream, "integer\n\t\t\tuid or group name.  This also sets ");
+	fprintf(stream, "the root inode gid\n");
 	fprintf(stream, "-ignore-zeros\t\tallow tar files to be concatenated ");
 	fprintf(stream, "together and fed to\n\t\t\tMksquashfs.  Normally a ");
 	fprintf(stream, "tarfile has two consecutive 512\n\t\t\tbyte blocks ");
@@ -6341,6 +6352,11 @@ static void print_options(FILE *stream, char *name, int total_mem)
 	fprintf(stream, "\t\t\tSOURCE_DATE_EPOCH.  See\n");
 	fprintf(stream, "\t\t\thttps://reproducible-builds.org/docs/source-date-epoch/\n");
 	fprintf(stream, "\t\t\tfor more information\n");
+	fprintf(stream, "\nExit status:\n");
+	fprintf(stream, "  0\tMksquashfs successfully generated a filesystem.\n");
+	fprintf(stream, "  1\tFatal errors occurred, Mksquashfs aborted and ");
+	fprintf(stream, "did not generate a\n\tfilesystem (or update if ");
+	fprintf(stream, "appending).\n");
 	fprintf(stream, "\nSee also:");
 	fprintf(stream, "\nThe README for the Squashfs-tools 4.6.1 release, ");
 	fprintf(stream, "describing the new features can be\n");
@@ -6424,17 +6440,26 @@ static void print_sqfstar_options(FILE *stream, char *name, int total_mem)
 	fprintf(stream, "This option sets the default\n\t\t\tdirectory ");
 	fprintf(stream, "permissions to octal <mode>, rather than 0755.\n");
 	fprintf(stream, "\t\t\tThis also sets the root inode mode\n");
-	fprintf(stream, "-default-uid <uid>\ttar files often do not store ");
+	fprintf(stream, "-default-uid <value>\ttar files often do not store ");
 	fprintf(stream, "uids for intermediate\n\t\t\tdirectories.  This ");
 	fprintf(stream, "option sets the default directory\n\t\t\towner to ");
-	fprintf(stream, "<uid>, rather than the user running Sqfstar.\n");
-	fprintf(stream, "\t\t\tThis also sets the root inode uid\n");
-	fprintf(stream, "-default-gid <gid>\ttar files often do not store ");
+	fprintf(stream, "<value>, rather than the user running Sqfstar.\n");
+	fprintf(stream, "\t\t\t<value> can be either an integer uid ");
+	fprintf(stream, "or user name.  This\n\t\t\talso sets the root ");
+	fprintf(stream, "inode uid\n");
+
+
+	fprintf(stream, "-default-gid <value>\ttar files often do not store ");
 	fprintf(stream, "gids for intermediate\n\t\t\tdirectories.  This ");
 	fprintf(stream, "option sets the default directory\n\t\t\tgroup to ");
-	fprintf(stream, "<gid>, rather than the group of the user\n");
-	fprintf(stream, "\t\t\trunning Sqfstar.  This also sets the root ");
-	fprintf(stream, "inode gid\n");
+	fprintf(stream, "<value>, rather than the group of the user\n");
+	fprintf(stream, "\t\t\trunning Sqfstar.  <value> can be either an ");
+	fprintf(stream, "integer uid\n\t\t\tor group name.  This also sets ");
+	fprintf(stream, "the root inode gid\n");
+
+
+
+
 	fprintf(stream, "-pseudo-override\tmake pseudo file uids and gids ");
 	fprintf(stream, "override -all-root,\n\t\t\t-force-uid and ");
 	fprintf(stream, "-force-gid options\n");
@@ -6568,6 +6593,10 @@ static void print_sqfstar_options(FILE *stream, char *name, int total_mem)
 	fprintf(stream, "\t\t\tSOURCE_DATE_EPOCH.  See\n");
 	fprintf(stream, "\t\t\thttps://reproducible-builds.org/docs/source-date-epoch/\n");
 	fprintf(stream, "\t\t\tfor more information\n");
+	fprintf(stream, "\nExit status:\n");
+	fprintf(stream, "  0\tSqfstar successfully generated a filesystem.\n");
+	fprintf(stream, "  1\tFatal errors occurred, Sqfstar aborted and ");
+	fprintf(stream, "did not generate a\n\tfilesystem.\n");
 	fprintf(stream, "\nSee also:\n");
 	fprintf(stream, "The README for the Squashfs-tools 4.6.1 release, ");
 	fprintf(stream, "describing the new features can be\n");
@@ -6673,7 +6702,7 @@ static void print_summary()
 }
 
 
-int option_with_arg(char *string, char *table[])
+static int option_with_arg(char *string, char *table[])
 {
 	int i;
 
@@ -6741,7 +6770,7 @@ static int get_gid_from_arg(char *arg, unsigned int *gid)
 }
 
 
-int sqfstar(int argc, char *argv[])
+static int sqfstar(int argc, char *argv[])
 {
 	struct stat buf;
 	int res, i;
@@ -6962,17 +6991,39 @@ int sqfstar(int argc, char *argv[])
 			root_mode = default_mode;
 			default_mode_opt = root_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-uid") == 0) {
-			if((++i == dest_index) || !parse_num_unsigned(argv[i], &default_uid)) {
-				ERROR("%s: -default-uid missing or invalid uid\n",
+			if(++i == dest_index) {
+				ERROR("%s: -default-uid missing uid or user name\n",
 					argv[0]);
+				exit(1);
+			}
+
+			res = get_uid_from_arg(argv[i], &default_uid);
+			if(res) {
+				if(res == -2)
+					ERROR("%s: -default-uid uid out of range\n",
+						argv[0]);
+				else
+					ERROR("%s: -default-uid invalid uid or "
+						"unknown user name\n", argv[0]);
 				exit(1);
 			}
 			root_uid = default_uid;
 			default_uid_opt = root_uid_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-gid") == 0) {
-			if((++i == dest_index) || !parse_num_unsigned(argv[i], &default_gid)) {
-				ERROR("%s: -default-gid missing or invalid gid\n",
+			if(++i == dest_index) {
+				ERROR("%s: -default-gid missing gid or group name\n",
 					argv[0]);
+				exit(1);
+			}
+
+			res = get_gid_from_arg(argv[i], &default_gid);
+			if(res) {
+				if(res == -2)
+					ERROR("%s: -default-gid gid out of range"
+						"\n", argv[0]);
+				else
+					ERROR("%s: -default-gid invalid gid or "
+						"unknown group name\n", argv[0]);
 				exit(1);
 			}
 			root_gid = default_gid;
@@ -7103,7 +7154,7 @@ print_sqfstar_compressor_options:
 			 * of memory is dealt with later.
 			 */
 			if((++i == dest_index) ||
-					!parse_number(argv[i], &percent, 0) ||
+					!parse_number(argv[i], &percent, 2) ||
 					(percent < 1)) {
 				ERROR("%s: -mem-percent missing or invalid "
 					"percentage: it should be 1 - 75%\n",
@@ -7851,17 +7902,39 @@ int main(int argc, char *argv[])
 			root_mode = default_mode;
 			default_mode_opt = root_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-uid") == 0) {
-			if((++i == argc) || !parse_num_unsigned(argv[i], &default_uid)) {
-				ERROR("%s: -default-uid missing or invalid uid\n",
+			if(++i == argc) {
+				ERROR("%s: -default-uid missing uid or user name\n",
 					argv[0]);
+				exit(1);
+			}
+
+			res = get_uid_from_arg(argv[i], &default_uid);
+			if(res) {
+				if(res == -2)
+					ERROR("%s: -default-uid uid out of range\n",
+						argv[0]);
+				else
+					ERROR("%s: -default-uid invalid uid or "
+						"unknown user name\n", argv[0]);
 				exit(1);
 			}
 			root_uid = default_uid;
 			default_uid_opt = root_uid_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-gid") == 0) {
-			if((++i == argc) || !parse_num_unsigned(argv[i], &default_gid)) {
-				ERROR("%s: -default-gid missing or invalid gid\n",
+			if(++i == argc) {
+				ERROR("%s: -default-gid missing gid or group name\n",
 					argv[0]);
+				exit(1);
+			}
+
+			res = get_gid_from_arg(argv[i], &default_gid);
+			if(res) {
+				if(res == -2)
+					ERROR("%s: -default-gid gid out of range"
+						"\n", argv[0]);
+				else
+					ERROR("%s: -default-gid invalid gid or "
+						"unknown group name\n", argv[0]);
 				exit(1);
 			}
 			root_gid = default_gid;
@@ -8124,7 +8197,7 @@ print_compressor_options:
 			 * of memory is dealt with later.
 			 */
 			if((++i == argc) ||
-					!parse_number(argv[i], &percent, 0) ||
+					!parse_number(argv[i], &percent, 2) ||
 					(percent < 1)) {
 				ERROR("%s: -mem-percent missing or invalid "
 					"percentage: it should be 1 - 75%\n",

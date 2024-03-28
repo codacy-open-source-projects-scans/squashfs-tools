@@ -47,7 +47,6 @@
 
 extern int silent;
 int ignore_zeros = FALSE;
-extern int ignore_zeros;
 int default_uid_opt = FALSE;
 unsigned int default_uid;
 int default_gid_opt = FALSE;
@@ -522,7 +521,7 @@ static void put_file_buffer(struct file_buffer *file_buffer)
 }
 
 
-int sparse_reader(struct tar_file *file, long long cur_offset, char *dest, int bytes, long long *off)
+static int sparse_reader(struct tar_file *file, long long cur_offset, char *dest, int bytes, long long *off)
 {
 	static int cur;
 	static long long offset;

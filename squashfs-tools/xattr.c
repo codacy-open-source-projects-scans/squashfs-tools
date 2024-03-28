@@ -383,7 +383,7 @@ long long write_xattrs()
 }
 
 
-void free_xattr_list(int xattrs, struct xattr_list *xattr_list)
+static void free_xattr_list(int xattrs, struct xattr_list *xattr_list)
 {
 	int i;
 
@@ -396,7 +396,7 @@ void free_xattr_list(int xattrs, struct xattr_list *xattr_list)
 }
 
 
-int generate_xattrs(int xattrs, struct xattr_list *xattr_list)
+static int generate_xattrs(int xattrs, struct xattr_list *xattr_list)
 {
 	int total_size, i;
 	int xattr_value_max;
@@ -887,7 +887,7 @@ failed:
 }
 
 
-char *hex_decode(char *source, int size, int *bytes)
+static char *hex_decode(char *source, int size, int *bytes)
 {
 	char *dest;
 	unsigned char *dest_ptr, *source_ptr = (unsigned char *) source;
@@ -928,7 +928,7 @@ failed:
 }
 
 
-int decode_octal(unsigned char *ptr)
+static int decode_octal(unsigned char *ptr)
 {
 	int i, output = 0;
 
@@ -945,7 +945,7 @@ int decode_octal(unsigned char *ptr)
 }
 
 
-char *text_decode(char *source, int *bytes)
+static char *text_decode(char *source, int *bytes)
 {
 	unsigned char *dest, *dest_ptr, *ptr = (unsigned char *) source;
 	int size = 0;
@@ -1051,13 +1051,13 @@ struct xattr_add *xattr_parse(char *str, char *pre, char *option)
 		}
 
 		entry->value = base64_decode(value, strlen(value), &size);
-		entry->vsize = size;
-
 		if(entry->value == NULL) {
 			ERROR("%sinvalid argument %s in %s option, because "
 				"invalid base64 value\n", pre, str, option);
 			goto failed2;
 		}
+
+		entry->vsize = size;
 		break;
 
 	case PREFIX_HEX_0X:
@@ -1071,13 +1071,13 @@ struct xattr_add *xattr_parse(char *str, char *pre, char *option)
 		}
 
 		entry->value = hex_decode(value, strlen(value), &size);
-		entry->vsize = size;
-
 		if(entry->value == NULL) {
 			ERROR("%sinvalid argument %s in %s option, because "
 				"invalid hexidecimal value\n", pre, str, option);
 			goto failed2;
 		}
+
+		entry->vsize = size;
 		break;
 
 	case PREFIX_TEXT_0T:
@@ -1091,13 +1091,13 @@ struct xattr_add *xattr_parse(char *str, char *pre, char *option)
 		}
 
 		entry->value = text_decode(value, &size);
-		entry->vsize = size;
-
 		if(entry->value == NULL) {
 			ERROR("%sinvalid argument %s in %s option, because "
 				"invalid text value\n", pre, str, option);
 			goto failed2;
 		}
+
+		entry->vsize = size;
 		break;
 
 	case PREFIX_BINARY_0B:
