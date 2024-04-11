@@ -152,6 +152,10 @@ int tarfile = FALSE;
 /* Is Mksquashfs reading a pseudo file from stdin? */
 int pseudo_stdin = FALSE;
 
+/* has a default Pseudo file directory been defined for cases where
+ * a directory in the pathname is missing? */
+struct pseudo_dev *pseudo_dir = NULL;
+
 /* Is Mksquashfs storing Xattrs, or excluding/including xattrs using regexs? */
 int no_xattrs = XATTR_DEF;
 unsigned int xattr_bytes = 0, total_xattr_bytes = 0;
@@ -343,14 +347,15 @@ char *option_table[] = { "comp", "b", "mkfs-time", "fstime", "all-time",
 	"vaf", "taf", "faf", "read-queue", "write-queue", "fragment-queue",
 	"root-time", "root-uid", "root-gid", "xattrs-exclude", "xattrs-include",
 	"xattrs-add", "default-mode", "default-uid", "default-gid",
-	"mem-percent", NULL
+	"mem-percent", "-pd", "-pseudo-dir", NULL
 };
 
 char *sqfstar_option_table[] = { "comp", "b", "mkfs-time", "fstime", "all-time",
 	"root-mode", "force-uid", "force-gid", "throttle", "limit",
 	"processors", "mem", "offset", "o", "root-time", "root-uid",
 	"root-gid", "xattrs-exclude", "xattrs-include", "xattrs-add", "p", "pf",
-	"default-mode", "default-uid", "default-gid", "mem-percent", NULL
+	"default-mode", "default-uid", "default-gid", "mem-percent", "pd",
+	"pseudo-dir", NULL
 };
 
 static char *read_from_disk(long long start, unsigned int avail_bytes, int buff);
@@ -4022,11 +4027,40 @@ static void dir_scan2(struct dir_info *dir, struct pseudo *pseudo)
 			}
 		}
 
-		if(pseudo_ent->dev == NULL)
-			continue;
-
 		if((!appending || dir->depth != 1) && !empty)
 			dir_ent = lookup_name(dir, pseudo_ent->name);
+
+		if(pseudo_ent->dev == NULL) {
+			if(dir_ent == NULL && pseudo_dir) {
+				struct dir_ent *dir_ent = create_dir_entry(pseudo_ent->name, NULL,
+						pseudo_ent->pathname, dir);
+				char *subpath = subpathname(dir_ent);
+				struct dir_info *sub_dir = scan1_opendir("", subpath, dir->depth + 1);
+
+				memset(&buf, 0, sizeof(buf));
+				buf.st_mode = pseudo_dir->buf->mode;
+				buf.st_uid = pseudo_dir->buf->uid;
+				buf.st_gid = pseudo_dir->buf->gid;
+				buf.st_mtime = pseudo_dir->buf->mtime;
+				buf.st_ino = pseudo_dir->buf->ino;
+
+				dir_scan2(sub_dir, pseudo_ent->pseudo);
+				dir->directory_count ++;
+				add_dir_entry(dir_ent, sub_dir, lookup_inode2(&buf, pseudo_dir));
+				continue;
+			} else if(dir_ent == NULL && pseudo_ent->pseudo)
+				BAD_ERROR("Pathname \"%s\" does not exist in "
+					"filesystem.  Some pseudo definitions "
+					"will not be created.\n",
+					pseudo_ent->pathname);
+			else if(dir_ent && !S_ISDIR(dir_ent->inode->buf.st_mode) &&
+								pseudo_ent->pseudo)
+				BAD_ERROR("Pathname \"%s\" is not a directory.  Some "
+					"pseudo definitions will not be created.\n",
+					pseudo_ent->pathname);
+			else
+				continue;
+		}
 
 		if(pseudo_ent->dev->type == 'm' || pseudo_ent->dev->type == 'M') {
 			struct stat *buf;
@@ -4113,13 +4147,9 @@ static void dir_scan2(struct dir_info *dir, struct pseudo *pseudo)
 			continue;
 
 		dir_ent = lookup_name(dir, pseudo_ent->name);
-		if(dir_ent == NULL) {
-			ERROR_START("Pseudo xattr file \"%s\" does not "
-				"exist in source filesystem.",
+		if(dir_ent == NULL)
+			BAD_ERROR("File \"%s\" does not exist, can not add Pseudo xattr to it.\n",
 				pseudo_ent->pathname);
-			ERROR_EXIT("  Ignoring.\n");
-			continue;
-		}
 
 		dir_ent->inode->xattr = pseudo_ent->xattr;
 	}
@@ -5843,7 +5873,7 @@ static int _parse_numberll(char *start, long long *res, int size, int base)
 	if(size == 1) {
 		/*
 		 * Allow a multiplier of  k, K, m, M, g, G optionally
-		 * followed by bytes.
+		 * followed by B, b, or bytes.
 		 *
 		 * Check for multiplier and trailing junk.
 		 * But first check that a number exists before the
@@ -5861,8 +5891,8 @@ static int _parse_numberll(char *start, long long *res, int size, int base)
 
 			if(end[1] != '\0')
 				/* trailing junk after multiplier, but
-				 * allow it to be "bytes" */
-				if(strcmp(end + 1, "bytes"))
+				 * allow it to be B, b or bytes */
+				if(strcmp(end + 1, "bytes") && strcmp(end + 1, "B") && strcmp(end + 1, "b"))
 					return 0;
 
 			break;
@@ -5874,8 +5904,8 @@ static int _parse_numberll(char *start, long long *res, int size, int base)
 
 			if(end[1] != '\0')
 				/* trailing junk after multiplier, but
-				 * allow it to be "bytes" */
-				if(strcmp(end + 1, "bytes"))
+				 * allow it to be B, b or bytes */
+				if(strcmp(end + 1, "bytes") && strcmp(end + 1, "B") && strcmp(end + 1, "b"))
 					return 0;
 
 			break;
@@ -5887,8 +5917,8 @@ static int _parse_numberll(char *start, long long *res, int size, int base)
 
 			if(end[1] != '\0')
 				/* trailing junk after multiplier, but
-				 * allow it to be "bytes" */
-				if(strcmp(end + 1, "bytes"))
+				 * allow it to be B, b or bytes */
+				if(strcmp(end + 1, "bytes") && strcmp(end + 1, "B") && strcmp(end + 1, "b"))
 					return 0;
 
 			break;
@@ -6080,8 +6110,9 @@ static void print_options(FILE *stream, char *name, int total_mem)
 	fprintf(stream, "\nFilesystem compression options:\n");
 	fprintf(stream, "-b <block_size>\t\tset data block to <block_size>.  Default ");
 	fprintf(stream, "128 Kbytes.\n");
-	fprintf(stream, "\t\t\tOptionally a suffix of K or M can be given to ");
-	fprintf(stream, "specify\n\t\t\tKbytes or Mbytes respectively\n");
+	fprintf(stream, "\t\t\tOptionally a suffix of K, KB, Kbytes or M, ");
+	fprintf(stream, "MB, Mbytes\n\t\t\tcan be given to ");
+	fprintf(stream, "specify Kbytes or Mbytes respectively\n");
 	fprintf(stream, "-comp <comp>\t\tselect <comp> compression\n");
 	fprintf(stream, "\t\t\tCompressors available:\n");
 	display_compressors(stream, "\t\t\t", COMP_DEFAULT);
@@ -6376,8 +6407,9 @@ static void print_sqfstar_options(FILE *stream, char *name, int total_mem)
 	fprintf(stream, "\nFilesystem compression options:\n");
 	fprintf(stream, "-b <block_size>\t\tset data block to <block_size>.  Default ");
 	fprintf(stream, "128 Kbytes.\n");
-	fprintf(stream, "\t\t\tOptionally a suffix of K or M can be given to ");
-	fprintf(stream, "specify\n\t\t\tKbytes or Mbytes respectively\n");
+	fprintf(stream, "\t\t\tOptionally a suffix of K, KB, Kbytes or ");
+	fprintf(stream, "M, MB, Mbytes\n\t\t\tcan be given to ");
+	fprintf(stream, "specify Kbytes or Mbytes respectively\n");
 	fprintf(stream, "-comp <comp>\t\tselect <comp> compression\n");
 	fprintf(stream, "\t\t\tCompressors available:\n");
 	display_compressors(stream, "\t\t\t", COMP_DEFAULT);
@@ -6880,7 +6912,7 @@ static int sqfstar(int argc, char *argv[])
 		else if(strcmp(argv[i], "-no-hardlinks") == 0)
 			no_hardlinks = TRUE;
 		else if(strcmp(argv[i], "-throttle") == 0) {
-			if((++i == dest_index) || !parse_num(argv[i], &sleep_time)) {
+			if((++i == dest_index) || !parse_number(argv[i], &sleep_time, 2)) {
 				ERROR("%s: %s missing or invalid value\n",
 							argv[0], argv[i - 1]);
 				exit(1);
@@ -6892,7 +6924,7 @@ static int sqfstar(int argc, char *argv[])
 			}
 			readq = 4;
 		} else if(strcmp(argv[i], "-limit") == 0) {
-			if((++i == dest_index) || !parse_num(argv[i], &sleep_time)) {
+			if((++i == dest_index) || !parse_number(argv[i], &sleep_time, 0)) {
 				ERROR("%s: %s missing or invalid value\n",
 							argv[0], argv[i - 1]);
 				exit(1);
@@ -7075,6 +7107,16 @@ print_sqfstar_compressor_options:
 				exit(1);
 			}
 			if(read_pseudo_definition(argv[i], argv[dest_index]) == FALSE)
+				exit(1);
+		} else if(strcmp(argv[i], "-pd") == 0 || strcmp(argv[i], "-pseudo-dir") == 0) {
+			if(++i == dest_index) {
+				ERROR("%s: %s missing pseudo file definition\n",
+					argv[0], argv[i-1]);
+				exit(1);
+			}
+
+			pseudo_dir = read_pseudo_dir(argv[i]);
+			if(pseudo_dir == NULL)
 				exit(1);
 		} else if(strcmp(argv[i], "-regex") == 0)
 			use_regex = TRUE;
@@ -7790,7 +7832,7 @@ int main(int argc, char *argv[])
 				exit(1);
 			}
 		} else if(strcmp(argv[i], "-throttle") == 0) {
-			if((++i == argc) || !parse_num(argv[i], &sleep_time)) {
+			if((++i == argc) || !parse_number(argv[i], &sleep_time, 2)) {
 				ERROR("%s: %s missing or invalid value\n",
 							argv[0], argv[i - 1]);
 				exit(1);
@@ -7802,7 +7844,7 @@ int main(int argc, char *argv[])
 			}
 			readq = 4;
 		} else if(strcmp(argv[i], "-limit") == 0) {
-			if((++i == argc) || !parse_num(argv[i], &sleep_time)) {
+			if((++i == argc) || !parse_number(argv[i], &sleep_time, 2)) {
 				ERROR("%s: %s missing or invalid value\n",
 							argv[0], argv[i - 1]);
 				exit(1);
@@ -8069,6 +8111,16 @@ print_compressor_options:
 				exit(1);
 			}
 			if(read_pseudo_definition(argv[i], destination_file) == FALSE)
+				exit(1);
+		} else if(strcmp(argv[i], "-pd") == 0 || strcmp(argv[i], "-pseudo-dir") == 0) {
+			if(++i == argc) {
+				ERROR("%s: %s missing pseudo file definition\n",
+					argv[0], argv[i]);
+				exit(1);
+			}
+
+			pseudo_dir = read_pseudo_dir(argv[i]);
+			if(pseudo_dir == NULL)
 				exit(1);
 		} else if(strcmp(argv[i], "-recover") == 0) {
 			if(++i == argc) {

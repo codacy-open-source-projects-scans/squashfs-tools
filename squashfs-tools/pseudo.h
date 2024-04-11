@@ -96,6 +96,7 @@ extern struct pseudo *pseudo;
 
 extern long long read_bytes(int, void *, long long);
 extern int read_pseudo_definition(char *, char *);
+extern struct pseudo_dev *read_pseudo_dir(char *def);
 extern int read_pseudo_file(char *, char *);
 extern struct pseudo *pseudo_subdir(char *, struct pseudo *);
 extern struct pseudo_entry *pseudo_readdir(struct pseudo *);
@@ -103,7 +104,6 @@ extern struct pseudo_dev *get_pseudo_file(int);
 extern int pseudo_exec_file(struct pseudo_dev *, int *);
 extern struct pseudo *get_pseudo();
 extern void dump_pseudos();
-extern char *get_element(char *target, char **targname);
-extern void print_definitions();
-extern struct pseudo_entry *pseudo_search(struct pseudo *, char *, int *);
+extern char *get_element(char *, char **, char **);
+extern struct pseudo_entry *pseudo_search(struct pseudo *, char *, char *, char *, int *);
 #endif
