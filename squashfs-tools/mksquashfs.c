@@ -7424,15 +7424,23 @@ int main(int argc, char *argv[])
 		print_option(argv[0], argv[i - 1], argv[i]);
 	}
 
+	if(i < argc && (strcmp(argv[i], "-help-section") == 0 ||
+						strcmp(argv[i], "-hs") == 0)) {
+		if(++i == argc) {
+			ERROR("%s: %s missing option\n", argv[0], argv[i - 1]);
+			exit(1);
+		}
+
+		print_section(argv[0], argv[i - 1], argv[i]);
+	}
+
 	if(i < argc && strcmp(argv[i], "-mem-default") == 0) {
 		printf("%d\n", total_mem);
 		exit(0);
 	}
 
-	if(i < 3) {
-		print_options(stderr, argv[0]);
-		exit(1);
-	}
+	if(i < 3)
+		print_help(argv[0]);
 
 	option_offset = i;
 	destination_file = argv[i - 1];
@@ -7554,6 +7562,15 @@ int main(int argc, char *argv[])
 			}
 
 			print_option(argv[0], argv[i - 1], argv[i]);
+		} else if((strcmp(argv[i], "-help-section") == 0 ||
+						strcmp(argv[i], "-hs") == 0)) {
+			if(++i == argc) {
+				ERROR("%s: %s missing option\n",
+							argv[0], argv[i - 1]);
+				exit(1);
+			}
+
+			print_section(argv[0], argv[i - 1], argv[i]);
 		} else if(strcmp(argv[i], "-no-hardlinks") == 0)
 			no_hardlinks = TRUE;
 		else if(strcmp(argv[i], "-no-strip") == 0 ||
@@ -8222,11 +8239,8 @@ print_compressor_options:
 		} else if(strcmp(argv[i], "-comp") == 0) {
 			/* parsed previously */
 			i++;
-		} else {
-			ERROR("%s: invalid option\n\n", argv[0]);
-			print_options(stderr, argv[0]);
-			exit(1);
-		}
+		} else
+			handle_invalid_option(argv[0], argv[i]);
 	}
 
 	check_env_var();

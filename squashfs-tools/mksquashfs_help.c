@@ -31,28 +31,47 @@
 #include "mksquashfs_help.h"
 #include "compressor.h"
 
+#define SYNTAX "SYNTAX:%s source1 source2 ...  FILESYSTEM [OPTIONS] [-e list of\nexclude dirs/files]\n"
+
 static char *options[] = {
-	NULL, "-b", "-comp", "-noI", "-noId", "-noD", "-noF", "-noX", "-no-compression",
-	"", NULL, "-tar", "-no-strip", "-tarstyle", "-cpiostyle", "-cpiostyle0",
+	"", "-b", "-comp", "-noI", "-noId", "-noD", "-noF", "-noX", "-no-compression",
+	"", "", "-tar", "-no-strip", "-tarstyle", "-cpiostyle", "-cpiostyle0",
 	"-reproducible", "-not-reproducible", "-mkfs-time", "-all-time",
 	"-root-time", "-root-mode", "-root-uid", "-root-gid", "-all-root",
 	"-force-uid", "-force-gid", "-pseudo-override", "-no-exports",
 	"-exports", "-no-sparse", "-no-tailends", "-tailends", "-no-fragments",
-	"-no-duplicates", "-no-hardlinks", "-keep-as-directory", "", NULL, "-p",
-	"-pd", "-pf", "-sort", "-wildcards", "-regex", "-max-depth",
-	"-one-file-system", "-one-file-system-x", "", NULL, "-no-xattrs", "-xattrs",
-	"-xattrs-exclude", "-xattrs-include", "-xattrs-add", "", NULL, "-version",
+	"-no-duplicates", "-no-hardlinks", "-keep-as-directory", "", "", "-p",
+	"-pd", "-pd", "-pf", "-sort", "-wildcards", "-regex", "-max-depth",
+	"-one-file-system", "-one-file-system-x", "", "", "-no-xattrs", "-xattrs",
+	"-xattrs-exclude", "-xattrs-include", "-xattrs-add", "", "", "-version",
 	"-exit-on-error", "-quiet", "-info", "-no-progress", "-progress",
 	"-percentage", "-throttle", "-limit", "-processors", "-mem",
-	"-mem-percent", "-mem-default", "", NULL, "-noappend", "-root-becomes",
-	"-no-recovery", "-recovery-path", "-recover", "", NULL, "-action",
+	"-mem-percent", "-mem-default", "", "", "-noappend", "-root-becomes",
+	"-no-recovery", "-recovery-path", "-recover", "", "", "-action",
 	"-log-action", "-true-action", "-false-action", "-action-file",
-	"-log-action-file", "-true-action-file", "-false-action-file", "", NULL,
-	"-default-mode", "-default-uid", "-default-gid", "-ignore-zeros", "", NULL,
-	"-nopad", "-offset", "-o", "", NULL, "-fstime", "-always-use-fragments",
-	"-root-owned", "-noInodeCompression", "-noIdTableCompression",
-	"-noDataCompression", "-noFragmentCompression", "-noXattrCompression",
-	"", "-help", "-h", "-help-option", "-ho", "-Xhelp", NULL, NULL
+	"-log-action-file", "-true-action-file", "-false-action-file", "", "",
+	"-default-mode", "-default-uid", "-default-gid", "-ignore-zeros", "", "",
+	"-nopad", "-offset", "-o", "", "", "-help", "-help-option", "-help-section",
+	"-Xhelp", "-h", "-ho", "-hs", "", "", "-fstime", "-always-use-fragments",
+	"-root-owned", "-noInodeCompression", "-noIdTableCompression", "-noDataCompression",
+	"-noFragmentCompression", "-noXattrCompression", NULL,
+};
+
+static char *options_args[]={
+	"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+	"<time>", "<time>", "<time>", "<mode>", "<value>", "<value>",
+	"", "<value>", "<value>", "", "", "", "", "", "", "", "", "", "", "", "", "",
+	"<d mode uid gid>", "<D time mode uid gid>", "<pseudo-file>", "<sort-file>", "", "",
+	"<levels>", "", "", "", "", "", "", "<regex>", "<regex>", "<name=val>", "", "", "", "", "", "",
+	"", "", "", "<percentage>", "<percentage>", "<number>", "<size>", "<percent>", "", "", "", "",
+	"<name>", "", "<name>", "<name>", "", "", "<action@expression>", "<action@expression>", "<action@expression>",
+	"<action@expression>", "<file>", "<file>", "<file>", "<file>", "", "", "<mode>", "<value>", "<value>",
+	"", "", "", "", "<offset>", "<offset>", "", "", "", "<regex>", "<section>", "", "", "<regex>", "<section>",
+	"", "", "<time>", "", "", "", "", "", "", "",
+};
+
+static char *sections[]={
+	"compression", "build", "filter", "xattrs", "runtime", "append", "actions", "tar", "expert", "help", "misc", "pseudo", NULL
 };
 
 static char *options_text[]={
@@ -94,7 +113,8 @@ static char *options_text[]={
 	"-keep-as-directory\tif one source directory is specified, create a root\n\t\t\tdirectory containing that directory, rather than the\n\t\t\tcontents of the directory\n",
 	"\n", "Filesystem filter options:\n",
 	"-p <pseudo-definition>\tadd pseudo file definition.  The definition should\n\t\t\tbe quoted.  See section \"Pseudo file definition format\"\n\t\t\tlater for format details\n",
-	"-pd <d mode uid gid>\tspecify a default pseudo directory which will be used in\n\t\t\tpseudo definitions if a directory in the pathname does\n\t\t\tnot exist.  This also allows pseudo definitions to be\n\t\t\tspecified without specifying all the directories in the\n\t\t\tpathname.  The definition should be quoted\n-pd <D time mode u g>\tas above, but also allow a timestamp to be specified\n",
+	"-pd <d mode uid gid>\tspecify a default pseudo directory which will be used in\n\t\t\tpseudo definitions if a directory in the pathname does\n\t\t\tnot exist.  This also allows pseudo definitions to be\n\t\t\tspecified without specifying all the directories in the\n\t\t\tpathname.  The definition should be quoted\n",
+	"-pd <D time mode u g>\tas above, but also allow a timestamp to be specified\n",
 	"-pf <pseudo-file>\tadd list of pseudo file definitions from <pseudo-file>,\n\t\t\tuse - for stdin.  Pseudo file definitions should not be\n\t\t\tquoted\n",
 	"-sort <sort-file>\tsort files according to priorities in <sort-file>.  One\n\t\t\tfile or dir with priority per line.  Priority -32768 to\n\t\t\t32767, default priority 0\n-ef <exclude-file>\tlist of exclude dirs/files.  One per line\n",
 	"-wildcards\t\tallow extended shell wildcards (globbing) to be used in\n\t\t\texclude dirs/files\n",
@@ -147,6 +167,14 @@ static char *options_text[]={
 	"-nopad\t\t\tdo not pad filesystem to a multiple of 4K\n",
 	"-offset <offset>\tskip <offset> bytes at the beginning of FILESYSTEM.\n\t\t\tOptionally a suffix of K, M or G can be given to specify\n\t\t\tKbytes, Mbytes or Gbytes respectively.\n\t\t\tDefault 0 bytes\n",
 	"-o <offset>\t\tsynonym for -offset\n",
+	"\n", "Help options:\n",
+	"-help\t\t\tprint help information for all Mksquashfs options to\n\t\t\tstdout\n",
+	"-help-option <regex>\tprint the help information for Mksquashfs options\n\t\t\tmatching <regex> to stdout\n",
+	"-help-section <section>\tprint the help information for section <section> to\n\t\t\tstdout.  Use \"sections\" or \"h\" as section name to get a\n\t\t\tlist of sections and their names\n",
+	"-Xhelp\t\t\tprint compressor options for selected compressor\n",
+	"-h\t\t\tshorthand alternative to -help\n",
+	"-ho <regex>\t\tshorthand aternative to -help-option\n",
+	"-hs <section>\t\tshorthand alternative to -help-section\n",
 	"\n", "Miscellaneous options:\n",
 	"-fstime <time>\t\talternative name for -mkfs-time\n",
 	"-always-use-fragments\talternative name for -tailends\n",
@@ -156,11 +184,6 @@ static char *options_text[]={
 	"-noDataCompression\talternative name for -noD\n",
 	"-noFragmentCompression\talternative name for -noF\n",
 	"-noXattrCompression\talternative name for -noX\n",
-	"\n", "-help\t\t\tprint help information for all Mksquashfs options to\n\t\t\tstdout\n",
-	"-h\t\t\tprint help information for all Mksquashfs options to\n\t\t\tstdout\n",
-	"-help-option <option>\tprint the help information for Mksquashfs option\n\t\t\t<option> to stdout\n",
-	"-ho <option>\t\tprint the help information for Mksquashfs option\n\t\t\t<option> to stdout\n",
-	"-Xhelp\t\t\tprint compressor options for selected compressor\n",
 	"\n", "Pseudo file definition format:\n",
 	"\"filename d mode uid gid\"\t\tcreate a directory\n",
 	"\"filename m mode uid gid\"\t\tmodify filename\n",
@@ -186,8 +209,7 @@ void print_options(FILE *stream, char *name)
 {
 	int i;
 
-	fprintf(stream, "SYNTAX:%s source1 source2 ...  FILESYSTEM [OPTIONS] ", name);
-	fprintf(stream, "[-e list of\nexclude dirs/files]\n");
+	fprintf(stream, SYNTAX, name);
 
 	for(i = 0; options_text[i] != NULL; i++)
 		fprintf(stream, options_text[i]);
@@ -238,11 +260,10 @@ void print_option(char *prog_name, char *opt_name, char *pattern)
 		exit(1);
 	}
 
-	for(i = 0; options[i] != NULL || options[i + 1] != NULL; i++) {
-		if(options[i] == NULL)
-			continue;
-
+	for(i = 0; options[i] != NULL; i++) {
 		res = regexec(preg, options[i], (size_t) 0, NULL, 0);
+		if(res)
+			res = regexec(preg, options_args[i], (size_t) 0, NULL, 0);
 		if(!res) {
 			matched = TRUE;
 			printf(options_text[i]);
@@ -254,4 +275,81 @@ void print_option(char *prog_name, char *opt_name, char *pattern)
 		exit(1);
 	} else
 		exit(0);
+}
+
+
+int is_header(int i)
+{
+	return options_text[i][0] != '-' && options_text[i][0] != '\n' && options_text[i][0] != '"';
+}
+
+
+static void print_section_names(int error, char *string)
+{
+	int i, j;
+	FILE * out = error ? stderr : stdout;
+
+	fprintf(out, "%sSECTION NAME\t\tSECTION\n", string);
+
+	for(i = 0, j = 0; sections[i] != NULL; j++)
+		if(is_header(j)) {
+			fprintf(out, "%s%s\t\t%s%s", string, sections[i], strlen(sections[i]) > 7 ? "" : "\t", options_text[j]);
+			i++;
+		}
+}
+
+
+void print_section(char *prog_name, char *opt_name, char *sec_name)
+{
+	int i, j, secs;
+
+	if(strcmp(sec_name, "sections") == 0 || strcmp(sec_name, "h") == 0) {
+		printf("\nUse following section name to print Mksquashfs help information for that section\n\n");
+		print_section_names(FALSE, "");
+		exit(0);
+	}
+
+	for(i = 0; sections[i] != NULL; i++)
+		if(strcmp(sections[i], sec_name) == 0)
+			break;
+
+	if(sections[i] == NULL) {
+		ERROR("%s: %s %s does not match any section name\n", prog_name, opt_name, sec_name);
+		print_section_names(TRUE, "");
+		exit(1);
+	}
+
+	i++;
+
+	for(j = 0, secs = 0; options_text[j] != NULL && secs <= i; j ++) {
+		if(is_header(j))
+			secs++;
+		if(i == secs)
+			printf(options_text[j]);
+	}
+
+	exit(0);
+}
+
+
+void handle_invalid_option(char *prog_name, char *opt_name)
+{
+	ERROR("%s: %s is an invalid option\n\n", prog_name, opt_name);
+	ERROR("Run\n  \"%s -help-section <section-name>\" to get help on these sections\n", prog_name);
+	print_section_names(TRUE, "\t");
+	ERROR("\nOr run\n  \"%s -help-option <regex>\" to get help on all options matching <regex>\n", prog_name);
+	ERROR("\nOr run\n  \"%s -help\" to get help on all the sections\n", prog_name);
+	exit(1);
+}
+
+
+void print_help(char *prog_name)
+{
+	ERROR("%s: fatal error: no arguments specified on command line\n\n", prog_name);
+	ERROR(SYNTAX "\n", prog_name);
+	ERROR("Run\n  \"%s -help-section <section-name>\" to get help on these sections\n", prog_name);
+	print_section_names(TRUE, "\t");
+	ERROR("\nOr run\n  \"%s -help-option <regex>\" to get help on all options matching <regex>\n", prog_name);
+	ERROR("\nOr run\n  \"%s -help\" to get help on all the sections\n", prog_name);
+	exit(1);
 }
