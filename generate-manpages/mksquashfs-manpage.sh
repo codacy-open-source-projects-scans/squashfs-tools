@@ -41,7 +41,7 @@ tmp=$(mktemp -d)
 # $tmp/mksquashfs.help.  This is to allow it to be modified before
 # passing to help2man.
 
-if ! $1/mksquashfs -help > $tmp/mksquashfs.help2 2>&1; then
+if ! $1/mksquashfs -help-all > $tmp/mksquashfs.help2 2>&1; then
 	error "$0: Running Mksquashfs failed.  Cross-compiled or incompatible binary?"
 	exit 1
 fi
@@ -241,7 +241,7 @@ ${SED} -i "s/\(Compressors available and compressor specific options\):/*\1*/" $
 ${SED} -i "s/\(Pseudo file definition format\):/*\1*/" $tmp/mksquashfs.help
 
 # Add reference to manpages for other squashfs-tools programs
-${SED} -i "s/See also:/See also:\nunsquashfs(1), sqfstar(1), sqfscat(1)\n/" $tmp/mksquashfs.help
+${SED} -i "s/See also (extra information elsewhere):/See also:\nunsquashfs(1), sqfstar(1), sqfscat(1)\n/" $tmp/mksquashfs.help
 
 # Make Exit status header into a manpage section
 
