@@ -7371,7 +7371,7 @@ print_sqfstar_compressor_options:
 int main(int argc, char *argv[])
 {
 	struct stat buf, source_buf;
-	int res, i;
+	int res, i, j;
 	char *root_name = NULL;
 	squashfs_inode inode;
 	int readq;
@@ -7382,6 +7382,8 @@ int main(int argc, char *argv[])
 	int progress = TRUE;
 	int force_progress = FALSE;
 	int exclude_option = FALSE;
+	int Xhelp = FALSE;
+	char *help_comp = NULL;
 	struct file_buffer **fragment = NULL;
 	char *command;
 
@@ -7441,6 +7443,73 @@ int main(int argc, char *argv[])
 		exit(0);
 	}
 
+	/*
+	 * Scan the command line for -comp xxx option, this is to ensure
+	 * any -X compressor specific options are passed to the
+	 * correct compressor.
+	 *
+	 * Also scan for -Xhelp and -help-comp specified on command line,
+	 */
+	for(j = i; j < argc; j++) {
+		struct compressor *prev_comp = comp;
+		
+		if(strcmp(argv[j], "-comp") == 0) {
+			if(++j == argc) {
+				ERROR("%s: -comp missing compression type\n",
+					argv[0]);
+				print_option_help(argv[0], argv[j - 1]);
+			}
+			comp = lookup_compressor(argv[j]);
+			if(!comp->supported) {
+				ERROR("%s: Compressor \"%s\" is not supported!"
+					"\n", argv[0], argv[j]);
+				ERROR("%s: Compressors available:\n", argv[0]);
+				display_compressors(stderr, "", COMP_DEFAULT);
+				exit(1);
+			}
+			if(prev_comp != NULL && prev_comp != comp) {
+				ERROR("%s: -comp multiple conflicting -comp"
+					" options specified on command line"
+					", previously %s, now %s\n", argv[0],
+					prev_comp->name, comp->name);
+				exit(1);
+			}
+			compressor_opt_parsed = 1;
+
+		} else if(strcmp(argv[j], "-help-comp") == 0) {
+			if(++j == argc) {
+				ERROR("%s: -help-comp missing compressor name\n",
+					argv[0]);
+				print_option_help(argv[0], argv[j - 1]);
+			}
+
+			help_comp = argv[j];
+		} else if(strcmp(argv[j], "-Xhelp") == 0)
+			Xhelp = TRUE;
+		else if(strcmp(argv[j], "-e") == 0)
+			break;
+		else if(option_with_arg(argv[j], option_table))
+			j++;
+	}
+
+	/*
+	 * if no -comp option specified lookup default compressor.  Note the
+	 * Makefile ensures the default compressor has been built, and so we
+	 * don't need to to check for failure here
+	 */
+	if(comp == NULL)
+		comp = lookup_compressor(COMP_DEFAULT);
+
+	if(Xhelp) {
+		print_selected_comp_options(stdout, comp, argv[0]);
+		exit(0);
+	}
+
+	if(help_comp) {
+		print_compressor_options(help_comp, argv[0]);
+		exit(0);
+	}
+
 	if(i < 3) {
 		ERROR("%s: fatal error: no arguments specified on command line\n\n", argv[0]);
 		print_help(TRUE, argv[0]);
@@ -7456,51 +7525,6 @@ int main(int argc, char *argv[])
 		source_path = NULL;
 		source = 0;
 	}
-
-	/*
-	 * Scan the command line for -comp xxx option, this is to ensure
-	 * any -X compressor specific options are passed to the
-	 * correct compressor
-	 */
-	for(; i < argc; i++) {
-		struct compressor *prev_comp = comp;
-		
-		if(strcmp(argv[i], "-comp") == 0) {
-			if(++i == argc) {
-				ERROR("%s: -comp missing compression type\n",
-					argv[0]);
-				print_option_help(argv[0], argv[i - 1]);
-			}
-			comp = lookup_compressor(argv[i]);
-			if(!comp->supported) {
-				ERROR("%s: Compressor \"%s\" is not supported!"
-					"\n", argv[0], argv[i]);
-				ERROR("%s: Compressors available:\n", argv[0]);
-				display_compressors(stderr, "", COMP_DEFAULT);
-				exit(1);
-			}
-			if(prev_comp != NULL && prev_comp != comp) {
-				ERROR("%s: -comp multiple conflicting -comp"
-					" options specified on command line"
-					", previously %s, now %s\n", argv[0],
-					prev_comp->name, comp->name);
-				exit(1);
-			}
-			compressor_opt_parsed = 1;
-
-		} else if(strcmp(argv[i], "-e") == 0)
-			break;
-		else if(option_with_arg(argv[i], option_table))
-			i++;
-	}
-
-	/*
-	 * if no -comp option specified lookup default compressor.  Note the
-	 * Makefile ensures the default compressor has been built, and so we
-	 * don't need to to check for failure here
-	 */
-	if(comp == NULL)
-		comp = lookup_compressor(COMP_DEFAULT);
 
 	/*
 	 * Scan the command line for -cpiostyle, -tar and -pf xxx options, this
@@ -7829,12 +7853,8 @@ int main(int argc, char *argv[])
 				exit(1);
 
 		} else if(strncmp(argv[i], "-X", 2) == 0) {
-			int args;
+			int args = compressor_options(comp, argv + i, argc - i);
 
-			if(strcmp(argv[i] + 2, "help") == 0)
-				goto print_compressor_options;
-
-			args = compressor_options(comp, argv + i, argc - i);
 			if(args < 0) {
 				if(args == -1) {
 					ERROR("%s: Unrecognised compressor"
@@ -7844,13 +7864,7 @@ int main(int argc, char *argv[])
 						ERROR("%s: Did you forget to"
 							" specify -comp?\n",
 							argv[0]);
-print_compressor_options:
-					ERROR("%s: selected compressor \"%s\""
-						".  Options supported: %s\n",
-						argv[0], comp->name,
-						comp->usage ? "" : "none");
-					if(comp->usage)
-						comp->usage(stderr);
+					print_selected_comp_options(stderr, comp, argv[0]);
 				}
 				exit(1);
 			}

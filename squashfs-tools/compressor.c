@@ -22,6 +22,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+
 #include "compressor.h"
 #include "squashfs_fs.h"
 
@@ -142,4 +144,36 @@ void display_compressor_usage(FILE *stream, char *def_comp)
 				fprintf(stream, "\t%s (no options)%s\n",
 					compressor[i]->name, str);
 		}
+}
+
+
+void print_selected_comp_options(FILE *stream, struct compressor *comp, char *prog_name)
+{
+	fprintf(stream, "%s: selected compressor \"%s\".  Options supported: %s\n",
+		prog_name, comp->name, comp->usage ? "" : "none");
+	if(comp->usage)
+		comp->usage(stream);
+}
+
+
+void print_compressor_options(char *comp_name, char *prog_name)
+{
+	int i;
+
+	for(i = 0; compressor[i]->id; i++)
+		if(compressor[i]->supported && strcmp(compressor[i]->name, comp_name) == 0) {
+			struct compressor *comp = compressor[i];
+
+			printf("%s: compressor \"%s\".  Options supported: %s\n",
+				prog_name, comp->name, comp->usage ? "" : "none");
+			if(comp->usage)
+				comp->usage(stdout);
+
+			return;
+	}
+
+	fprintf(stderr, "%s: Compressor \"%s\" is not supported!\n", prog_name, comp_name);
+	fprintf(stderr, "%s: Compressors available:\n", prog_name);
+	display_compressors(stderr, "", COMP_DEFAULT);
+	exit(1);
 }
