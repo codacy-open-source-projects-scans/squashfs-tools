@@ -39,13 +39,16 @@
 
 extern long long read_bytes(int, void *, long long);
 
+static char *pager_command = "/usr/bin/pager";
+static char *pager_name = "pager";
+static int pager_from_env_var = FALSE;
+
 #define MKSQUASHFS_SYNTAX "SYNTAX:%s source1 source2 ...  FILESYSTEM " \
-	"[OPTIONS] [-e list of exclude dirs/files]\n"
+	"[OPTIONS] [-e list of exclude dirs/files]\n\n"
 
-#define SQFSTAR_SYNTAX "SYNTAX:%s [OPTIONS] FILESYSTEM [list of exclude " \
-	"dirs/files]\n"
+#define SQFSTAR_SYNTAX "SYNTAX:%s [OPTIONS] FILESYSTEM [list of exclude dirs/files]\n\n"
 
-static char *options[] = {
+static char *mksquashfs_options[] = {
 	"", "", "-b", "-comp", "-noI", "-noId", "-noD", "-noF", "-noX",
 	"-no-compression", "", "", "", "-tar", "-no-strip", "-tarstyle",
 	"-cpiostyle", "-cpiostyle0", "-reproducible", "-not-reproducible",
@@ -66,13 +69,32 @@ static char *options[] = {
 	"-false-action-file", "", "", "", "-default-mode", "-default-uid",
 	"-default-gid", "-ignore-zeros", "", "", "", "-nopad", "-offset", "-o",
 	"", "", "", "-help", "-help-option", "-help-section", "help-comp",
-	"-help-all", "-Xhelp", "-h", "-ho", "-hs", "", "", "", "-fstime",
-	"-always-use-fragments", "-root-owned", "-noInodeCompression",
-	"-noIdTableCompression", "-noDataCompression", "-noFragmentCompression",
-	"-noXattrCompression", "-pseudo-dir", NULL,
+	"-help-all", "-Xhelp", "-h", "-ho", "-hs", "-ha", "", "", "",
+	"-fstime", "-always-use-fragments", "-root-owned",
+	"-noInodeCompression", "-noIdTableCompression", "-noDataCompression",
+	"-noFragmentCompression", "-noXattrCompression", "-pseudo-dir", NULL,
 };
 
-static char *options_args[]={
+static char *sqfstar_options[]={
+	"", "", "-b", "-comp", "-noI", "-noId", "-noD", "-noF", "-noX",
+	"-no-compression", "", "", "", "-reproducible", "-not-reproducible",
+	"-mkfs-time", "-all-time", "-root-time", "-root-mode", "-root-uid",
+	"-root-gid", "-all-root", "-force-uid", "-force-gid", "-default-mode",
+	"-default-uid", "-default-gid", "-pseudo-override", "-exports",
+	"-no-sparse", "-no-fragments", "-no-tailends", "-no-duplicates",
+	"-no-hardlinks", "", "", "", "-p", "-pd", "-pd", "-pf", "-ef", "-regex",
+	"-ignore-zeros", "", "", "", "-no-xattrs", "-xattrs", "-xattrs-exclude",
+	"-xattrs-include", "-xattrs-add", "", "","", "-version", "-force",
+	"-exit-on-error", "-quiet", "-info", "-no-progress", "-progress",
+	"-percentage", "-throttle", "-limit", "-processors", "-mem",
+	"-mem-percent", "-mem-default", "", "", "", "-nopad", "-offset", "-o",
+	"", "", "", "-fstime", "-root-owned", "-noInodeCompression",
+	"-noIdTableCompression", "-noDataCompression", "-noFragmentCompression",
+	"-noXattrCompression", "", "-help", "help-option", "-help-section",
+	"-help-all", "-Xhelp", "-h", "-ho", "-hs", "-ha", NULL
+};
+
+static char *mksquashfs_args[]={
 	"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
 	"", "", "<time>", "<time>", "<time>", "<mode>", "<value>", "<value>",
 	"", "<value>", "<value>", "", "", "", "", "", "", "", "", "", "", "",
@@ -86,13 +108,31 @@ static char *options_args[]={
 	"<file>", "<file>", "<file>", "<file>", "", "", "", "<mode>", "<value>",
 	"<value>", "", "", "", "", "", "<offset>", "<offset>", "", "", "", "",
 	"<regex>", "<section>", "comp", "", "", "", "<regex>", "<section>", "",
-	"", "", "<time>", "", "", "", "", "", "", "", ""
+	"", "", "", "<time>", "", "", "", "", "", "", "", ""
 };
 
-static char *sections[]={
+static char *sqfstar_args[]={
+	"", "", "<block-size>", "<comp>",  "", "", "", "", "", "", "", "", "",
+	"", "", "<time>", "<time>", "<time>", "<mode>", "<value>", "<value>",
+	"", "<value>", "<value>", "<mode>", "<value>", "<value>", "", "", "",
+	"", "", "", "", "", "", "", "<pseudo-definition>", "<d mode uid gid>",
+	"<D time mode u g>", "<pseudo-file>", "<exclude-file>", "", "", "", "",
+	"", "", "", "<regex>", "<regex>", "<name=val>", "", "","", "", "", "",
+	"", "", "", "", "", "<percentage>", "<percentage>", "<number>",
+	"<size>", "<percent>", "", "", "", "", "", "<offset>", "<offset>", "",
+	"", "", "<time>", "", "", "", "", "", "", "", "", "<regex>",
+	"<section>", "", "", "", "<regex>", "<section>", ""
+};
+
+static char *mksquashfs_sections[]={
 	"compression", "build", "filter", "xattrs", "runtime", "append",
 	"actions", "tar", "expert", "help", "misc", "pseudo", "environment",
 	"exit", "extra", NULL
+};
+
+static char *sqfstar_sections[]={
+	"compression", "build", "filter", "xattrs", "runtime", "expert",
+	"misc", "pseudo", "environment", "exit", "extra", NULL
 };
 
 static char *mksquashfs_text[]={
@@ -174,8 +214,10 @@ static char *mksquashfs_text[]={
 		"does not exist.  This also allows pseudo definitions to be "
 		"specified without specifying all the directories in the "
 		"pathname.  The definition should be quoted\n",
-	"-pd <D time mode u g>\tas above, but also allow a timestamp to be "
-		"specified\n",
+	"-pd <D time mode u g>\tspecify a default pseudo directory which will "
+		"be used in pseudo definitions if a directory in the pathname "
+		"does not exist.  The D type also allows a timestamp to be "
+		"specified in addition to mode, uid and gid\n",
 	"-pf <pseudo-file>\tadd list of pseudo file definitions from "
 		"<pseudo-file>, use - for stdin.  Pseudo file definitions "
 		"should not be quoted\n",
@@ -308,6 +350,7 @@ static char *mksquashfs_text[]={
 	"-h\t\t\tshorthand alternative to -help\n",
 	"-ho <regex>\t\tshorthand aternative to -help-option\n",
 	"-hs <section>\t\tshorthand alternative to -help-section\n",
+	"-ha\t\t\tshorthand alternative to -help-all\n",
 	"\n", "Miscellaneous options:", "\n",
 	"-fstime <time>\t\talternative name for -mkfs-time\n",
 	"-always-use-fragments\talternative name for -tailends\n",
@@ -350,7 +393,10 @@ static char *mksquashfs_text[]={
 		"timestamp.  Also any file timestamps which are after "
 		"SOURCE_DATE_EPOCH will be clamped to SOURCE_DATE_EPOCH.  "
 		"See https://reproducible-builds.org/docs/source-date-epoch/"
-		" for more information\n",
+		" for more information\n", "\n",
+	"PAGER\t\t\tIf set, this is used as the name of the program used to "
+		"display the help text.  The value can be a simple command or "
+		"a pathname.  The default is /usr/bin/pager\n",
 	"\n", "Exit status:", "\n",
 	"  0\tMksquashfs successfully generated a filesystem.\n"
 	"  1\tFatal errors occurred, Mksquashfs aborted and did not generate a "
@@ -373,8 +419,8 @@ static char *sqfstar_text[]={
 	"-b <block-size>\t\tset data block to <block-size>.  Default 128 "
 		"Kbytes. Optionally a suffix of K, KB, Kbytes or M, MB, Mbytes "
 		"can be given to specify Kbytes or Mbytes respectively\n",
-	"-comp <comp>\t\tselect <comp> compression\n", "\t\t\tCompressors "
-		"available:\n\t\t\t" COMPRESSORS "\n",
+	"-comp <comp>\t\tselect <comp> compression\n\t\t\tCompressors "
+		"available:\n\t\t\t\t" COMPRESSORS "\n",
 	"-noI\t\t\tdo not compress inode table\n",
 	"-noId\t\t\tdo not compress the uid/gid table (implied by -noI)\n",
 	"-noD\t\t\tdo not compress data blocks\n",
@@ -383,9 +429,9 @@ static char *sqfstar_text[]={
 	"-no-compression\t\tdo not compress any of the data or metadata.  This "
 		"is equivalent to specifying -noI -noD -noF and -noX\n",
 	"\n", "Filesystem build options:", "\n",
-	"-reproducible\t\tbuild filesystems that are reproducible", REP_STR
+	"-reproducible\t\tbuild filesystems that are reproducible" REP_STR
 		"\n",
-	"-not-reproducible\tbuild filesystems that are not reproducible",
+	"-not-reproducible\tbuild filesystems that are not reproducible"
 		NOREP_STR "\n",
 	"-mkfs-time <time>\tset filesystem creation timestamp to <time>. "
 		"<time> can be an unsigned 32-bit int indicating seconds since "
@@ -446,8 +492,10 @@ static char *sqfstar_text[]={
 		"does not exist.  This also allows pseudo definitions to be "
 		"specified without specifying all the directories in the "
 		"pathname.  The definition should be quoted\n",
-	"-pd <D time mode u g>\tas above, but also allow a timestamp to be "
-		"specified\n",
+	"-pd <D time mode u g>\tspecify a default pseudo directory which will "
+		"be used in pseudo definitions if a directory in the pathname "
+		"does not exist.  The D type also allows a timestamp to be "
+		"specified in addition to mode, uid and gid\n",
 	"-pf <pseudo-file>\tadd list of pseudo file definitions.  Pseudo file "
 		"definitions in pseudo-files should not be quoted\n",
 	"-ef <exclude-file>\tlist of exclude dirs/files.  One per line\n",
@@ -459,8 +507,8 @@ static char *sqfstar_text[]={
 		"stop reading after the first tar file on encountering them. "
 		"This option makes Sqfstar ignore the zero filled blocks\n",
 	"\n", "Filesystem extended attribute (xattrs) options:", "\n",
-	"-no-xattrs\t\tdo not store extended attributes" NOXOPT_STR "\n"
-	"-xattrs\t\t\tstore extended attributes" XOPT_STR "\n"
+	"-no-xattrs\t\tdo not store extended attributes" NOXOPT_STR "\n",
+	"-xattrs\t\t\tstore extended attributes" XOPT_STR "\n",
 	"-xattrs-exclude <regex>\texclude any xattr names matching <regex>.  "
 		"<regex> is a POSIX regular expression, e.g. -xattrs-exclude "
 		"'^user.' excludes xattrs from the user namespace\n",
@@ -499,7 +547,7 @@ static char *sqfstar_text[]={
 	"-processors <number>\tuse <number> processors.  By default will use "
 		"number of processors available\n",
 	"-mem <size>\t\tuse <size> physical memory for caches.  Use K, M or G "
-		"to\n\t\t\tspecify Kbytes, Mbytes or Gbytes respectively\n",
+		"to specify Kbytes, Mbytes or Gbytes respectively\n",
 	"-mem-percent <percent>\tuse <percent> physical memory for caches.  "
 		"Default 25%\n",
 	"-mem-default\t\tprint default memory usage in Mbytes\n",
@@ -518,9 +566,19 @@ static char *sqfstar_text[]={
 	"-noDataCompression\talternative name for -noD\n",
 	"-noFragmentCompression\talternative name for -noF\n",
 	"-noXattrCompression\talternative name for -noX\n",
-	"\n-help\t\t\toutput this options text to stdout\n",
-	"-h\t\t\toutput this options text to stdout\n",
-	"\n-Xhelp\t\t\tprint compressor options for selected compressor\n",
+	"\n", "-help\t\t\tprint help summary information to stdout\n",
+	"-help-option <regex>\tprint the help information for Sqfstar "
+		"options matching <regex> to stdout\n",
+	"-help-section <section>\tprint the help information for section "
+		"<section> to stdout.  Use \"sections\" or \"h\" as section "
+		"name to get a list of sections and their names\n",
+	"-help-all\t\tprint help information for all Sqfstar options and "
+		"sections to stdout\n",
+	"-Xhelp\t\t\tprint compressor options for selected compressor\n",
+	"-h\t\t\tshorthand alternative to -help\n",
+	"-ho <regex>\t\tshorthand alternative to -help-option\n",
+	"-hs <section>\t\tshorthand alternative to -help-section\n",
+	"-ha\t\t\tshorthand alternative to -help-all\n",
 	"\n","Pseudo file definition format:", "\n",
 	"\"filename d mode uid gid\"\t\tcreate a directory\n",
 	"\"filename m mode uid gid\"\t\tmodify filename\n",
@@ -528,6 +586,7 @@ static char *sqfstar_text[]={
 	"\"filename c mode uid gid major minor\"\tcreate a character device\n",
 	"\"filename f mode uid gid command\"\tcreate file from stdout of "
 		"command\n",
+	"\"filename s mode uid gid symlink\"\tcreate a symbolic link\n",
 	"\"filename i mode uid gid [s|f]\"\t\tcreate a socket (s) or FIFO "
 		"(f)\n",
 	"\"filename x name=val\"\t\t\tcreate an extended attribute\n",
@@ -552,12 +611,15 @@ static char *sqfstar_text[]={
 		"timestamp.  Also any file timestamps which are after "
 		"SOURCE_DATE_EPOCH will be clamped to SOURCE_DATE_EPOCH.  "
 		"See https://reproducible-builds.org/docs/source-date-epoch/ "
-		"for more information\n",
+		"for more information\n", "\n",
+	"PAGER\t\t\tIf set, this is used as the name of the program used to "
+		"display the help text.  The value can be a simple command or "
+		"a pathname.  The default is /usr/bin/pager\n",
 	"\n", "Exit status:", "\n",
 	"  0\tSqfstar successfully generated a filesystem.\n",
 	"  1\tFatal errors occurred, Sqfstar aborted and did not generate a "
 		"filesystem.\n",
-	"\n", "See also:", "\n",
+	"\n","See also (extra information elsewhere):", "\n",
 	"The README for the Squashfs-tools 4.6.1 release, describing the new "
 		"features can be read here https://github.com/plougher/"
 		"squashfs-tools/blob/master/README-4.6.1\n",
@@ -565,6 +627,90 @@ static char *sqfstar_text[]={
 		"plougher/squashfs-tools/blob/master/USAGE-4.6\n",
 	NULL
 };
+
+
+static char *get_base(char *pathname)
+{
+	char *cur = pathname, *sow = NULL, *eow = NULL;
+
+	while(*cur != '\0') {
+		if(*cur == '/')
+			cur ++;
+		else if(strcmp(cur, ".") == 0)
+			cur ++;
+		else if(strcmp(cur, "..") == 0)
+			cur += 2;
+		else if(strncmp(cur, "./", 2) == 0)
+			cur +=2;
+		else if(strncmp(cur, "../", 3) == 0)
+			cur += 3;
+		else {
+			sow = cur;
+
+			do {
+				cur ++;
+			} while(*cur != '/' && *cur != '\0');
+
+			eow = cur;
+		}
+	}
+
+	if(sow == NULL || eow != cur)
+		return NULL;
+	else
+		return sow;
+}
+
+
+int check_and_set_pager(char *pager)
+{
+	int i, length = strlen(pager);
+	char *base;
+
+	/* Check string :-
+	 * 1. Isn't empty,
+	 * 2. Doesn't contain spaces, tabs, pipes, command separators or file
+	 *    redirects.
+	 *
+	 * Note: this isn't an exhaustive check of what can't be in the
+	 *	 pager name, as the execlp() will do this.  It is more
+	 *	 intended to check for common shell metacharacters and
+	 *	 warn users this isn't supported in a friendlier way.
+	 */
+	if(length == 0) {
+		ERROR("PAGER environment variable is empty!\n");
+		return FALSE;
+	}
+
+	base = get_base(pager);
+	if(base == NULL) {
+		ERROR("PAGER doesn't have a name in it or has trailing '/', '.' or '..' characters!\n");
+		return FALSE;
+	}
+
+	for(i = 0; i < length; i ++) {
+		if(pager[i] == ' ' || pager[i] == '\t') {
+			ERROR("PAGER cannot have spaces or tabs!\n");
+			goto failed;
+		} else if(pager[i] == '|' || pager[i] == ';') {
+			ERROR("PAGER cannot have pipes or command separators!\n");
+			goto failed;
+		} else if(pager[i] == '<' || pager[i] == '>' || pager[i] == '&') {
+			ERROR("PAGER cannot have file redirections!\n");
+			goto failed;
+		}
+	}
+
+	pager_command = pager;
+	pager_name = base;
+	pager_from_env_var = TRUE;
+	return TRUE;
+
+failed:
+	ERROR("If you want to do this, please use a wrapper script!\n");
+	return FALSE;
+}
+
 
 int determine_pager(void)
 {
@@ -593,7 +739,7 @@ int determine_pager(void)
 		if(res == -1)
 			exit(EXIT_FAILURE);
 
-		execl("/usr/bin/pager", "pager", "--version", (char *) NULL);
+		execlp(pager_command, pager_name, "--version", (char *) NULL);
 		close(pipefd[1]);
 		exit(EXIT_FAILURE);
 	}
@@ -658,7 +804,7 @@ void wait_to_die(pid_t process)
 	}
 
 	if(!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-		ERROR("Pager exited unexpectedly or with an errror status");
+		ERROR("Pager failed to run or failed with an error status\n");
 }
 
 
@@ -690,15 +836,17 @@ FILE *exec_pager(pid_t *process)
 			exit(EXIT_FAILURE);
 
 		if(pager == LESS_PAGER)
-			execl("/usr/bin/pager", "pager", "--quit-if-one-screen", (char *) NULL);
+			execlp(pager_command, pager_name, "--quit-if-one-screen", (char *) NULL);
 		else if(pager == MORE_PAGER)
-			execl("/usr/bin/pager", "pager", "--exit-on-eof", (char *) NULL);
+			execlp(pager_command, pager_name, "--exit-on-eof", (char *) NULL);
 		else
-			execl("/usr/bin/pager", "pager", (char *) NULL);
+			execlp(pager_command, pager_name,  (char *) NULL);
 
-		execl("/usr/bin/less", "less", "--quit-if-one-screen", (char *) NULL);
-		execl("/usr/bin/more", "more", "--exit-on-eof", (char *) NULL);
-		execl("/usr/bin/cat", "cat", (char *) NULL);
+		if(pager_from_env_var == FALSE) {
+			execl("/usr/bin/less", "less", "--quit-if-one-screen", (char *) NULL);
+			execl("/usr/bin/more", "more", "--exit-on-eof", (char *) NULL);
+			execl("/usr/bin/cat", "cat", (char *) NULL);
+		}
 
 		close(pipefd[0]);
 		exit(EXIT_FAILURE);
@@ -851,7 +999,8 @@ static void print_help_all(char *name, char *syntax, char **options_text)
 }
 
 
-void print_option(char *prog_name, char *opt_name, char *pattern)
+static void print_option(char *prog_name, char *opt_name, char *pattern, char **options,
+					char **options_args, char **options_text)
 {
 	int i, res, matched = FALSE;
 	regex_t *preg = malloc(sizeof(regex_t));
@@ -876,41 +1025,41 @@ void print_option(char *prog_name, char *opt_name, char *pattern)
 			res = regexec(preg, options_args[i], (size_t) 0, NULL, 0);
 		if(!res) {
 			matched = TRUE;
-			autowrap_print(stdout, mksquashfs_text[i], cols);
+			autowrap_print(stdout, options_text[i], cols);
 		}
 	}
 
 	if(!matched) {
-		autowrap_printf(stderr, cols, "%s: %s %s does not match any Mksquashfs option\n", prog_name, opt_name, pattern);
+		autowrap_printf(stderr, cols, "%s: %s %s does not match any %s option\n", prog_name, opt_name, pattern, prog_name);
 		exit(1);
 	} else
 		exit(0);
 }
 
 
-static int is_header(int i)
+static int is_header(int i, char **options_text)
 {
-	int length = strlen(mksquashfs_text[i]);
+	int length = strlen(options_text[i]);
 
-	return length && mksquashfs_text[i][length - 1] == ':';
+	return length && options_text[i][length - 1] == ':';
 }
 
 
-static void print_section_names(FILE *out, char *string, int cols)
+static void print_section_names(FILE *out, char *string, int cols, char **sections, char **options_text)
 {
 	int i, j;
 
 	autowrap_printf(out, cols, "%sSECTION NAME\t\tSECTION\n", string);
 
 	for(i = 0, j = 0; sections[i] != NULL; j++)
-		if(is_header(j)) {
-			autowrap_printf(out, cols, "%s%s\t\t%s%s\n", string, sections[i], strlen(sections[i]) > 7 ? "" : "\t", mksquashfs_text[j]);
+		if(is_header(j, options_text)) {
+			autowrap_printf(out, cols, "%s%s\t\t%s%s\n", string, sections[i], strlen(sections[i]) > 7 ? "" : "\t", options_text[j]);
 			i++;
 		}
 }
 
 
-void print_section(char *prog_name, char *opt_name, char *sec_name)
+static void print_section(char *prog_name, char *opt_name, char *sec_name, char **sections, char **options_text)
 {
 	int i, j, secs, cols, tty = isatty(STDOUT_FILENO);
 	pid_t pager_pid;
@@ -928,8 +1077,8 @@ void print_section(char *prog_name, char *opt_name, char *sec_name)
 	}
 
 	if(strcmp(sec_name, "sections") == 0 || strcmp(sec_name, "h") == 0) {
-		autowrap_print(pager, "\nUse following section name to print Mksquashfs help information for that section\n\n", cols);
-		print_section_names(pager , "", cols);
+		autowrap_printf(pager, cols, "\nUse following section name to print %s help information for that section\n\n", prog_name);
+		print_section_names(pager , "", cols, sections, options_text);
 		goto finish;
 	}
 
@@ -939,17 +1088,17 @@ void print_section(char *prog_name, char *opt_name, char *sec_name)
 
 	if(sections[i] == NULL) {
 		autowrap_printf(pager, cols, "%s: %s %s does not match any section name\n", prog_name, opt_name, sec_name);
-		print_section_names(pager, "", cols);
+		print_section_names(pager, "", cols, sections, options_text);
 		goto finish;
 	}
 
 	i++;
 
-	for(j = 0, secs = 0; mksquashfs_text[j] != NULL && secs <= i; j ++) {
-		if(is_header(j))
+	for(j = 0, secs = 0; options_text[j] != NULL && secs <= i; j ++) {
+		if(is_header(j, options_text))
 			secs++;
 		if(i == secs)
-			autowrap_print(pager, mksquashfs_text[j], cols);
+			autowrap_print(pager, options_text[j], cols);
 	}
 
 finish:
@@ -962,40 +1111,40 @@ finish:
 }
 
 
-void handle_invalid_option(char *prog_name, char *opt_name)
+static void handle_invalid_option(char *prog_name, char *opt_name, char **sections, char **options_text)
 {
 	int cols = get_column_width();
 
 	autowrap_printf(stderr, cols, "%s: %s is an invalid option\n\n", prog_name, opt_name);
 	fprintf(stderr, "Run\n  \"%s -help-section <section-name>\" to get help on these sections\n", prog_name);
-	print_section_names(stderr, "\t", cols);
+	print_section_names(stderr, "\t", cols, sections, options_text);
 	autowrap_printf(stderr, cols, "\nOr run\n  \"%s -help-option <regex>\" to get help on all options matching <regex>\n", prog_name);
 	autowrap_printf(stderr, cols, "\nOr run\n  \"%s -help-all\" to get help on all the sections\n", prog_name);
 	exit(1);
 }
 
 
-void print_help(int error, char *prog_name)
+static void print_help(int error, char *prog_name, char *syntax, char **sections, char **options_text)
 {
 	FILE *stream = error ? stderr : stdout;
 	int cols = get_column_width();
 
-	autowrap_printf(stream, cols, MKSQUASHFS_SYNTAX "\n", prog_name);
+	autowrap_printf(stream, cols, syntax, prog_name);
 	autowrap_printf(stream, cols, "Run\n  \"%s -help-section <section-name>\" to get help on these sections\n", prog_name);
-	print_section_names(stream, "\t", cols);
+	print_section_names(stream, "\t", cols, sections, options_text);
 	autowrap_printf(stream, cols, "\nOr run\n  \"%s -help-option <regex>\" to get help on all options matching <regex>\n", prog_name);
 	autowrap_printf(stream, cols, "\nOr run\n  \"%s -help-all\" to get help on all the sections\n", prog_name);
 	exit(error);
 }
 
 
-void print_option_help(char *prog_name, char *option)
+static void print_option_help(char *prog_name, char *option, char **sections, char **options_text)
 {
 	int cols = get_column_width();
 
 	autowrap_printf(stderr, cols, "\nRun\n  \"%s -help-option %s$\" to get help on %s option\n", prog_name, option, option);
 	autowrap_printf(stderr, cols, "Or run\n  \"%s -help-section <section-name>\" to get help on these sections\n", prog_name);
-	print_section_names(stderr, "\t", cols);
+	print_section_names(stderr, "\t", cols, sections, options_text);
 	autowrap_printf(stderr, cols, "\nOr run\n  \"%s -help-option <regex>\" to get help on all options matching <regex>\n", prog_name);
 	autowrap_printf(stderr, cols, "\nOr run\n  \"%s -help-all\" to get help on all the sections\n", prog_name);
 	exit(1);
@@ -1011,4 +1160,56 @@ void mksquashfs_help_all(char *name)
 void sqfstar_help_all(char *name)
 {
 	print_help_all(name, SQFSTAR_SYNTAX, sqfstar_text);
+}
+
+
+void mksquashfs_option(char *prog_name, char *opt_name, char *pattern)
+{
+	print_option(prog_name, opt_name, pattern, mksquashfs_options, mksquashfs_args, mksquashfs_text);
+}
+
+
+void sqfstar_option(char *prog_name, char *opt_name, char *pattern)
+{
+	print_option(prog_name, opt_name, pattern, sqfstar_options, sqfstar_args, sqfstar_text);
+}
+
+void mksquashfs_section(char *prog_name, char *opt_name, char *sec_name)
+{
+	print_section(prog_name, opt_name, sec_name, mksquashfs_sections, mksquashfs_text);
+}
+
+void sqfstar_section(char *prog_name, char *opt_name, char *sec_name)
+{
+	print_section(prog_name, opt_name, sec_name, sqfstar_sections, sqfstar_text);
+}
+
+void mksquashfs_help(int error, char *prog_name)
+{
+	print_help(error, prog_name, MKSQUASHFS_SYNTAX, mksquashfs_sections, mksquashfs_text);
+}
+
+void sqfstar_help(int error, char *prog_name)
+{
+	print_help(error, prog_name, SQFSTAR_SYNTAX, sqfstar_sections, sqfstar_text);
+}
+
+void mksquashfs_invalid_option(char *prog_name, char *opt_name)
+{
+	handle_invalid_option(prog_name, opt_name, mksquashfs_sections, mksquashfs_text);
+}
+
+void sqfstar_invalid_option(char *prog_name, char *opt_name)
+{
+	handle_invalid_option(prog_name, opt_name, sqfstar_sections, sqfstar_text);
+}
+
+void mksquashfs_option_help(char *prog_name, char *option)
+{
+	print_option_help(prog_name, option, mksquashfs_sections, mksquashfs_text);
+}
+
+void sqfstar_option_help(char *prog_name, char *option)
+{
+	print_option_help(prog_name, option, sqfstar_sections, sqfstar_text);
 }
