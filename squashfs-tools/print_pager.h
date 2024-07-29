@@ -1,5 +1,5 @@
-#ifndef UNSQUASHFS_HELP_H
-#define UNSQUASHFS_HELP_H
+#ifndef PRINT_PAGER_H
+#define PRINT_PAGER_H
 /*
  * Squashfs
  *
@@ -20,31 +20,20 @@
  * along with this program; if not, write to the Free Software
  * Foundation, 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  *
- * unsquashfs_help.h
+ * print_pager.h
  */
 
-#ifdef XATTR_SUPPORT
-#ifdef XATTR_OS_SUPPORT
-#ifdef XATTR_DEFAULT
-#define NOXOPT_STR
-#define XOPT_STR " (default)"
-#else
-#define NOXOPT_STR " (default)"
-#define XOPT_STR
-#endif
-#else
-#ifdef XATTR_DEFAULT
-#define NOXOPT_STR
-#define XOPT_STR " (default - no OS support)"
-#else
-#define NOXOPT_STR " (default)"
-#define XOPT_STR " (no OS support)"
-#endif
-#endif
-#else
-#define NOXOPT_STR " (default)"
-#define XOPT_STR " (unsupported)"
-#endif
+#define TRUE 1
+#define FALSE 0
 
-extern void unsquashfs_help_all(char *name);
+#define LESS_PAGER 1
+#define MORE_PAGER 2
+#define UNKNOWN_PAGER 3
+
+extern void wait_to_die(pid_t process);
+extern FILE *exec_pager(pid_t *process);
+extern int get_column_width();
+extern void autowrap_print(FILE *stream, char *text, int maxl);
+extern void autowrap_printf(FILE *stream, int maxl, char *fmt, ...);
+extern int check_and_set_pager(char *pager);
 #endif

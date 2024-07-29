@@ -21,27 +21,16 @@
  * mksquashfs_help.c
  */
 
-#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <regex.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
-#include <stdarg.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <errno.h>
 
 #include "mksquashfs_error.h"
 #include "mksquashfs_help.h"
+#include "print_pager.h"
 #include "compressor.h"
-
-extern long long read_bytes(int, void *, long long);
-
-static char *pager_command = "/usr/bin/pager";
-static char *pager_name = "pager";
-static int pager_from_env_var = FALSE;
 
 #define MKSQUASHFS_SYNTAX "SYNTAX:%s source1 source2 ...  FILESYSTEM " \
 	"[OPTIONS] [-e list of exclude dirs/files]\n\n"
@@ -68,7 +57,7 @@ static char *mksquashfs_options[] = {
 	"-action-file", "-log-action-file", "-true-action-file",
 	"-false-action-file", "", "", "", "-default-mode", "-default-uid",
 	"-default-gid", "-ignore-zeros", "", "", "", "-nopad", "-offset", "-o",
-	"", "", "", "-help", "-help-option", "-help-section", "help-comp",
+	"", "", "", "-help", "-help-option", "-help-section", "-help-comp",
 	"-help-all", "-Xhelp", "-h", "-ho", "-hs", "-ha", "", "", "",
 	"-fstime", "-always-use-fragments", "-root-owned",
 	"-noInodeCompression", "-noIdTableCompression", "-noDataCompression",
@@ -88,10 +77,11 @@ static char *sqfstar_options[]={
 	"-exit-on-error", "-quiet", "-info", "-no-progress", "-progress",
 	"-percentage", "-throttle", "-limit", "-processors", "-mem",
 	"-mem-percent", "-mem-default", "", "", "", "-nopad", "-offset", "-o",
-	"", "", "", "-fstime", "-root-owned", "-noInodeCompression",
-	"-noIdTableCompression", "-noDataCompression", "-noFragmentCompression",
-	"-noXattrCompression", "", "-help", "help-option", "-help-section",
-	"-help-all", "-Xhelp", "-h", "-ho", "-hs", "-ha", NULL
+	"", "", "", "-help", "help-option", "-help-section", "-help-comp",
+	"-help-all", "-Xhelp", "-h", "-ho", "-hs", "-ha", "", "", "",
+	"-fstime", "-root-owned", "-noInodeCompression",
+	"-noIdTableCompression", "-noDataCompression",
+	"-noFragmentCompression", "-noXattrCompression", NULL
 };
 
 static char *mksquashfs_args[]={
@@ -107,7 +97,7 @@ static char *mksquashfs_args[]={
 	"<action@expression>", "<action@expression>", "<action@expression>",
 	"<file>", "<file>", "<file>", "<file>", "", "", "", "<mode>", "<value>",
 	"<value>", "", "", "", "", "", "<offset>", "<offset>", "", "", "", "",
-	"<regex>", "<section>", "comp", "", "", "", "<regex>", "<section>", "",
+	"<regex>", "<section>", "<comp>", "", "", "", "<regex>", "<section>", "",
 	"", "", "", "<time>", "", "", "", "", "", "", "", ""
 };
 
@@ -120,8 +110,8 @@ static char *sqfstar_args[]={
 	"", "", "", "<regex>", "<regex>", "<name=val>", "", "","", "", "", "",
 	"", "", "", "", "", "<percentage>", "<percentage>", "<number>",
 	"<size>", "<percent>", "", "", "", "", "", "<offset>", "<offset>", "",
-	"", "", "<time>", "", "", "", "", "", "", "", "", "<regex>",
-	"<section>", "", "", "", "<regex>", "<section>", ""
+	"", "", "", "<regex>", "<section>", "<comp>", "", "", "", "<regex>",
+	"<section>", "" "", "", "", "<time>", "", "", "", "", "", "", ""
 };
 
 static char *mksquashfs_sections[]={
@@ -132,7 +122,7 @@ static char *mksquashfs_sections[]={
 
 static char *sqfstar_sections[]={
 	"compression", "build", "filter", "xattrs", "runtime", "expert",
-	"misc", "pseudo", "environment", "exit", "extra", NULL
+	"help", "misc", "pseudo", "environment", "exit", "extra", NULL
 };
 
 static char *mksquashfs_text[]={
@@ -558,6 +548,21 @@ static char *sqfstar_text[]={
 		"specify Kbytes, Mbytes or Gbytes respectively.  Default 0 "
 		"bytes\n",
 	"-o <offset>\t\tsynonym for -offset\n",
+	"\n", "Help options:", "\n",
+	"-help\t\t\tprint help summary information to stdout\n",
+	"-help-option <regex>\tprint the help information for Sqfstar "
+		"options matching <regex> to stdout\n",
+	"-help-section <section>\tprint the help information for section "
+		"<section> to stdout.  Use \"sections\" or \"h\" as section "
+		"name to get a list of sections and their names\n",
+	"-help-comp <comp>\tprint compressor options for compressor <comp>\n",
+	"-help-all\t\tprint help information for all Sqfstar options and "
+		"sections to stdout\n",
+	"-Xhelp\t\t\tprint compressor options for selected compressor\n",
+	"-h\t\t\tshorthand alternative to -help\n",
+	"-ho <regex>\t\tshorthand alternative to -help-option\n",
+	"-hs <section>\t\tshorthand alternative to -help-section\n",
+	"-ha\t\t\tshorthand alternative to -help-all\n",
 	"\n", "Miscellaneous options:", "\n",
 	"-fstime <time>\t\talternative name for mkfs-time\n",
 	"-root-owned\t\talternative name for -all-root\n",
@@ -566,19 +571,6 @@ static char *sqfstar_text[]={
 	"-noDataCompression\talternative name for -noD\n",
 	"-noFragmentCompression\talternative name for -noF\n",
 	"-noXattrCompression\talternative name for -noX\n",
-	"\n", "-help\t\t\tprint help summary information to stdout\n",
-	"-help-option <regex>\tprint the help information for Sqfstar "
-		"options matching <regex> to stdout\n",
-	"-help-section <section>\tprint the help information for section "
-		"<section> to stdout.  Use \"sections\" or \"h\" as section "
-		"name to get a list of sections and their names\n",
-	"-help-all\t\tprint help information for all Sqfstar options and "
-		"sections to stdout\n",
-	"-Xhelp\t\t\tprint compressor options for selected compressor\n",
-	"-h\t\t\tshorthand alternative to -help\n",
-	"-ho <regex>\t\tshorthand alternative to -help-option\n",
-	"-hs <section>\t\tshorthand alternative to -help-section\n",
-	"-ha\t\t\tshorthand alternative to -help-all\n",
 	"\n","Pseudo file definition format:", "\n",
 	"\"filename d mode uid gid\"\t\tcreate a directory\n",
 	"\"filename m mode uid gid\"\t\tmodify filename\n",
@@ -628,342 +620,6 @@ static char *sqfstar_text[]={
 	NULL
 };
 
-
-static char *get_base(char *pathname)
-{
-	char *cur = pathname, *sow = NULL, *eow = NULL;
-
-	while(*cur != '\0') {
-		if(*cur == '/')
-			cur ++;
-		else if(strcmp(cur, ".") == 0)
-			cur ++;
-		else if(strcmp(cur, "..") == 0)
-			cur += 2;
-		else if(strncmp(cur, "./", 2) == 0)
-			cur +=2;
-		else if(strncmp(cur, "../", 3) == 0)
-			cur += 3;
-		else {
-			sow = cur;
-
-			do {
-				cur ++;
-			} while(*cur != '/' && *cur != '\0');
-
-			eow = cur;
-		}
-	}
-
-	if(sow == NULL || eow != cur)
-		return NULL;
-	else
-		return sow;
-}
-
-
-int check_and_set_pager(char *pager)
-{
-	int i, length = strlen(pager);
-	char *base;
-
-	/* Check string :-
-	 * 1. Isn't empty,
-	 * 2. Doesn't contain spaces, tabs, pipes, command separators or file
-	 *    redirects.
-	 *
-	 * Note: this isn't an exhaustive check of what can't be in the
-	 *	 pager name, as the execlp() will do this.  It is more
-	 *	 intended to check for common shell metacharacters and
-	 *	 warn users this isn't supported in a friendlier way.
-	 */
-	if(length == 0) {
-		ERROR("PAGER environment variable is empty!\n");
-		return FALSE;
-	}
-
-	base = get_base(pager);
-	if(base == NULL) {
-		ERROR("PAGER doesn't have a name in it or has trailing '/', '.' or '..' characters!\n");
-		return FALSE;
-	}
-
-	for(i = 0; i < length; i ++) {
-		if(pager[i] == ' ' || pager[i] == '\t') {
-			ERROR("PAGER cannot have spaces or tabs!\n");
-			goto failed;
-		} else if(pager[i] == '|' || pager[i] == ';') {
-			ERROR("PAGER cannot have pipes or command separators!\n");
-			goto failed;
-		} else if(pager[i] == '<' || pager[i] == '>' || pager[i] == '&') {
-			ERROR("PAGER cannot have file redirections!\n");
-			goto failed;
-		}
-	}
-
-	pager_command = pager;
-	pager_name = base;
-	pager_from_env_var = TRUE;
-	return TRUE;
-
-failed:
-	ERROR("If you want to do this, please use a wrapper script!\n");
-	return FALSE;
-}
-
-
-int determine_pager(void)
-{
-	int bytes, status, res, pipefd[2];
-	pid_t child;
-	char buffer[1024];
-
-	res = pipe(pipefd);
-	if(res == -1) {
-		ERROR("Error determining pager, pipe failed\n");
-		return UNKNOWN_PAGER;
-	}
-
-	child = fork();
-	if(child == -1) {
-		ERROR("Error determining pager, fork failed\n");
-		close(pipefd[0]);
-		close(pipefd[1]);
-		return UNKNOWN_PAGER;
-	}
-
-	if(child == 0) { /* child */
-		close(pipefd[0]);
-		close(STDOUT_FILENO);
-		res = dup(pipefd[1]);
-		if(res == -1)
-			exit(EXIT_FAILURE);
-
-		execlp(pager_command, pager_name, "--version", (char *) NULL);
-		close(pipefd[1]);
-		exit(EXIT_FAILURE);
-	}
-
-	/* parent */
-	close(pipefd[1]);
-
-	bytes = read_bytes(pipefd[0], buffer, 1024);
-
-	if(bytes == -1) {
-		ERROR("Error determining pager\n");
-		close(pipefd[0]);
-		return UNKNOWN_PAGER;
-	}
-
-	if(res == 1024) {
-		ERROR("Pager returned unexpectedly large amount of data for --version\n");
-		close(pipefd[0]);
-		return UNKNOWN_PAGER;
-	}
-
-	while(1) {
-		res = waitpid(child, &status, 0);
-		if(res != -1)
-			break;
-		else if(errno != EINTR) {
-			ERROR("Error determining pager, waitpid failed\n");
-			close(pipefd[0]);
-			return UNKNOWN_PAGER;
-		}
-	}
-
-	close(pipefd[0]);
-
-	if(!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-		/* Pager didn't understand --version?  Return unknown pager */
-		return UNKNOWN_PAGER;
-	}
-
-	if(strncmp(buffer, "less", strlen("less")) == 0)
-		return LESS_PAGER;
-	else if(strncmp(buffer, "more", strlen("more")) == 0 ||
-				strncmp(buffer, "pager", strlen("pager")) == 0)
-		return MORE_PAGER;
-	else
-		return UNKNOWN_PAGER;
-}
-
-
-void wait_to_die(pid_t process)
-{
-	int res, status;
-
-	while(1) {
-		res = waitpid(process, &status, 0);
-		if(res != -1)
-			break;
-		else if(errno != EINTR) {
-			ERROR("Error executing pager, waitpid failed\n");
-			return;
-		}
-	}
-
-	if(!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-		ERROR("Pager failed to run or failed with an error status\n");
-}
-
-
-FILE *exec_pager(pid_t *process)
-{
-	FILE *file;
-	int res, pipefd[2], pager = determine_pager();
-	pid_t child;
-
-	res = pipe(pipefd);
-	if(res == -1) {
-		ERROR("Error executing pager, pipe failed\n");
-		return NULL;
-	}
-
-	child = fork();
-	if(child == -1) {
-		ERROR("Error executing pager, fork failed\n");
-		close(pipefd[0]);
-		close(pipefd[1]);
-		return NULL;
-	}
-
-	if(child == 0) { /* child */
-		close(pipefd[1]);
-		close(STDIN_FILENO);
-		res = dup(pipefd[0]);
-		if(res == -1)
-			exit(EXIT_FAILURE);
-
-		if(pager == LESS_PAGER)
-			execlp(pager_command, pager_name, "--quit-if-one-screen", (char *) NULL);
-		else if(pager == MORE_PAGER)
-			execlp(pager_command, pager_name, "--exit-on-eof", (char *) NULL);
-		else
-			execlp(pager_command, pager_name,  (char *) NULL);
-
-		if(pager_from_env_var == FALSE) {
-			execl("/usr/bin/less", "less", "--quit-if-one-screen", (char *) NULL);
-			execl("/usr/bin/more", "more", "--exit-on-eof", (char *) NULL);
-			execl("/usr/bin/cat", "cat", (char *) NULL);
-		}
-
-		close(pipefd[0]);
-		exit(EXIT_FAILURE);
-	}
-
-	/* parent */
-	close(pipefd[0]);
-
-	file = fdopen(pipefd[1], "w");
-	if(file == NULL) {
-		ERROR("Error executing pager, fdopen failed\n");
-		goto failed;
-	}
-
-	*process = child;
-	return file;
-
-failed:
-	res = kill(child, SIGKILL);
-	if(res == -1)
-	ERROR("Error executing pager, kill failed\n");
-	close(pipefd[1]);
-	return NULL;
-}
-
-
-int get_column_width()
-{
-	struct winsize winsize;
-
-	if(ioctl(1, TIOCGWINSZ, &winsize) == -1) {
-		if(isatty(STDOUT_FILENO))
-			ERROR("TIOCGWINSZ ioctl failed, defaulting to 80 "
-				"columns\n");
-		return 80;
-	} else
-		return winsize.ws_col;
-}
-
-
-void autowrap_print(FILE *stream, char *text, int maxl)
-{
-	char *cur = text;
-	int first_line = TRUE, tab_out = 0, length = 0;
-
-	while(*cur != '\0') {
-		char *sol = cur, *lw = NULL, *eow = NULL;
-		int wrapped = FALSE;
-
-		while(length <= maxl && *cur != '\n' && *cur != '\0') {
-			if(*cur == '\t') {
-				length = (length + 8) & ~7;
-				if(first_line)
-					tab_out = length;
-			} else
-				length ++;
-
-			if(*cur == '\t' || *cur == ' ')
-				eow = lw;
-			else
-				lw = cur;
-
-			if(length <= maxl)
-				cur ++;
-		}
-
-		first_line = FALSE;
-
-		if(*cur == '\n')
-			cur ++;
-		else if(*cur != '\0') {
-			if(eow)
-				cur = eow + 1;
-			else if(cur - sol == 0)
-				cur ++;
-
-			if(tab_out >= maxl)
-				tab_out = 0;
-
-			wrapped = TRUE;
-		}
-
-		while(sol < cur)
-			fputc(*sol ++, stream);
-
-		if(wrapped) {
-			fputc('\n', stream);
-
-			for(length = 0; length < tab_out; length += 8)
-				fputc('\t', stream);
-
-			while(*cur == ' ')
-				cur ++;
-		} else
-			length = 0;
-	}
-}
-
-
-void autowrap_printf(FILE *stream, int maxl, char *fmt, ...)
-{
-	va_list ap;
-	char *text;
-	int res;
-
-	va_start(ap, fmt);
-	res = vasprintf(&text, fmt, ap);
-	va_end(ap);
-
-	if(res == -1)
-		BAD_ERROR("Vasprintf failed in autowrap_printf\n");
-
-	autowrap_print(stream, text, maxl);
-	free(text);
-}
-
-
 static void print_help_all(char *name, char *syntax, char **options_text)
 {
 	int i, cols, tty = isatty(STDOUT_FILENO);
@@ -988,7 +644,7 @@ static void print_help_all(char *name, char *syntax, char **options_text)
 
 	autowrap_print(pager, "\nCompressors available and compressor specific options:\n", cols);
 
-	display_compressor_usage(pager, COMP_DEFAULT);
+	display_compressor_usage(pager, COMP_DEFAULT, cols);
 
 	if(tty) {
 		fclose(pager);

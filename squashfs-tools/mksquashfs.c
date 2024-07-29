@@ -75,6 +75,7 @@
 #include "memory_compat.h"
 #include "memory.h"
 #include "mksquashfs_help.h"
+#include "print_pager.h"
 
 /* Compression options */
 int noF = FALSE;
@@ -6293,6 +6294,7 @@ static int sqfstar(int argc, char *argv[])
 	int total_mem = get_default_phys_mem();
 	int progress = TRUE;
 	int force_progress = FALSE;
+	int Xhelp = FALSE;
 	int dest_index;
 	struct file_buffer **fragment = NULL;
 	int size;
@@ -6310,17 +6312,25 @@ static int sqfstar(int argc, char *argv[])
 		else if(strcmp(argv[i], "-help-option") == 0 || strcmp(argv[i], "-ho") == 0) {
 			if(++i == argc) {
 				ERROR("%s: %s missing regex\n", argv[0], argv[i - 1]);
-				exit(1);
+				sqfstar_option_help(argv[0], argv[i - 1]);
 			}
 
 			sqfstar_option(argv[0], argv[i - 1], argv[i]);
 		} else if(strcmp(argv[i], "-help-section") == 0 || strcmp(argv[i], "-hs") == 0) {
 			if(++i == argc) {
 				ERROR("%s: %s missing section\n", argv[0], argv[i - 1]);
-				exit(1);
+				sqfstar_option_help(argv[0], argv[i - 1]);
 			}
 
 			sqfstar_section(argv[0], argv[i - 1], argv[i]);
+		} else if(strcmp(argv[i], "-help-comp") == 0) {
+			if(++i == argc) {
+				ERROR("%s: -help-comp missing compressor name\n", argv[0]);
+				sqfstar_option_help(argv[0], argv[i - 1]);
+			}
+
+			print_compressor_options(argv[i], argv[0]);
+			exit(0);
 		} else if(strcmp(argv[1], "-mem-default") == 0) {
 			printf("%d\n", total_mem);
 			exit(0);
@@ -6339,6 +6349,8 @@ static int sqfstar(int argc, char *argv[])
 	 * Scan the command line for -comp xxx option, this should occur before
 	 * any -X compression specific options to ensure these options are passed
 	 * to the correct compressor
+	 *
+	 * Also scan for -Xhelp
 	 */
 	for(i = 1; i < argc; i++) {
 		if(strncmp(argv[i], "-X", 2) == 0)
@@ -6372,19 +6384,24 @@ static int sqfstar(int argc, char *argv[])
 					"-X option\n", argv[0]);
 				exit(1);
 			}
-		} else if(argv[i][0] != '-')
+		} else if(strcmp(argv[i], "-Xhelp") == 0)
+			Xhelp = TRUE;
+		else if(argv[i][0] != '-')
 			break;
 		else if(option_with_arg(argv[i], sqfstar_option_table))
 			i++;
 	}
 
-	if(i >= argc) {
-		ERROR("%s: fatal error: no arguments specified on command line\n\n", argv[0]);
-		sqfstar_help(TRUE, argv[0]);
-		exit(1);
+	if(Xhelp) {
+		print_selected_comp_options(stdout, comp, argv[0]);
+		exit(0);
 	}
 
-	dest_index = i;
+	if(i >= argc)
+		dest_index = argc;
+	else
+		dest_index = i;
+
 	source_path = NULL;
 	source = 0;
 	old_exclude = FALSE;
@@ -6554,12 +6571,8 @@ static int sqfstar(int argc, char *argv[])
 			/* parsed previously */
 			i++;
 		else if(strncmp(argv[i], "-X", 2) == 0) {
-			int args;
+			int args = compressor_options(comp, argv + i, dest_index - i);
 
-			if(strcmp(argv[i] + 2, "help") == 0)
-				goto print_sqfstar_compressor_options;
-
-			args = compressor_options(comp, argv + i, dest_index - i);
 			if(args < 0) {
 				if(args == -1) {
 					ERROR("%s: Unrecognised compressor"
@@ -6571,13 +6584,7 @@ static int sqfstar(int argc, char *argv[])
 							"specify it after the"
 							" -X options?\n",
 							argv[0]);
-print_sqfstar_compressor_options:
-					ERROR("%s: selected compressor \"%s\""
-						".  Options supported: %s\n",
-						argv[0], comp->name,
-						comp->usage ? "" : "none");
-					if(comp->usage)
-						comp->usage(stderr);
+					print_selected_comp_options(stderr, comp, argv[0]);
 				}
 				exit(1);
 			}
@@ -6898,6 +6905,12 @@ print_sqfstar_compressor_options:
 			sqfstar_invalid_option(argv[0], argv[i]);
 	}
 
+	if(i == argc) {
+		ERROR("%s: fatal error: no output filesystem specified on command line\n\n", argv[0]);
+		sqfstar_help(TRUE, argv[0]);
+		exit(1);
+	}
+
 	check_source_date_epoch();
 
 	/*
@@ -7153,7 +7166,6 @@ int main(int argc, char *argv[])
 	int force_progress = FALSE;
 	int exclude_option = FALSE;
 	int Xhelp = FALSE;
-	char *help_comp = NULL;
 	struct file_buffer **fragment = NULL;
 	char *command;
 
@@ -7179,40 +7191,46 @@ int main(int argc, char *argv[])
 	block_log = slog(block_size);
 	calculate_queue_sizes(total_mem, &readq, &fragq, &bwriteq, &fwriteq);
 
+	/* Find the first option */
         for(i = 1; i < argc && (argv[i][0] != '-' || strcmp(argv[i], "-") == 0);
 									i++);
 
-	if(i < argc && (strcmp(argv[i], "-help") == 0 ||
-						strcmp(argv[i], "-h") == 0))
-		mksquashfs_help(FALSE, argv[0]);
+	/* Scan the command line for options that will immediately quit afterwards */
+	for(j = i; j < argc; j++) {
+		if(strcmp(argv[j], "-help") == 0 || strcmp(argv[j], "-h") == 0)
+			mksquashfs_help(FALSE, argv[0]);
+		else if(strcmp(argv[j], "-help-all") == 0 || strcmp(argv[j], "-ha") == 0)
+			mksquashfs_help_all(argv[0]);
+		else if(strcmp(argv[j], "-help-option") == 0 || strcmp(argv[j], "-ho") == 0) {
+			if(++j == argc) {
+				ERROR("%s: %s missing regex\n", argv[0], argv[j - 1]);
+				mksquashfs_option_help(argv[0], argv[j - 1]);
+			}
 
-	if(i < argc && (strcmp(argv[i], "-help-all") == 0 ||
-						strcmp(argv[i], "-ha") == 0))
-		mksquashfs_help_all(argv[0]);
+			mksquashfs_option(argv[0], argv[j - 1], argv[j]);
+		} else if(strcmp(argv[j], "-help-section") == 0 || strcmp(argv[j], "-hs") == 0) {
+			if(++j == argc) {
+				ERROR("%s: %s missing section\n", argv[0], argv[j - 1]);
+				mksquashfs_option_help(argv[0], argv[j - 1]);
+			}
 
-	if(i < argc && (strcmp(argv[i], "-help-option") == 0 ||
-						strcmp(argv[i], "-ho") == 0)) {
-		if(++i == argc) {
-			ERROR("%s: %s missing regex\n", argv[0], argv[i - 1]);
-			exit(1);
-		}
+			mksquashfs_section(argv[0], argv[j - 1], argv[j]);
+		} else if(strcmp(argv[j], "-help-comp") == 0) {
+			if(++j == argc) {
+				ERROR("%s: -help-comp missing compressor name\n",
+					argv[0]);
+				mksquashfs_option_help(argv[0], argv[j - 1]);
+			}
 
-		mksquashfs_option(argv[0], argv[i - 1], argv[i]);
-	}
-
-	if(i < argc && (strcmp(argv[i], "-help-section") == 0 ||
-						strcmp(argv[i], "-hs") == 0)) {
-		if(++i == argc) {
-			ERROR("%s: %s missing section\n", argv[0], argv[i - 1]);
-			exit(1);
-		}
-
-		mksquashfs_section(argv[0], argv[i - 1], argv[i]);
-	}
-
-	if(i < argc && strcmp(argv[i], "-mem-default") == 0) {
-		printf("%d\n", total_mem);
-		exit(0);
+			print_compressor_options(argv[j], argv[0]);
+			exit(0);
+		} else if(strcmp(argv[j], "-mem-default") == 0) {
+			printf("%d\n", total_mem);
+			exit(0);
+		} else if(strcmp(argv[j], "-e") == 0)
+			break;
+		else if(option_with_arg(argv[j], option_table))
+			j++;
 	}
 
 	/*
@@ -7248,14 +7266,6 @@ int main(int argc, char *argv[])
 			}
 			compressor_opt_parsed = 1;
 
-		} else if(strcmp(argv[j], "-help-comp") == 0) {
-			if(++j == argc) {
-				ERROR("%s: -help-comp missing compressor name\n",
-					argv[0]);
-				mksquashfs_option_help(argv[0], argv[j - 1]);
-			}
-
-			help_comp = argv[j];
 		} else if(strcmp(argv[j], "-Xhelp") == 0)
 			Xhelp = TRUE;
 		else if(strcmp(argv[j], "-e") == 0)
@@ -7277,13 +7287,11 @@ int main(int argc, char *argv[])
 		exit(0);
 	}
 
-	if(help_comp) {
-		print_compressor_options(help_comp, argv[0]);
-		exit(0);
-	}
-
 	if(i < 3) {
-		ERROR("%s: fatal error: no arguments specified on command line\n\n", argv[0]);
+		if(i == 1)
+			ERROR("%s: fatal error: no source or output filesystem specified on command line\n\n", argv[0]);
+		else
+			ERROR("%s: fatal error: no output filesystem specified on command line\n\n", argv[0]);
 		mksquashfs_help(TRUE, argv[0]);
 	}
 
@@ -7349,30 +7357,6 @@ int main(int argc, char *argv[])
 				mksquashfs_option_help(argv[0], argv[i - 1]);
 			}
 			recovery_pathname = argv[i];
-		} else if(strcmp(argv[i], "-help") == 0 ||
-						strcmp(argv[i], "-h") == 0)
-			mksquashfs_help(FALSE, argv[0]);
-		else if(strcmp(argv[i], "-help-all") == 0 ||
-						strcmp(argv[i], "-ha") == 0)
-			mksquashfs_help_all(argv[0]);
-		else if((strcmp(argv[i], "-help-option") == 0 ||
-						strcmp(argv[i], "-ho") == 0)) {
-			if(++i == argc) {
-				ERROR("%s: %s missing option\n",
-							argv[0], argv[i - 1]);
-				exit(1);
-			}
-
-			mksquashfs_option(argv[0], argv[i - 1], argv[i]);
-		} else if((strcmp(argv[i], "-help-section") == 0 ||
-						strcmp(argv[i], "-hs") == 0)) {
-			if(++i == argc) {
-				ERROR("%s: %s missing option\n",
-							argv[0], argv[i - 1]);
-				exit(1);
-			}
-
-			mksquashfs_section(argv[0], argv[i - 1], argv[i]);
 		} else if(strcmp(argv[i], "-no-hardlinks") == 0)
 			no_hardlinks = TRUE;
 		else if(strcmp(argv[i], "-no-strip") == 0 ||
@@ -7823,9 +7807,6 @@ int main(int argc, char *argv[])
 
 			calculate_queue_sizes(total_mem, &readq, &fragq,
 				&bwriteq, &fwriteq);
-		} else if(strcmp(argv[i], "-mem-default") == 0) {
-			printf("%d\n", total_mem);
-			exit(0);
 		} else if(strcmp(argv[i], "-b") == 0) {
 			if(++i == argc) {
 				ERROR("%s: -b missing block size\n", argv[0]);
