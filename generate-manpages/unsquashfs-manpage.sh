@@ -85,6 +85,15 @@ print "Written by Phillip Lougher <phillip@squashfs.org.uk>" >> $tmp/unsquashfs.
 
 ${SED} -i "s/^SYNTAX:/Usage: /" $tmp/unsquashfs.help
 
+# The Usage text expands over two lines, and that confuses help2man.
+# So concatenate the lines if the second isn't empty
+
+${SED} -i "/^Usage/ {
+N
+/\n$/b
+s/\n/ /
+}" $tmp/unsquashfs.help
+
 # Man pages expect the options to be in the "Options" section.  So insert
 # Options section after Usage
 
@@ -166,6 +175,22 @@ s/^.*\n//
 /^  [012]/b again
 }" $tmp/unsquashfs.help
 
+# Concatenate the PAGER text on to one line.  Indent the line by
+# two and add a full stop to the end of the line
+
+${SED} -i " /  PAGER/ {
+s/PAGER/  PAGER/
+
+:again
+N
+/\n$/b print
+s/\n */ /
+b again
+
+:print
+s/\([^.]\)\n/\1.\n/
+}" $tmp/unsquashfs.help
+
 # Make Decompressors available header into a manpage section
 
 ${SED} -i "s/\(Decompressors available\):/*\1*/" $tmp/unsquashfs.help
@@ -175,11 +200,15 @@ ${SED} -i "s/\(Decompressors available\):/*\1*/" $tmp/unsquashfs.help
 ${SED} -i "s/\(Exit status\):/*\1*/" $tmp/unsquashfs.help
 
 # Add reference to manpages for other squashfs-tools programs
-${SED} -i "s/See also:/See also:\nmksquashfs(1), sqfstar(1), sqfscat(1)\n/" $tmp/unsquashfs.help
+${SED} -i "s/See also (extra information elsewhere):/See also:\nmksquashfs(1), sqfstar(1), sqfscat(1)\n/" $tmp/unsquashfs.help
 
 # Make See also header into a manpage section
 
 ${SED} -i "s/\(See also\):/*\1*/" $tmp/unsquashfs.help
+
+# Make Environment header into a manpage section
+
+${SED} -i "s/\(Environment\):/*\1*/" $tmp/unsquashfs.help
 
 if ! help2man -Ni unsquashfs.h2m -o $2 $tmp/unsquashfs.sh; then
 	error "$0: help2man returned error.  Aborting"

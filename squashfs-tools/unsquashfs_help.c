@@ -34,15 +34,43 @@
 
 #define UNSQUASHFS_SYNTAX "SYNTAX: %s [OPTIONS] FILESYSTEM [files to extract or exclude (with -excludes) or cat (with -cat )]\n\n"
 
-static char *unsquashfs_text[]= {
-	"Filesystem extraction (filtering) options:\n",
-	"\t-d[est] <pathname>\textract to <pathname>, default \"squashfs-root\".  This option ", "also sets the prefix used when listing the filesystem\n",
+static char *unsquashfs_options[]={
+	"", "", "-dest", "-max-depth", "-excludes", "-exclude-list",
+	"-extract-file", "-exclude-file", "-match", "-follow-symlinks",
+	"-missing-symlinks", "-no-wildcards", "-regex", "-all-time",
+	"-cat", "-force", "-pf", "", "", "", "-stat", "-max-depth",
+	"-info", "-linfo", "-ls", "-lls", "-llnumeric", "-lc", "-llc",
+	"-full-precision", "-UTC", "-mkfs-time", "", "", "", "-no-xattrs",
+	"-xattrs", "-xattrs-exclude", "-xattrs-include", "", "", "", "-version",
+	"-processors", "-mem", "-mem-percent", "-quiet", "-no-progress",
+	"-percentage", "-ignore-errors", "-strict-errors", "-no-exit-code",
+	"", "", "", "-help", "-help-section", "-hs", "", "", "", "-offset",
+	"-fstime", "-ef", "-excf", "-L", "-pseudo-file", "", "", "", NULL,
+};
+
+static char *unsquashfs_args[]={
+	"", "", "", "", "", "", "<file>", "<file>", "", "", "", "", "",
+	"<time>", "", "", "<file>", "", "", "", "", "<levels>", "", "",
+	"", "", "", "", "", "", "", "", "", "", "", "", "", "<regex>",
+	"<regex>", "", "", "", "", "<number>", "<size>", "<percent>",
+	"", "", "", "", "", "", "", "", "", "", "<section>", "<section>",
+	"", "", "", "<bytes>", "", "<extract file>", "<exclude file>", "",
+	"<file>", "", "", "",
+};
+
+static char *unsquashfs_sections[]={
+	"extraction", "information", "xattrs", "runtime", "help", "misc", "environment", "exit", "extra", NULL
+};
+
+static char *unsquashfs_text[]={
+	"Filesystem extraction (filtering) options:", "\n",
+	"\t-d[est] <pathname>\textract to <pathname>, default \"squashfs-root\".  This option also sets the prefix used when listing the filesystem\n",
 	"\t-max[-depth] <levels>\tdescend at most <levels> of directories when extracting\n",
 	"\t-excludes\t\ttreat files on command line as exclude files\n",
 	"\t-ex[clude-list]\t\tlist of files to be excluded, terminated with ; e.g. file1 file2 ;\n",
 	"\t-extract-file <file>\tlist of directories or files to extract.  One per line\n",
 	"\t-exclude-file <file>\tlist of directories or files to exclude.  One per line\n",
-	"\t-match\t\t\tabort if any extract file does not match on\n\t\t\t\tanything, and can not be resolved.  Implies -missing-symlinks and -no-wildcards\n",
+	"\t-match\t\t\tabort if any extract file does not match on anything, and can not be resolved.  Implies -missing-symlinks and -no-wildcards\n",
 	"\t-follow[-symlinks]\tfollow symlinks in extract files, and add all files/symlinks needed to resolve extract file.  Implies -no-wildcards\n",
 	"\t-missing[-symlinks]\tUnsquashfs will abort if any symlink can't be resolved in -follow-symlinks\n",
 	"\t-no-wild[cards]\t\tdo not use wildcard matching in extract and exclude names\n",
@@ -51,7 +79,7 @@ static char *unsquashfs_text[]= {
 	"\t-cat\t\t\tcat the files on the command line to stdout\n",
 	"\t-f[orce]\t\tif destination directory already exists, descend into it and any sub-directories, and unlink (delete) files if they already exist before extracting to them\n",
 	"\t-pf <file>\t\toutput a pseudo file equivalent of the input Squashfs filesystem, use - for stdout\n",
-	"\nFilesystem information and listing options:\n",
+	"\n", "Filesystem information and listing options:", "\n",
 	"\t-s[tat]\t\t\tdisplay filesystem superblock information\n",
 	"\t-max[-depth] <levels>\tdescend at most <levels> of directories when listing\n",
 	"\t-i[nfo]\t\t\tprint files as they are extracted\n",
@@ -64,12 +92,12 @@ static char *unsquashfs_text[]= {
 	"\t-full[-precision]\tuse full precision when displaying times including seconds.  Use with -linfo, -lls, -lln and -llc\n",
 	"\t-UTC\t\t\tuse UTC rather than local time zone when displaying time\n",
 	"\t-mkfs-time\t\tdisplay filesystem superblock time, which is an unsigned 32-bit int representing the time in seconds since the epoch (1970-01-01)\n",
-	"\nFilesystem extended attribute (xattrs) options:\n",
-	"\t-no[-xattrs]\t\tdo not extract xattrs in file system", NOXOPT_STR"\n",
+	"\n", "Filesystem extended attribute (xattrs) options:", "\n",
+	"\t-no[-xattrs]\t\tdo not extract xattrs in file system" NOXOPT_STR "\n",
 	"\t-x[attrs]\t\textract xattrs in file system" XOPT_STR "\n",
 	"\t-xattrs-exclude <regex>\texclude any xattr names matching <regex>.  <regex> is a POSIX regular expression, e.g. -xattrs-exclude '^user.' excludes xattrs from the user namespace\n",
 	"\t-xattrs-include <regex>\tinclude any xattr names matching <regex>.  <regex> is a POSIX regular expression, e.g. -xattrs-include '^user.' includes xattrs from the user namespace\n",
-	"\nUnsquashfs runtime options:\n",
+	"\n", "Unsquashfs runtime options:", "\n",
 	"\t-v[ersion]\t\tprint version, licence and copyright information\n",
 	"\t-p[rocessors] <number>\tuse <number> processors.  By default will use the number of processors available\n",
 	"\t-mem <size>\t\tuse <size> physical memory for caches.  Use K, M or G to specify Kbytes, Mbytes or Gbytes respectively.  Default 512 Mbytes\n",
@@ -80,20 +108,28 @@ static char *unsquashfs_text[]= {
 	"\t-ig[nore-errors]\ttreat errors writing files to output as non-fatal\n",
 	"\t-st[rict-errors]\ttreat all errors as fatal\n",
 	"\t-no-exit[-code]\t\tdo not set exit code (to nonzero) on non-fatal errors\n",
-	"\nMiscellaneous options:\n",
+	"\n", "Help options:", "\n",
 	"\t-h[elp]\t\t\toutput this options text to stdout\n",
+	"\t-help-option <regex>\tprint the help information for Unsquashfs "
+		"options matching <regex> to stdout\n",
+	"\t-help-section <section>\tprint the help information for section <section> to stdout.  Use \"sections\" or \"h\" as section name to get a list of sections and their names\n",
+	"\t-ho <regex>\t\tshorthand alternative to -help-option\n",
+	"\t-hs <section>\t\tshorthand alternative to -help-section\n",
+	"\n", "Miscellaneous options:", "\n",
 	"\t-o[ffset] <bytes>\tskip <bytes> at start of FILESYSTEM.  Optionally a suffix of K, M or G can be given to specify Kbytes, Mbytes or Gbytes respectively (default 0 bytes).\n",
 	"\t-fstime\t\t\tsynonym for -mkfs-time\n",
 	"\t-e[f] <extract file>\tsynonym for -extract-file\n",
 	"\t-exc[f] <exclude file>\tsynonym for -exclude-file\n",
 	"\t-L\t\t\tsynonym for -follow-symlinks\n",
 	"\t-pseudo-file <file>\talternative name for -pf\n",
-	"\nExit status:\n",
+	"\n", "Environment:", "\n",
+	"\tPAGER\t\t\tIf set, this is used as the name of the program used to display the help text.  The value can be a simple command or a pathname.  The default is /usr/bin/pager\n",
+	"\n", "Exit status:", "\n",
 	"  0\tThe filesystem listed or extracted OK.\n",
 	"  1\tFATAL errors occurred, e.g. filesystem corruption, I/O errors.  Unsquashfs did not continue and aborted.\n",
 	"  2\tNon-fatal errors occurred, e.g. no support for XATTRs, Symbolic links in output filesystem or couldn't write permissions to output filesystem.  Unsquashfs continued and did not abort.\n",
 	"\nSee -ignore-errors, -strict-errors and -no-exit-code options for how they affect the exit status.\n",
-	"\nSee also:\n",
+	"\n", "See also (extra information elsewhere):", "\n",
 	"The README for the Squashfs-tools 4.6.1 release, describing the new features can be read here https://github.com/plougher/squashfs-tools/blob/master/README-4.6.1\n",
 	"\nThe Squashfs-tools USAGE guide can be read here https://github.com/plougher/squashfs-tools/blob/master/USAGE-4.6\n",
 	NULL
@@ -134,7 +170,144 @@ static void print_help_all(char *name, char *syntax, char **options_text)
 }
 
 
+static void print_option(char *prog_name, char *opt_name, char *pattern, char **options,
+					char **options_args, char **options_text)
+{
+	int i, res, matched = FALSE;
+	regex_t *preg = malloc(sizeof(regex_t));
+	int cols = get_column_width();
+
+	if(preg == NULL)
+		MEM_ERROR();
+
+	res = regcomp(preg, pattern, REG_EXTENDED|REG_NOSUB);
+
+	if(res) {
+		char str[1024]; /* overflow safe */
+
+		regerror(res, preg, str, 1024);
+		autowrap_printf(stderr, cols, "%s: %s invalid regex %s because %s\n", prog_name, opt_name, pattern, str);
+		exit(1);
+	}
+
+	for(i = 0; options[i] != NULL; i++) {
+		res = regexec(preg, options[i], (size_t) 0, NULL, 0);
+		if(res)
+			res = regexec(preg, options_args[i], (size_t) 0, NULL, 0);
+		if(!res) {
+			matched = TRUE;
+			autowrap_print(stdout, options_text[i], cols);
+		}
+	}
+
+	if(!matched) {
+		autowrap_printf(stderr, cols, "%s: %s %s does not match any %s option\n", prog_name, opt_name, pattern, prog_name);
+		exit(1);
+	} else
+		exit(0);
+}
+
+
+static int is_header(int i)
+{
+	int length = strlen(unsquashfs_text[i]);
+
+	return length && unsquashfs_text[i][length - 1] == ':';
+}
+
+
+static void print_section_names(FILE *out, char *string, int cols)
+{
+	int i, j;
+
+	autowrap_printf(out, cols, "%sSECTION NAME\t\tSECTION\n", string);
+
+	for(i = 0, j = 0; unsquashfs_sections[i] != NULL; j++)
+		if(is_header(j)) {
+			autowrap_printf(out, cols, "%s%s\t\t%s%s\n", string, unsquashfs_sections[i], strlen(unsquashfs_sections[i]) > 7 ? "" : "\t", unsquashfs_text[j]);
+			i++;
+		}
+}
+
+
+void unsquashfs_section(char *prog_name, char *opt_name, char *sec_name)
+{
+	int i, j, secs, cols, tty = isatty(STDOUT_FILENO);
+	pid_t pager_pid;
+	FILE *pager;
+
+	if(tty) {
+		cols = get_column_width();
+
+		pager = exec_pager(&pager_pid);
+		if(pager == NULL)
+			exit(1);
+	} else {
+		cols = 80;
+		pager = stdout;
+	}
+
+	if(strcmp(sec_name, "sections") == 0 || strcmp(sec_name, "h") == 0) {
+		autowrap_printf(pager, cols, "\nUse following section name to print %s help information for that section\n\n", prog_name);
+		print_section_names(pager , "", cols);
+		goto finish;
+	}
+
+	for(i = 0; unsquashfs_sections[i] != NULL; i++)
+		if(strcmp(unsquashfs_sections[i], sec_name) == 0)
+			break;
+
+	if(unsquashfs_sections[i] == NULL) {
+		autowrap_printf(pager, cols, "%s: %s %s does not match any section name\n", prog_name, opt_name, sec_name);
+		print_section_names(pager, "", cols);
+		goto finish;
+	}
+
+	i++;
+
+	for(j = 0, secs = 0; unsquashfs_text[j] != NULL && secs <= i; j ++) {
+		if(is_header(j))
+			secs++;
+		if(i == secs)
+			autowrap_print(pager, unsquashfs_text[j], cols);
+	}
+
+finish:
+	if(tty) {
+		fclose(pager);
+		wait_to_die(pager_pid);
+	}
+
+	exit(0);
+}
+
+
+static void print_help(int error, char *prog_name, char *syntax, char **sections, char **options_text)
+{
+	FILE *stream = error ? stderr : stdout;
+	int cols = get_column_width();
+
+	autowrap_printf(stream, cols, syntax, prog_name);
+	autowrap_printf(stream, cols, "Run\n  \"%s -help-section <section-name>\" to get help on these sections\n", prog_name);
+	print_section_names(stream, "\t", cols);
+	autowrap_printf(stream, cols, "\nOr run\n  \"%s -help-option <regex>\" to get help on all options matching <regex>\n", prog_name);
+	autowrap_printf(stream, cols, "\nOr run\n  \"%s -help-all\" to get help on all the sections\n", prog_name);
+	exit(error);
+}
+
+
 void unsquashfs_help_all(char *name)
 {
         print_help_all(name, UNSQUASHFS_SYNTAX, unsquashfs_text);
+}
+
+
+void unsquashfs_option(char *prog_name, char *opt_name, char *pattern)
+{
+	print_option(prog_name, opt_name, pattern, unsquashfs_options, unsquashfs_args, unsquashfs_text);
+}
+
+void unsquashfs_help(int error, char *prog_name)
+{
+	print_help(error, prog_name, UNSQUASHFS_SYNTAX, unsquashfs_sections, unsquashfs_text);
 }

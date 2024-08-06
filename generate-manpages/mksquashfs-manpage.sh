@@ -37,7 +37,7 @@ done
 
 tmp=$(mktemp -d)
 
-# Run mksquashfs -help, expand TABS to spaces, and output the help text to
+# Run mksquashfs -help-all, expand TABS to spaces, and output the help text to
 # $tmp/mksquashfs.help.  This is to allow it to be modified before
 # passing to help2man.
 
@@ -250,7 +250,6 @@ b again
 s/\([^.]\)\n/\1.\n/
 }" $tmp/mksquashfs.help
 
-# Make Compressors available header into a manpage section
 # Make Compressors available header into a manpage section
 
 ${SED} -i "s/\(Compressors available and compressor specific options\):/*\1*/" $tmp/mksquashfs.help

@@ -35,6 +35,7 @@
 #include "nprocessors_compat.h"
 #include "memory_compat.h"
 #include "memory.h"
+#include "print_pager.h"
 #include "unsquashfs_help.h"
 
 #ifdef __linux__
@@ -3946,6 +3947,19 @@ static void print_cat_options(FILE *stream, char *name)
 }
 
 
+static void check_pager()
+{
+	char * string = getenv("PAGER");
+
+	if(string != NULL) {
+		int res = check_and_set_pager(string);
+
+		if(res == FALSE)
+			exit(1);
+	}
+}
+
+
 static void print_version(char *string)
 {
 	printf("%s version " VERSION " (" DATE ")\n", string);
@@ -4147,9 +4161,24 @@ static int parse_options(int argc, char *argv[])
 	for(i = 1; i < argc; i++) {
 		if(*argv[i] != '-')
 			break;
-		if(strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "-h") == 0) {
+		if(strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "-h") == 0)
+			unsquashfs_help(FALSE, argv[0]);
+		else if(strcmp(argv[i], "-help-all") == 0 || strcmp(argv[i], "-ha") == 0)
 			unsquashfs_help_all(argv[0]);
-			exit(0);
+		else if(strcmp(argv[i], "-help-option") == 0 || strcmp(argv[i], "-ho") == 0) {
+			if(++i == argc) {
+				ERROR("%s: %s missing regex\n", argv[0], argv[i - 1]);
+				exit(1);
+			}
+
+			unsquashfs_option(argv[0], argv[i - 1], argv[i]);
+		} else if(strcmp(argv[i], "-help-section") == 0 || strcmp(argv[i], "-hs") == 0) {
+			if(++i == argc) {
+				ERROR("%s: %s missing section\n", argv[0], argv[i - 1]);
+				exit(1);
+			}
+
+			unsquashfs_section(argv[0], argv[i - 1], argv[i]);
 		} else if(strcmp(argv[i], "-pseudo-file") == 0 ||
 				strcmp(argv[i], "-pf") == 0) {
 			if(++i == argc) {
@@ -4458,10 +4487,8 @@ static int parse_options(int argc, char *argv[])
 		} else if(strcmp(argv[i], "-full-precision") == 0 ||
 				strcmp(argv[i], "-full") == 0)
 			full_precision = TRUE;
-		else {
-			unsquashfs_help_all(argv[0]);
-			exit(1);
-		}
+		else 
+			unsquashfs_help(TRUE, argv[0]);
 	}
 
 	if(dest[0] == '\0' && !lsonly)
@@ -4510,8 +4537,9 @@ static int parse_options(int argc, char *argv[])
 
 	if(i == argc) {
 		if(!version)
-			unsquashfs_help_all(argv[0]);
-		exit(1);
+			unsquashfs_help(TRUE, argv[0]);
+		else
+			exit(1);
 	}
 
 	return i;
@@ -4524,6 +4552,8 @@ int main(int argc, char *argv[])
 	long res;
 	int exit_code = 0;
 	char *command;
+
+	check_pager();
 
 	pthread_mutex_init(&screen_mutex, NULL);
 	root_process = geteuid() == 0;

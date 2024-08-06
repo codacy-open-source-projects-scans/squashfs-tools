@@ -37,11 +37,11 @@ done
 
 tmp=$(mktemp -d)
 
-# Run sqfstar -help, expand TABS to spaces, and output the help text to
+# Run sqfstar -help-all, expand TABS to spaces, and output the help text to
 # $tmp/sqfstar.help.  This is to allow it to be modified before
 # passing to help2man.
 
-if ! $1/sqfstar -help > $tmp/sqfstar.help2; then
+if ! $1/sqfstar -help-all > $tmp/sqfstar.help2; then
 	error "$0: Running Sqfstar failed.  Cross-compiled or incompatible binary?"
 	exit 1
 fi
@@ -244,7 +244,6 @@ s/\([^.]\)\n/\1.\n/
 }" $tmp/sqfstar.help
 
 # Make Compressors available header into a manpage section
-# Make Compressors available header into a manpage section
 
 ${SED} -i "s/\(Compressors available and compressor specific options\):/*\1*/" $tmp/sqfstar.help
 
@@ -253,7 +252,7 @@ ${SED} -i "s/\(Compressors available and compressor specific options\):/*\1*/" $
 ${SED} -i "s/\(Pseudo file definition format\):/*\1*/" $tmp/sqfstar.help
 
 # Add reference to manpages for other squashfs-tools programs
-${SED} -i "s/See also:/See also:\nmksquashfs(1), unsquashfs(1), sqfscat(1)\n/" $tmp/sqfstar.help
+${SED} -i "s/See also (extra information elsewhere):/See also:\nmksquashfs(1), unsquashfs(1), sqfscat(1)\n/" $tmp/sqfstar.help
 
 # Make Exit status header into a manpage section
 
