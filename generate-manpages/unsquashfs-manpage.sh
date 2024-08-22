@@ -37,11 +37,11 @@ done
 
 tmp=$(mktemp -d)
 
-# Run unsquashfs -help, and output the help text to
+# Run unsquashfs -help-all, and output the help text to
 # $tmp/unsquashfs.help.  This is to allow it to be modified before
 # passing to help2man.
 
-if ! $1/unsquashfs -help > $tmp/unsquashfs.help; then
+if ! $1/unsquashfs -help-all > $tmp/unsquashfs.help; then
 	error "$0: Running Unsquashfs failed.  Cross-compiled or incompatible binary?"
 	exit 1
 fi
@@ -81,18 +81,17 @@ ${SED} -i "s/^copyright/Copyright/" $tmp/unsquashfs.version
 print >> $tmp/unsquashfs.version
 print "Written by Phillip Lougher <phillip@squashfs.org.uk>" >> $tmp/unsquashfs.version
 
+# If the second line isn't empty, it means the first line (starting with
+# SYNTAX) has wrapped.
+
+${SED} -i "1 {
+N
+/\n$/!s/\n/ /
+}" $tmp/unsquashfs.help
+
 # help2man expects "Usage: ", and so rename "SYNTAX:" to "Usage: "
 
 ${SED} -i "s/^SYNTAX:/Usage: /" $tmp/unsquashfs.help
-
-# The Usage text expands over two lines, and that confuses help2man.
-# So concatenate the lines if the second isn't empty
-
-${SED} -i "/^Usage/ {
-N
-/\n$/b
-s/\n/ /
-}" $tmp/unsquashfs.help
 
 # Man pages expect the options to be in the "Options" section.  So insert
 # Options section after Usage
