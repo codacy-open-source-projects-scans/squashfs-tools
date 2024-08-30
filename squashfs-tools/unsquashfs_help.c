@@ -47,8 +47,15 @@ static char *unsquashfs_options[]={
 	"-xattrs", "-xattrs-exclude", "-xattrs-include", "", "", "", "-version",
 	"-processors", "-mem", "-mem-percent", "-quiet", "-no-progress",
 	"-percentage", "-ignore-errors", "-strict-errors", "-no-exit-code",
-	"", "", "", "-help", "-help-section", "-hs", "", "", "", "-offset",
-	"-fstime", "-ef", "-excf", "-L", "-pseudo-file", "", "", "", NULL,
+	"", "", "", "-help", "-help-option", "-help-section", "-help-all",
+	"-ho", "-hs", "-ha", "", "", "", "-offset", "-fstime", "-ef", "-excf",
+	"-L", "-pseudo-file", "", "", "", NULL,
+};
+
+static char *sqfscat_options[]={ "", "", "-version", "-processors", "-mem",
+	"-mem-percent", "-offset", "-ignore-errors", "-strict-errors",
+	"-no-exit-code", "", "", "","-no-wildcards", "-regex", "", "", "",
+	"-help", "-help-option", "-help-section", "-ho", "-hs", NULL,
 };
 
 static char *unsquashfs_args[]={
@@ -56,14 +63,24 @@ static char *unsquashfs_args[]={
 	"<time>", "", "", "<file>", "", "", "", "", "<levels>", "", "",
 	"", "", "", "", "", "", "", "", "", "", "", "", "", "<regex>",
 	"<regex>", "", "", "", "", "<number>", "<size>", "<percent>",
-	"", "", "", "", "", "", "", "", "", "", "<section>", "<section>",
-	"", "", "", "<bytes>", "", "<extract file>", "<exclude file>", "",
-	"<file>", "", "", "",
+	"", "", "", "", "", "", "", "", "", "", "<regex>", "<section>", "",
+	"<regex>", "<section>", "", "", "", "", "<bytes>", "", "<extract file>",
+	"<exclude file>", "", "<file>", "", "", "",
+};
+
+static char *sqfscat_args[]={
+	"", "", "", "<number>", "<size>", "<percent>", "<bytes>", "", "", "",
+	"", "", "", "", "", "", "", "", "", "<regex>", "<section>", "<regex>",
+	"<section>"
 };
 
 static char *unsquashfs_sections[]={
 	"extraction", "information", "xattrs", "runtime", "help", "misc",
 	"environment", "exit", "extra", NULL
+};
+
+static char *sqfscat_sections[]={
+	"runtime", "filter", "help", "environment", "exit", "extra", NULL
 };
 
 static char *unsquashfs_text[]={
@@ -110,7 +127,8 @@ static char *unsquashfs_text[]={
 	"\t-max[-depth] <levels>\tdescend at most <levels> of directories when "
 		"listing\n",
 	"\t-i[nfo]\t\t\tprint files as they are extracted\n",
-	"\t-li[nfo]\t\tprint files as they are extracted with file attributes "			"(like ls -l output)\n",
+	"\t-li[nfo]\t\tprint files as they are extracted with file attributes "
+		"(like ls -l output)\n",
 	"\t-l[s]\t\t\tlist filesystem, but do not extract files\n",
 	"\t-ll[s]\t\t\tlist filesystem with file attributes (like ls -l "
 		"output), but do not extract files\n",
@@ -158,10 +176,11 @@ static char *unsquashfs_text[]={
 	"\t-help-option <regex>\tprint the help information for Unsquashfs "
 		"options matching <regex> to stdout\n",
 	"\t-help-section <section>\tprint the help information for section "
-		"<section> to stdout.  Use \"sections\" or \"h\" as section "
-		"name to get a list of sections and their names\n",
+		"<section> to pager (or stdout if not a terminal).  Use "
+		"\"sections\" or \"h\" as section name to get a list of "
+		"sections and their names\n",
 	"\t-help-all\t\tprint help information for all Unsquashfs options and "
-		"sections to stdout\n",
+		"sections to pager (or stdout if not a terminal)\n",
 	"\t-ho <regex>\t\tshorthand alternative to -help-option\n",
 	"\t-hs <section>\t\tshorthand alternative to -help-section\n",
 	"\t-ha\t\t\tshorthand alternative to -help-all\n",
@@ -198,7 +217,7 @@ static char *unsquashfs_text[]={
 
 
 static char *sqfscat_text[]={
-	"Options:\n",
+	"Runtime options:", "\n",
 	"\t-v[ersion]\t\tprint version, licence and copyright information\n",
 	"\t-p[rocessors] <number>\tuse <number> processors.  By default will use the number of processors available\n",
 	"\t-mem <size>\t\tuse <size> physical memory for caches.  Use K, M or G to specify Kbytes, Mbytes or Gbytes respectively.  Default 512 Mbytes\n",
@@ -207,19 +226,29 @@ static char *sqfscat_text[]={
 	"\t-ig[nore-errors]\ttreat errors writing files to stdout as non-fatal\n",
 	"\t-st[rict-errors]\ttreat all errors as fatal\n",
 	"\t-no-exit[-code]\t\tdon't set exit code (to nonzero) on non-fatal errors\n",
+	"\n", "Filter options:", "\n",
 	"\t-no-wild[cards]\t\tdo not use wildcard matching in filenames\n",
 	"\t-r[egex]\t\ttreat filenames as POSIX regular expressions rather than use the default shell wildcard expansion (globbing)\n",
-	"\t-h[elp]\t\t\toutput options text to stdout\n",
+	"\n", "Help options:", "\n",
+	"\t-h[elp]\t\t\tprint help information for all Sqfscat options to pager (or stdout if not a terminal)\n",
+	"\t-help-option <regex>\tprint the help information for Sqfscat "
+		"options matching <regex> to stdout\n",
+	"\t-help-section <section>\tprint the help information for section "
+		"<section> to pager (or stdout if not a terminal).  Use "
+		"\"sections\" or \"h\" as section name to get a list of "
+		"sections and their names\n",
+	"\t-ho <regex>\t\tshorthand alternative to -help-option\n",
+	"\t-hs <section>\t\tshorthand alternative to -help-section\n",
 	"\n", "Environment:", "\n",
 	"\tPAGER\t\t\tIf set, this is used as the name of the program used to "
 		"display the help text.  The value can be a simple command or "
 		"a pathname.  The default is /usr/bin/pager\n",
-	"\nExit status:\n",
+	"\n", "Exit status:", "\n",
 	"  0\tThe file or files were output to stdout OK.\n",
 	"  1\tFATAL errors occurred, e.g. filesystem corruption, I/O errors.  Sqfscat did not continue and aborted.\n",
 	"  2\tNon-fatal errors occurred, e.g. not a regular file, or failed to resolve pathname.  Sqfscat continued and did not abort.\n",
 	"\nSee -ignore-errors, -strict-errors and -no-exit-code options for how they affect the exit status.\n",
-	"\nSee also:\n",
+	"\n", "See also (extra information elsewhere):", "\n",
 	"The README for the Squashfs-tools 4.6.1 release describing the new features can be read here https://github.com/plougher/squashfs-tools/blob/master/README-4.6.1\n",
 	"\nThe Squashfs-tools USAGE guide can be read here https://github.com/plougher/squashfs-tools/blob/master/USAGE-4.6\n",
 	NULL,
@@ -299,29 +328,29 @@ static void print_option(char *prog_name, char *opt_name, char *pattern, char **
 }
 
 
-static int is_header(int i)
+static int is_header(int i, char **options_text)
 {
-	int length = strlen(unsquashfs_text[i]);
+	int length = strlen(options_text[i]);
 
-	return length && unsquashfs_text[i][length - 1] == ':';
+	return length && options_text[i][length - 1] == ':';
 }
 
 
-static void print_section_names(FILE *out, char *string, int cols)
+static void print_section_names(FILE *out, char *string, int cols, char **sections, char **options_text)
 {
 	int i, j;
 
 	autowrap_printf(out, cols, "%sSECTION NAME\t\tSECTION\n", string);
 
-	for(i = 0, j = 0; unsquashfs_sections[i] != NULL; j++)
-		if(is_header(j)) {
-			autowrap_printf(out, cols, "%s%s\t\t%s%s\n", string, unsquashfs_sections[i], strlen(unsquashfs_sections[i]) > 7 ? "" : "\t", unsquashfs_text[j]);
+	for(i = 0, j = 0; sections[i] != NULL; j++)
+		if(is_header(j, options_text)) {
+			autowrap_printf(out, cols, "%s%s\t\t%s%s\n", string, sections[i], strlen(sections[i]) > 7 ? "" : "\t", options_text[j]);
 			i++;
 		}
 }
 
 
-void unsquashfs_section(char *prog_name, char *opt_name, char *sec_name)
+static void print_section(char *prog_name, char *opt_name, char *sec_name, char **sections, char **options_text)
 {
 	int i, j, secs, cols, tty = isatty(STDOUT_FILENO);
 	pid_t pager_pid;
@@ -340,27 +369,27 @@ void unsquashfs_section(char *prog_name, char *opt_name, char *sec_name)
 
 	if(strcmp(sec_name, "sections") == 0 || strcmp(sec_name, "h") == 0) {
 		autowrap_printf(pager, cols, "\nUse following section name to print %s help information for that section\n\n", prog_name);
-		print_section_names(pager , "", cols);
+		print_section_names(pager , "", cols, sections, options_text);
 		goto finish;
 	}
 
-	for(i = 0; unsquashfs_sections[i] != NULL; i++)
-		if(strcmp(unsquashfs_sections[i], sec_name) == 0)
+	for(i = 0; sections[i] != NULL; i++)
+		if(strcmp(sections[i], sec_name) == 0)
 			break;
 
-	if(unsquashfs_sections[i] == NULL) {
+	if(sections[i] == NULL) {
 		autowrap_printf(pager, cols, "%s: %s %s does not match any section name\n", prog_name, opt_name, sec_name);
-		print_section_names(pager, "", cols);
+		print_section_names(pager, "", cols, sections, options_text);
 		goto finish;
 	}
 
 	i++;
 
-	for(j = 0, secs = 0; unsquashfs_text[j] != NULL && secs <= i; j ++) {
-		if(is_header(j))
+	for(j = 0, secs = 0; options_text[j] != NULL && secs <= i; j ++) {
+		if(is_header(j, options_text))
 			secs++;
 		if(i == secs)
-			autowrap_print(pager, unsquashfs_text[j], cols);
+			autowrap_print(pager, options_text[j], cols);
 	}
 
 finish:
@@ -379,7 +408,7 @@ static void handle_invalid_option(char *prog_name, char *opt_name, char **sectio
 
 	autowrap_printf(stderr, cols, "%s: %s is an invalid option\n\n", prog_name, opt_name);
 	fprintf(stderr, "Run\n  \"%s -help-section <section-name>\" to get help on these sections\n", prog_name);
-	print_section_names(stderr, "\t", cols);
+	print_section_names(stderr, "\t", cols, sections, options_text);
 	autowrap_printf(stderr, cols, "\nOr run\n  \"%s -help-option <regex>\" to get help on all options matching <regex>\n", prog_name);
 	autowrap_printf(stderr, cols, "\nOr run\n  \"%s -help-all\" to get help on all the sections\n", prog_name);
 	exit(1);
@@ -393,7 +422,7 @@ static void print_help(int error, char *prog_name, char *syntax, char **sections
 
 	autowrap_printf(stream, cols, syntax, prog_name);
 	autowrap_printf(stream, cols, "Run\n  \"%s -help-section <section-name>\" to get help on these sections\n", prog_name);
-	print_section_names(stream, "\t", cols);
+	print_section_names(stream, "\t", cols, sections, options_text);
 	autowrap_printf(stream, cols, "\nOr run\n  \"%s -help-option <regex>\" to get help on all options matching <regex>\n", prog_name);
 	autowrap_printf(stream, cols, "\nOr run\n  \"%s -help-all\" to get help on all the sections\n", prog_name);
 	exit(error);
@@ -406,7 +435,7 @@ static void print_option_help(char *prog_name, char *option, char **sections, ch
 
 	autowrap_printf(stderr, cols, "\nRun\n  \"%s -help-option %s$\" to get help on %s option\n", prog_name, option, option);
 	autowrap_printf(stderr, cols, "Or run\n  \"%s -help-section <section-name>\" to get help on these sections\n", prog_name);
-	print_section_names(stderr, "\t", cols);
+	print_section_names(stderr, "\t", cols, sections, options_text);
 	autowrap_printf(stderr, cols, "\nOr run\n  \"%s -help-option <regex>\" to get help on all options matching <regex>\n", prog_name);
 	autowrap_printf(stderr, cols, "\nOr run\n  \"%s -help-all\" to get help on all the sections\n", prog_name);
 	exit(1);
@@ -416,6 +445,12 @@ static void print_option_help(char *prog_name, char *option, char **sections, ch
 void unsquashfs_help_all(char *name)
 {
         print_help_all(name, UNSQUASHFS_SYNTAX, unsquashfs_text);
+}
+
+
+void unsquashfs_section(char *prog_name, char *opt_name, char *sec_name)
+{
+	print_section(prog_name, opt_name, sec_name, unsquashfs_sections, unsquashfs_text);
 }
 
 
@@ -443,7 +478,25 @@ void unsquashfs_option_help(char *prog_name, char *option)
 }
 
 
-void sqfscat_help(char *name)
+void sqfscat_help_all(char *name)
 {
 	print_help_all(name, SQFSCAT_SYNTAX, sqfscat_text);
+}
+
+
+void sqfscat_section(char *prog_name, char *opt_name, char *sec_name)
+{
+	print_section(prog_name, opt_name, sec_name, sqfscat_sections, sqfscat_text);
+}
+
+
+void sqfscat_option(char *prog_name, char *opt_name, char *pattern)
+{
+	print_option(prog_name, opt_name, pattern, sqfscat_options, sqfscat_args, sqfscat_text);
+}
+
+
+void sqfscat_help(int error, char *prog_name)
+{
+	print_help(error, prog_name, SQFSCAT_SYNTAX, sqfscat_sections, sqfscat_text);
 }

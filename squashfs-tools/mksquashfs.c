@@ -629,8 +629,6 @@ int read_fs_bytes(int fd, long long byte, long long bytes, void *buff)
 	TRACE("read_fs_bytes: reading from position 0x%llx, bytes %lld\n",
 		byte, bytes);
 
-	pthread_cleanup_push((void *) pthread_mutex_unlock, &pos_mutex);
-	pthread_mutex_lock(&pos_mutex);
 	if(lseek(fd, start_offset + off, SEEK_SET) == -1) {
 		ERROR("read_fs_bytes: Lseek on destination failed because %s, "
 			"offset=0x%llx\n", strerror(errno), start_offset + off);
@@ -640,7 +638,6 @@ int read_fs_bytes(int fd, long long byte, long long bytes, void *buff)
 		res = 0;
 	}
 
-	pthread_cleanup_pop(1);
 	return res;
 }
 
@@ -672,9 +669,6 @@ void write_destination(int fd, long long byte, long long bytes, void *buff)
 {
 	off_t off = byte;
 
-	pthread_cleanup_push((void *) pthread_mutex_unlock, &pos_mutex);
-	pthread_mutex_lock(&pos_mutex);
-
 	if(lseek(fd, start_offset + off, SEEK_SET) == -1) {
 		ERROR("write_destination: Lseek on destination "
 			"failed because %s, offset=0x%llx\n", strerror(errno),
@@ -686,8 +680,6 @@ void write_destination(int fd, long long byte, long long bytes, void *buff)
 	if(write_bytes(fd, buff, bytes) == -1)
 		BAD_ERROR("Failed to write to output %s\n",
 			block_device ? "block device" : "filesystem");
-
-	pthread_cleanup_pop(1);
 }
 
 
@@ -2545,8 +2537,23 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 }
 
 
+void cleanup(void *arg)
+{
+	int fd = *((int *) arg);
+
+	close(fd);
+}
+
+
 static void *writer(void *arg)
 {
+	off_t wpos = 0;
+	int fd = open(destination_file, O_WRONLY);
+	if(fd == -1)
+		BAD_ERROR("Writer failed to open destination file\n");
+
+	pthread_cleanup_push(cleanup, &fd);
+
 	while(1) {
 		struct file_buffer *file_buffer = queue_get(to_writer);
 		off_t off;
@@ -2556,28 +2563,29 @@ static void *writer(void *arg)
 			continue;
 		}
 
-		off = file_buffer->block;
+		off = start_offset + file_buffer->block;
 
-		pthread_cleanup_push((void *) pthread_mutex_unlock, &pos_mutex);
-		pthread_mutex_lock(&pos_mutex);
+		if(wpos != off) {
+			if(lseek(fd, off, SEEK_SET) == -1) {
+				ERROR("writer: Lseek on destination failed because "
+					"%s, offset=0x%llx\n", strerror(errno), off);
+				BAD_ERROR("Probably out of space on output "
+					"%s\n", block_device ? "block device" :
+					"filesystem");
+			}
 
-		if(lseek(fd, start_offset + off, SEEK_SET) == -1) {
-			ERROR("writer: Lseek on destination failed because "
-				"%s, offset=0x%llx\n", strerror(errno), start_offset + off);
-			BAD_ERROR("Probably out of space on output "
-				"%s\n", block_device ? "block device" :
-				"filesystem");
+			wpos = off;
 		}
 
-		if(write_bytes(fd, file_buffer->data,
-				file_buffer->size) == -1)
+		if(write_bytes(fd, file_buffer->data, file_buffer->size) == -1)
 			BAD_ERROR("Failed to write to output %s\n",
 				block_device ? "block device" : "filesystem");
 
-		pthread_cleanup_pop(1);
-
+		wpos += file_buffer->size;
 		cache_block_put(file_buffer);
 	}
+
+	pthread_cleanup_pop(1);
 }
 
 
@@ -6645,7 +6653,7 @@ static int sqfstar(int argc, char *argv[])
 				sqfstar_option_help(argv[0], argv[i - 1]);
 			}
 		} else if(strcmp(argv[i], "-mem") == 0) {
-			long long number;
+			long long number = 0;
 
 			if(mem_options_disabled) {
 				ERROR("Ignoring -mem option because amount of "
@@ -7123,6 +7131,8 @@ static int sqfstar(int argc, char *argv[])
 	queue_put(to_writer, NULL);
 	if(queue_get(from_writer) != 0)
 		EXIT_MKSQUASHFS();
+
+	pthread_cancel(writer_thread);
 
 	set_progressbar_state(FALSE);
 	write_filesystem_tables(&sBlk);
@@ -7727,7 +7737,7 @@ int main(int argc, char *argv[])
 				exit(1);
 			}
 		} else if(strcmp(argv[i], "-mem") == 0) {
-			long long number;
+			long long number = 0;
 
 			if(mem_options_disabled) {
 				ERROR("Ignoring -mem option because amount of "
@@ -8469,6 +8479,8 @@ int main(int argc, char *argv[])
 	queue_put(to_writer, NULL);
 	if(queue_get(from_writer) != 0)
 		EXIT_MKSQUASHFS();
+
+	pthread_cancel(writer_thread);
 
 	set_progressbar_state(FALSE);
 	write_filesystem_tables(&sBlk);
