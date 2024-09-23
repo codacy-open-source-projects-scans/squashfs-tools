@@ -25,7 +25,7 @@ GZIP_SUPPORT = 1
 #
 # LZMA2 compression.
 #
-# XZ Utils liblzma (http://tukaani.org/xz/) is supported
+# XZ Utils liblzma (https://tukaani.org/xz/) is supported
 #
 # Development packages (libraries and header files) should be
 # supported by most modern distributions.  Please refer to
@@ -34,7 +34,7 @@ GZIP_SUPPORT = 1
 # To build install the library and uncomment
 # the XZ_SUPPORT line below.
 #
-#XZ_SUPPORT = 1
+XZ_SUPPORT = 1
 
 # Enable support for OpenWrt extended compression options by uncommenting
 # next line.  Do not do this unless you understand the implications.
@@ -52,7 +52,7 @@ GZIP_SUPPORT = 1
 # To build install the library and uncomment
 # the LZO_SUPPORT line below.
 #
-#LZO_SUPPORT = 1
+LZO_SUPPORT = 1
 
 
 ########### Building LZ4 support #############
@@ -68,7 +68,7 @@ GZIP_SUPPORT = 1
 # To build install and uncomment
 # the LZ4_SUPPORT line below.
 #
-#LZ4_SUPPORT = 1
+LZ4_SUPPORT = 1
 
 
 ########### Building ZSTD support ############
@@ -84,7 +84,7 @@ GZIP_SUPPORT = 1
 # To build install the library and uncomment
 # the ZSTD_SUPPORT line below.
 #
-#ZSTD_SUPPORT = 1
+ZSTD_SUPPORT = 1
 
 
 ######## Specifying default compression ########
@@ -178,7 +178,7 @@ INSTALL_MANPAGES_DIR = $(INSTALL_PREFIX)/man/man1
 # LZMA1 compression is obsolete, and the newer and better XZ (LZMA2)
 # compression should be used in preference.
 #
-# Both XZ Utils liblzma (http://tukaani.org/xz/) and LZMA SDK
+# Both XZ Utils liblzma (https://tukaani.org/xz/) and LZMA SDK
 # (http://www.7-zip.org/sdk.html) are supported
 #
 # To build using XZ Utils liblzma - install the library and uncomment
