@@ -3,7 +3,7 @@
  * filesystem.
  *
  * Copyright (c) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011,
- * 2012, 2013, 2014, 2017, 2019, 2021, 2022, 2023
+ * 2012, 2013, 2014, 2017, 2019, 2021, 2022, 2023, 2024
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -167,8 +167,9 @@ regex_t *xattr_include_preg = NULL;
 /* Does Mksquashfs print a summary and other information when running? */
 int quiet = FALSE;
 
-/* Does Mksquashfs display filenames as they are archived? */
-int silent = TRUE;
+/* Does Mksquashfs display information as files and directories are archived? */
+int display_info = FALSE;
+FILE *info_file = NULL;
 
 /* Is Mksquashfs using the older non-wildcard exclude code? */
 int old_exclude = TRUE;
@@ -351,7 +352,7 @@ char *option_table[] = { "comp", "b", "mkfs-time", "fstime", "all-time",
 	"root-time", "root-uid", "root-gid", "xattrs-exclude", "xattrs-include",
 	"xattrs-add", "default-mode", "default-uid", "default-gid",
 	"mem-percent", "-pd", "-pseudo-dir", "help-option", "ho", "help-section",
-	"hs", NULL
+	"hs", "info-file", NULL
 };
 
 char *sqfstar_option_table[] = { "comp", "b", "mkfs-time", "fstime", "all-time",
@@ -359,7 +360,8 @@ char *sqfstar_option_table[] = { "comp", "b", "mkfs-time", "fstime", "all-time",
 	"processors", "mem", "offset", "o", "root-time", "root-uid",
 	"root-gid", "xattrs-exclude", "xattrs-include", "xattrs-add", "p", "pf",
 	"default-mode", "default-uid", "default-gid", "mem-percent", "pd",
-	"pseudo-dir", "help-option", "ho", "help-section", "hs", NULL
+	"pseudo-dir", "help-option", "ho", "help-section", "hs", "info-file",
+	NULL
 };
 
 static char *read_from_disk(long long start, unsigned int avail_bytes, int buff);
@@ -6382,6 +6384,27 @@ static int get_gid_from_arg(char *arg, unsigned int *gid)
 }
 
 
+FILE *open_info_file(char *filename)
+{
+	FILE *file;
+	struct stat buf;
+	int res;
+
+	res = stat(filename, &buf);
+	if(res == -1) {
+		if(errno != ENOENT)
+			BAD_ERROR("Failed to stat info_file filename \"%s\" because %s\n", strerror(errno));
+
+		file = fopen(filename, "w");
+		if(file == NULL)
+			BAD_ERROR("Failed to create info_file filename \"%s\" because %s\n", filename, strerror(errno));
+	} else
+		BAD_ERROR("Info_file filename \"%s\" already exists!\n", filename);
+
+	return file;
+}
+
+
 static int sqfstar(int argc, char *argv[])
 {
 	struct stat buf;
@@ -6394,6 +6417,7 @@ static int sqfstar(int argc, char *argv[])
 	int total_mem = get_default_phys_mem();
 	int progress = TRUE;
 	int force_progress = FALSE;
+	int percentage = FALSE;
 	int Xhelp = FALSE;
 	int dest_index;
 	struct file_buffer **fragment = NULL;
@@ -6960,9 +6984,18 @@ static int sqfstar(int argc, char *argv[])
 			nopad = TRUE;
 
 		else if(strcmp(argv[i], "-info") == 0)
-			silent = FALSE;
+			display_info = TRUE;
 
-		else if(strcmp(argv[i], "-force") == 0)
+		else if(strcmp(argv[i], "-info-file") == 0) {
+			if(++i == dest_index) {
+				ERROR("sqfstar: -info-file missing filename\n");
+				sqfstar_option_help(argv[i - 1]);
+			}
+
+			display_info = TRUE;
+			info_file = open_info_file(argv[i]);
+
+		} else if(strcmp(argv[i], "-force") == 0)
 			appending = FALSE;
 
 		else if(strcmp(argv[i], "-quiet") == 0)
@@ -6973,8 +7006,7 @@ static int sqfstar(int argc, char *argv[])
 
 		else if(strcmp(argv[i], "-percentage") == 0) {
 			progressbar_percentage();
-			progress = silent = TRUE;
-
+			percentage = TRUE;
 		} else
 			sqfstar_invalid_option(argv[i]);
 	}
@@ -7003,11 +7035,27 @@ static int sqfstar(int argc, char *argv[])
 		EXIT_MKSQUASHFS();
 
 	/*
+	 * Selecting both -no-progress and -percentage produces a conflict,
+	 * and so reject such command lines
+	 */
+	if(!progress && percentage)
+		BAD_ERROR("Only one of -no-progress and -percentage can be "
+			"specified.  Both causes a conflict.\n");
+
+	/*
+	 * Selecting both -no-progress and -progress produces a conflict,
+	 * and so reject such command lines
+	 */
+	if(!progress && force_progress)
+		BAD_ERROR("Only one of -no-progress and -progress can be "
+			"specified.  Both causes a conflict.\n");
+
+	/*
 	 * If the -info option has been selected then disable the
 	 * progress bar unless it has been explicitly enabled with
 	 * the -progress option
 	 */
-	if(!silent)
+	if(display_info && !info_file)
 		progress = force_progress;
 
 	/*
@@ -7239,6 +7287,7 @@ int main(int argc, char *argv[])
 	int total_mem = get_default_phys_mem();
 	int progress = TRUE;
 	int force_progress = FALSE;
+	int percentage = FALSE;
 	int exclude_option = FALSE;
 	int Xhelp = FALSE;
 	struct file_buffer **fragment = NULL;
@@ -8007,9 +8056,18 @@ int main(int argc, char *argv[])
 			nopad = TRUE;
 
 		else if(strcmp(argv[i], "-info") == 0)
-			silent = FALSE;
+			display_info = TRUE;
 
-		else if(strcmp(argv[i], "-e") == 0) {
+		else if(strcmp(argv[i], "-info-file") == 0) {
+			if(++i == argc) {
+				ERROR("mksquashfs: -info-file missing filename\n");
+				mksquashfs_option_help(argv[i - 1]);
+			}
+
+			display_info = TRUE;
+			info_file = open_info_file(argv[i]);
+
+		} else if(strcmp(argv[i], "-e") == 0) {
 			exclude_option = TRUE;
 			break;
 
@@ -8033,7 +8091,7 @@ int main(int argc, char *argv[])
 			root_name = argv[i];
 		} else if(strcmp(argv[i], "-percentage") == 0) {
 			progressbar_percentage();
-			progress = silent = TRUE;
+			percentage = TRUE;
 		} else if(strcmp(argv[i], "-version") == 0) {
 			print_version("mksquashfs");
 		} else if(strcmp(argv[i], "-cpiostyle") == 0 ||
@@ -8053,15 +8111,16 @@ int main(int argc, char *argv[])
 	 * from standard in.  We do not expect to have any sources
 	 * specified on the command line */
 	if(cpiostyle && source)
-		BAD_ERROR("Sources on the command line should be -, "
-			"when using -cpiostyle[0] options\n");
+		BAD_ERROR("Sources on the command line should be - when using "
+			"-cpiostyle[0] options, i.e. mksquashfs - image.sqfs "
+			"-cpiostyle\n");
 
 	/* If -tar option is set, then files will be read-in
 	 * from standard in.  We do not expect to have any sources
 	 * specified on the command line */
 	if(tarfile && source)
-		BAD_ERROR("Sources on the command line should be -, "
-			"when using -tar option\n");
+		BAD_ERROR("Sources on the command line should be - when using "
+			"-tar option, i.e. mksquashfs - image.sqfs -tar\n");
 
 	/* If -tar option is set, then check that actions have not been
 	 * specified, which are unsupported with tar file reading
@@ -8091,11 +8150,27 @@ int main(int argc, char *argv[])
 		EXIT_MKSQUASHFS();
 
 	/*
+	 * Selecting both -no-progress and -percentage produces a conflict,
+	 * and so reject such command lines
+	 */
+	if(!progress && percentage)
+		BAD_ERROR("Only one of -no-progress and -percentage can be "
+			"specified.  Both causes a conflict.\n");
+
+	/*
+	 * Selecting both -no-progress and -progress produces a conflict,
+	 * and so reject such command lines
+	 */
+	if(!progress && force_progress)
+		BAD_ERROR("Only one of -no-progress and -progress can be "
+			"specified.  Both causes a conflict.\n");
+
+	/*
 	 * If the -info option has been selected then disable the
 	 * progress bar unless it has been explicitly enabled with
 	 * the -progress option
 	 */
-	if(!silent)
+	if(display_info && !info_file)
 		progress = force_progress;
 		
 	/*
