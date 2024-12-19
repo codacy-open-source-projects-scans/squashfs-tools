@@ -78,11 +78,12 @@ static char *sqfscat_args[]={
 
 static char *unsquashfs_sections[]={
 	"extraction", "information", "xattrs", "runtime", "help", "misc",
-	"environment", "exit", "extra", NULL
+	"environment", "exit", "extra", "decompressors", NULL
 };
 
 static char *sqfscat_sections[]={
-	"runtime", "filter", "help", "environment", "exit", "extra", NULL
+	"runtime", "filter", "help", "environment", "exit", "extra",
+	"decompressors", NULL
 };
 
 static char *unsquashfs_text[]={
@@ -214,7 +215,8 @@ static char *unsquashfs_text[]={
 			"squashfs-tools/blob/master/README-4.6.1\n",
 	"\nThe Squashfs-tools USAGE guide can be read here https://github.com/"
 		"plougher/squashfs-tools/blob/master/USAGE-4.6\n",
-	NULL
+	"\n", "Decompressors available:", "\n",
+	"\t" DECOMPRESSORS "\n", NULL
 };
 
 
@@ -270,7 +272,8 @@ static char *sqfscat_text[]={
 		"squashfs-tools/blob/master/README-4.6.1\n",
 	"\nThe Squashfs-tools USAGE guide can be read here https://github.com/"
 		"plougher/squashfs-tools/blob/master/USAGE-4.6\n",
-	NULL,
+	"\n", "Decompressors available:", "\n",
+	"\t" DECOMPRESSORS "\n", NULL,
 };
 
 
@@ -295,10 +298,6 @@ static void print_help_all(char *name, char *syntax, char **options_text)
 
 	for(i = 0; options_text[i] != NULL; i++)
 		autowrap_print(pager, options_text[i], cols);
-
-	autowrap_print(pager, "\nDecompressors available:\n", cols);
-
-	display_compressors(pager, "", "");
 
 	if(tty) {
 		fclose(pager);
@@ -530,4 +529,11 @@ void sqfscat_invalid_option(char *opt_name)
 void sqfscat_option_help(char *option)
 {
 	print_option_help("sqfscat", option, sqfscat_sections, sqfscat_text);
+}
+
+
+void display_compressors() {
+	int cols = get_column_width();
+
+	autowrap_print(stderr, "\t" DECOMPRESSORS "\n", cols);
 }

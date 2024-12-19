@@ -246,7 +246,7 @@ extern struct dir_info *root_dir;
 extern struct pathnames *paths;
 extern int tarfile;
 extern int root_mode_opt;
-extern mode_t root_mode;
+extern struct mode_data *root_mode;
 extern int root_time_opt;
 extern unsigned int root_time;
 extern int root_uid_opt;
@@ -262,6 +262,8 @@ extern unsigned int global_uid;
 extern int global_gid_opt;
 extern unsigned int global_gid;
 extern int sleep_time;
+extern int global_dir_mode_opt;
+extern struct mode_data *global_dir_mode;
 
 extern int read_fs_bytes(int, long long, long long, void *);
 extern void add_file(long long, long long, long long, unsigned int *, int,

@@ -42,77 +42,80 @@ static char *mksquashfs_options[]={
 	"-no-compression", "", "", "", "-tar", "-no-strip", "-tarstyle",
 	"-cpiostyle", "-cpiostyle0", "-reproducible", "-not-reproducible",
 	"-mkfs-time", "-all-time", "-root-time", "-root-mode", "-root-uid",
-	"-root-gid", "-all-root", "-force-uid", "-force-gid",
-	"-pseudo-override", "-no-exports", "-exports", "-no-sparse",
-	"-no-tailends", "-tailends", "-no-fragments", "-no-duplicates",
-	"-no-hardlinks", "-keep-as-directory", "", "", "", "-p", "-pd", "-pd",
-	"-pf", "-sort", "-ef", "-wildcards", "-regex", "-max-depth",
-	"-one-file-system", "-one-file-system-x", "", "", "", "-no-xattrs",
-	"-xattrs", "-xattrs-exclude", "-xattrs-include", "-xattrs-add", "",
-	"", "", "-version", "-exit-on-error", "-quiet", "-info", "-info-file",
-	"-no-progress", "-progress", "-percentage", "-throttle", "-limit",
-	"-processors", "-mem", "-mem-percent", "-mem-default", "", "", "",
-	"-noappend", "-root-becomes", "-no-recovery", "-recovery-path",
-	"-recover", "", "", "", "-action", "-log-action", "-true-action",
-	"-false-action", "-action-file", "-log-action-file",
-	"-true-action-file", "-false-action-file", "", "", "", "-default-mode",
-	"-default-uid", "-default-gid", "-ignore-zeros", "", "", "", "-nopad",
-	"-offset", "-o", "", "", "", "-help", "-help-option", "-help-section",
-	"-help-comp", "-help-all", "-Xhelp", "-h", "-ho", "-hs", "-ha", "", "",
-	"", "-fstime", "-always-use-fragments", "-root-owned",
-	"-noInodeCompression", "-noIdTableCompression", "-noDataCompression",
-	"-noFragmentCompression", "-noXattrCompression", "-pseudo-dir", NULL,
+	"-root-gid", "-all-root", "-force-file-mode", "-force-dir-mode",
+	"-force-uid", "-force-gid", "-pseudo-override", "-no-exports",
+	"-exports", "-no-sparse", "-no-tailends", "-tailends", "-no-fragments",
+	"-no-duplicates", "-no-hardlinks", "-keep-as-directory", "", "", "",
+	"-p", "-pd", "-pd", "-pf", "-sort", "-ef", "-wildcards", "-regex",
+	"-max-depth", "-one-file-system", "-one-file-system-x", "", "", "",
+	"-no-xattrs", "-xattrs", "-xattrs-exclude", "-xattrs-include",
+	"-xattrs-add", "", "", "", "-version", "-exit-on-error", "-quiet",
+	"-info", "-info-file", "-no-progress", "-progress", "-percentage",
+	"-throttle", "-limit", "-processors", "-mem", "-mem-percent",
+	"-mem-default", "", "", "", "-noappend", "-root-becomes",
+	"-no-recovery", "-recovery-path", "-recover", "", "", "", "-action",
+	"-log-action", "-true-action", "-false-action", "-action-file",
+	"-log-action-file", "-true-action-file", "-false-action-file", "", "",
+	"", "-default-mode", "-default-uid", "-default-gid", "-ignore-zeros",
+	"", "", "", "-nopad", "-offset", "-o", "", "", "", "-help",
+	"-help-option", "-help-section", "-help-comp", "-help-all", "-Xhelp",
+	"-h", "-ho", "-hs", "-ha", "", "", "", "-fstime",
+	"-always-use-fragments", "-root-owned", "-noInodeCompression",
+	"-noIdTableCompression", "-noDataCompression", "-noFragmentCompression",
+	 "-noXattrCompression", "-pseudo-dir", NULL,
 };
 
 static char *sqfstar_options[]={
 	"", "", "-b", "-comp", "-noI", "-noId", "-noD", "-noF", "-noX",
 	"-no-compression", "", "", "", "-reproducible", "-not-reproducible",
 	"-mkfs-time", "-all-time", "-root-time", "-root-mode", "-root-uid",
-	"-root-gid", "-all-root", "-force-uid", "-force-gid", "-default-mode",
-	"-default-uid", "-default-gid", "-pseudo-override", "-exports",
-	"-no-sparse", "-no-fragments", "-no-tailends", "-no-duplicates",
-	"-no-hardlinks", "", "", "", "-p", "-pd", "-pd", "-pf", "-ef", "-regex",
-	"-ignore-zeros", "", "", "", "-no-xattrs", "-xattrs", "-xattrs-exclude",
+	"-root-gid", "-all-root", "-force-file-mode", "-force-dir-mode",
+	"-force-uid", "-force-gid", "-default-mode", "-default-uid",
+	"-default-gid", "-pseudo-override", "-exports", "-no-sparse",
+	"-no-fragments", "-no-tailends", "-no-duplicates", "-no-hardlinks", "",
+	"", "", "-p", "-pd", "-pd", "-pf", "-ef", "-regex", "-ignore-zeros",
+	"", "", "", "-no-xattrs", "-xattrs", "-xattrs-exclude",
 	"-xattrs-include", "-xattrs-add", "", "","", "-version", "-force",
 	"-exit-on-error", "-quiet", "-info", "-info-file", "-no-progress",
 	"-progress", "-percentage", "-throttle", "-limit", "-processors",
 	"-mem", "-mem-percent", "-mem-default", "", "", "", "-nopad", "-offset",
-	"-o", "", "", "", "-help", "help-option", "-help-section", "-help-comp",
-	"-help-all", "-Xhelp", "-h", "-ho", "-hs", "-ha", "", "", "",
-	"-fstime", "-root-owned", "-noInodeCompression",
-	"-noIdTableCompression", "-noDataCompression",
-	"-noFragmentCompression", "-noXattrCompression", NULL
+	 "-o", "", "", "", "-help", "help-option", "-help-section",
+	"-help-comp", "-help-all", "-Xhelp", "-h", "-ho", "-hs", "-ha", "", "",
+	"", "-fstime", "-root-owned", "-noInodeCompression",
+	"-noIdTableCompression", "-noDataCompression", "-noFragmentCompression",
+	 "-noXattrCompression", NULL
 };
 
 static char *mksquashfs_args[]={
 	"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
 	"", "", "<time>", "<time>", "<time>", "<mode>", "<value>", "<value>",
-	"", "<value>", "<value>", "", "", "", "", "", "", "", "", "", "", "",
-	"", "", "", "<d mode uid gid>", "<D time mode uid gid>",
-	"<pseudo-file>", "<sort-file>", "<exclude-file>", "", "", "<levels>",
-	"", "", "", "", "", "", "", "<regex>", "<regex>", "<name=val>", "", "",
-	"", "", "", "", "", "<file>", "", "", "", "<percentage>",
-	"<percentage>", "<number>", "<size>", "<percent>", "", "", "", "", "",
-	"<name>", "", "<name>", "<name>", "", "", "", "<action@expression>",
-	"<action@expression>", "<action@expression>", "<action@expression>",
-	"<file>", "<file>", "<file>", "<file>", "", "", "", "<mode>", "<value>",
-	"<value>", "", "", "", "", "", "<offset>", "<offset>", "", "", "", "",
-	"<regex>", "<section>", "<comp>", "", "", "", "<regex>", "<section>", "",
-	"", "", "", "<time>", "", "", "", "", "", "", "", ""
+	"", "<mode>", "<mode>", "<value>", "<value>", "", "", "", "", "", "",
+	"", "", "", "", "", "", "", "", "<d mode uid gid>",
+	"<D time mode uid gid>", "<pseudo-file>", "<sort-file>",
+	"<exclude-file>", "", "", "<levels>", "", "", "", "", "", "", "",
+	"<regex>", "<regex>", "<name=val>", "", "", "", "", "", "", "",
+	"<file>", "", "", "", "<percentage>", "<percentage>", "<number>",
+	"<size>", "<percent>", "", "", "", "", "", "<name>", "", "<name>",
+	"<name>", "", "", "", "<action@expression>", "<action@expression>",
+	"<action@expression>", "<action@expression>", "<file>", "<file>",
+	"<file>", "<file>", "", "", "", "<mode>", "<value>", "<value>", "", "",
+	"", "", "", "<offset>", "<offset>", "", "", "", "", "<regex>",
+	"<section>", "<comp>", "", "", "", "<regex>", "<section>", "", "", "",
+	"", "<time>", "", "", "", "", "", "", "", ""
 };
 
 static char *sqfstar_args[]={
 	"", "", "<block-size>", "<comp>",  "", "", "", "", "", "", "", "", "",
 	"", "", "<time>", "<time>", "<time>", "<mode>", "<value>", "<value>",
-	"", "<value>", "<value>", "<mode>", "<value>", "<value>", "", "", "",
-	"", "", "", "", "", "", "", "<pseudo-definition>", "<d mode uid gid>",
-	"<D time mode u g>", "<pseudo-file>", "<exclude-file>", "", "", "", "",
-	"", "", "", "<regex>", "<regex>", "<name=val>", "", "","", "", "", "",
-	"", "", "<file>", "", "", "", "<percentage>", "<percentage>",
-	"<number>", "<size>", "<percent>", "", "", "", "", "", "<offset>",
-	"<offset>", "", "", "", "", "<regex>", "<section>", "<comp>", "", "",
-	"", "<regex>", "<section>", "" "", "", "", "<time>", "", "", "", "", "",
-	"", ""
+	"", "<mode>", "<mode>", "<value>", "<value>", "<mode>", "<value>",
+	"<value>", "", "", "", "", "", "", "", "", "", "",
+	"<pseudo-definition>", "<d mode uid gid>", "<D time mode u g>",
+	"<pseudo-file>", "<exclude-file>", "", "", "", "", "", "", "",
+	"<regex>", "<regex>", "<name=val>", "", "","", "", "", "", "", "",
+	"<file>", "", "", "", "<percentage>", "<percentage>", "<number>",
+	"<size>", "<percent>", "", "", "", "", "", "<offset>", "<offset>", "",
+	"", "", "", "<regex>", "<section>", "<comp>", "", "", "", "<regex>",
+	"<section>", "" "", "", "", "<time>", "", "", "", "", "", "", ""
 };
 
 static char *mksquashfs_sections[]={
@@ -133,7 +136,8 @@ static char *mksquashfs_text[]={
 		"Mbytes can be given to specify Kbytes or Mbytes "
 		"respectively\n",
 	"-comp <comp>\t\tselect <comp> compression.  Run -help-comp <comp> to "
-		"get compressor options.\n\t\t\tCompressors available:\n"
+		"get compressor options for <comp>, or <all> for all the "
+		"compressors.\n\t\t\tCompressors available:\n"
 		"\t\t\t\t" COMPRESSORS "\n",
 	"-noI\t\t\tdo not compress inode table\n",
 	"-noId\t\t\tdo not compress the uid/gid table (implied by -noI)\n",
@@ -160,11 +164,11 @@ static char *mksquashfs_text[]={
 		"the \"date\" command to parse. Any string value which the "
 		"date command recognises can be used such as \"now\", \"last "
 		"week\", or \"Wed Feb 15 21:02:39 GMT 2023\"\n",
-	"-all-time <time>\tset all file timestamps to <time>. <time> can be an "
-		"unsigned 32-bit int indicating seconds since the epoch "
-		"(1970-01-01) or a string value which is passed to the "
-		"\"date\" command to parse. Any string value which the date "
-		"command recognises can be used such as \"now\", \"last "
+	"-all-time <time>\tset all file and directory timestamps to <time>. "
+		"<time> can be an unsigned 32-bit int indicating seconds since "
+		"the epoch (1970-01-01) or a string value which is passed to "
+		"the \"date\" command to parse. Any string value which the "
+		"date command recognises can be used such as \"now\", \"last "
 		"week\", or \"Wed Feb 15 21:02:39 GMT 2023\"\n",
 	"-root-time <time>\tset root directory time to <time>. <time> can be "
 		"an unsigned 32-bit int indicating seconds since the epoch "
@@ -172,16 +176,24 @@ static char *mksquashfs_text[]={
 		"\"date\" command to parse. Any string value which the date "
 		"command recognises can be used such as \"now\", \"last "
 		"week\", or \"Wed Feb 15 21:02:39 GMT 2023\"\n",
-	"-root-mode <mode>\tset root directory permissions to octal <mode>\n",
+	"-root-mode <mode>\tset root directory permissions to <mode>.  <Mode> "
+		"can be symbolic or octal (see section Symbolic mode "
+		"specification).  Default root mode is ugo=rwx or 0777 octal\n",
 	"-root-uid <value>\tset root directory owner to specified <value>, "
 		"<value> can be either an integer uid or user name\n",
 	"-root-gid <value>\tset root directory group to specified <value>, "
 		"<value> can be either an integer gid or group name\n",
-	"-all-root\t\tmake all files owned by root\n",
-	"-force-uid <value>\tset all file uids to specified <value>, <value> "
-		"can be either an integer uid or user name\n",
-	"-force-gid <value>\tset all file gids to specified <value>, <value> "
-		"can be either an integer gid or group name\n",
+	"-all-root\t\tmake all files and directories owned by root\n",
+	"-force-file-mode <mode>\tset all file (non-directory) permissions "
+		"to <mode>.  <Mode> can be symbolic or octal (see section "
+		"Symbolic mode specification)\n",
+	"-force-dir-mode <mode>\tset all directory permissions to <mode>.  "
+		"<Mode> can be symbolic or octal (see section Symbolic mode "
+		"specification)\n",
+	"-force-uid <value>\tset all file and directory uids to specified "
+		"<value>, <value> can be either an integer uid or user name\n",
+	"-force-gid <value>\tset all file and directory gids to specified "
+		"<value>, <value> can be either an integer gid or group name\n",
 	"-pseudo-override\tmake pseudo file uids and gids override -all-root, "
 		"-force-uid and -force-gid options\n",
 	"-no-exports\t\tdo not make filesystem exportable via NFS (-tar "
@@ -290,8 +302,8 @@ static char *mksquashfs_text[]={
 	"-recover <name>\t\trecover filesystem data using recovery file "
 		"<name>\n",
 	"\n", "Filesystem actions options:", "\n",
-	"-action <action@expr>\tevaluate <expr> on every file, and execute "
-		"<action> if it returns TRUE\n",
+	"-action <action@expr>\tevaluate <expr> on every file and directory, "
+		"and execute <action> if it returns TRUE\n",
 	"-log-action <act@expr>\tas above, but log expression evaluation "
 		"results and actions performed\n",
 	"-true-action <act@expr>\tas above, but only log expressions which "
@@ -306,18 +318,20 @@ static char *mksquashfs_text[]={
 	"\n", "Tar file only options:", "\n",
 	"-default-mode <mode>\ttar files often do not store permissions for "
 		"intermediate directories.  This option sets the default "
-		"directory permissions to octal <mode>, rather than 0755.  "
-		"This also sets the root inode mode\n",
+		"directory permissions to <mode>.  <Mode> can be symbolic or "
+		"octal (see section Symbolic mode specification).  Default "
+		"mode is u=rwx,go=rx or 0755 octal.  This also sets the root "
+		"directory mode\n",
 	"-default-uid <value>\ttar files often do not store uids for "
 		"intermediate directories.  This option sets the default "
 		"directory owner to <value>, rather than the user running "
 		"Mksquashfs.  <value> can be either an integer uid or user "
-		"name.  This also sets the root inode uid\n",
+		"name.  This also sets the root directory uid\n",
 	"-default-gid <value>\ttar files often do not store gids for "
 		"intermediate directories.  This option sets the default "
 		"directory group to <value>, rather than the group of the user "
 		"running Mksquashfs.  <value> can be either an integer uid or "
-		"group name.  This also sets the root inode gid\n",
+		"group name.  This also sets the root directory gid\n",
 	"-ignore-zeros\t\tallow tar files to be concatenated together and fed "
 		"to Mksquashfs.  Normally a tarfile has two consecutive 512 "
 		"byte blocks filled with zeros which means EOF and Mksquashfs "
@@ -339,7 +353,8 @@ static char *mksquashfs_text[]={
 		"<section> to pager (or stdout if not a terminal).  Use "
 		"\"sections\" or \"h\" as section name to get a list of "
 		"sections and their names\n",
-	"-help-comp <comp>\tprint compressor options for compressor <comp>\n",
+	"-help-comp <comp>\tprint compressor options for compressor <comp>.  "
+		"Use <all> to get compressor options for all the compressors\n",
 	"-help-all\t\tprint help information for all Mksquashfs options and "
 		"sections to pager (or stdout if not a terminal)\n",
 	"-Xhelp\t\t\tprint compressor options for selected compressor\n",
@@ -416,8 +431,10 @@ static char *sqfstar_text[]={
 	"-b <block-size>\t\tset data block to <block-size>.  Default 128 "
 		"Kbytes. Optionally a suffix of K, KB, Kbytes or M, MB, Mbytes "
 		"can be given to specify Kbytes or Mbytes respectively\n",
-	"-comp <comp>\t\tselect <comp> compression\n\t\t\tCompressors "
-		"available:\n\t\t\t\t" COMPRESSORS "\n",
+	"-comp <comp>\t\tselect <comp> compression.  Run -help-comp <comp> to "
+		"get compressor options for <comp>, or <all> for all the "
+		"compressors.\n\t\t\tCompressors available:\n"
+		"\t\t\t\t" COMPRESSORS "\n",
 	"-noI\t\t\tdo not compress inode table\n",
 	"-noId\t\t\tdo not compress the uid/gid table (implied by -noI)\n",
 	"-noD\t\t\tdo not compress data blocks\n",
@@ -436,11 +453,11 @@ static char *sqfstar_text[]={
 		"the \"date\" command to parse. Any string value which the "
 		"date command recognises can be used such as \"now\", \"last "
 		"week\", or \"Wed Feb 15 21:02:39 GMT 2023\"\n",
-	"-all-time <time>\tset all file timestamps to <time>. <time> can be an "
-		"unsigned 32-bit int indicating seconds since the epoch "
-		"(1970-01-01) or a string value which is passed to the "
-		"\"date\" command to parse. Any string value which the date "
-		"command recognises can be used such as \"now\", \"last "
+	"-all-time <time>\tset all file and directory timestamps to <time>. "
+		"<time> can be an unsigned 32-bit int indicating seconds since "
+		"the epoch (1970-01-01) or a string value which is passed to "
+		"the \"date\" command to parse. Any string value which the "
+		"date command recognises can be used such as \"now\", \"last "
 		"week\", or \"Wed Feb 15 21:02:39 GMT 2023\"\n",
 	"-root-time <time>\tset root directory time to " "<time>. <time> can "
 		"be an unsigned 32-bit int indicating seconds since the epoch "
@@ -448,30 +465,40 @@ static char *sqfstar_text[]={
 		"\"date\" command to parse. Any string value which the date "
 		"command recognises can be used such as \"now\", \"last "
 		"week\", or \"Wed Feb 15 21:02:39 GMT 2023\"\n",
-	"-root-mode <mode>\tset root directory permissions to octal <mode>\n",
+	"-root-mode <mode>\tset root directory permissions to <mode>.  <Mode> "
+		"can be symbolic or octal (see section Symbolic mode "
+		"specification).  Default root mode is ugo=rwx or 0777 octal\n",
 	"-root-uid <value>\tset root directory owner to specified <value>, "
 		"<value> can be either an integer uid or user name\n",
 	"-root-gid <value>\tset root directory group to specified <value>, "
 		"<value> can be either an integer gid or group name\n",
-	"-all-root\t\tmake all files owned by root\n",
-	"-force-uid <value>\tset all file uids to specified <value>, <value> "
-		"can be either an integer uid or user name\n",
-	"-force-gid <value>\tset all file gids to specified <value>, <value> "
-		"can be either an integer gid or group name\n",
+	"-all-root\t\tmake all files and directories owned by root\n",
+	"-force-file-mode <mode>\tset all file (non-directory) permissions "
+		"to <mode>.  <Mode> can be symbolic or octal (see section "
+		"Symbolic mode specification)\n",
+	"-force-dir-mode <mode>\tset all directory permissions to <mode>.  "
+		"<Mode> can be symbolic or octal (see section Symbolic mode "
+		"specification)\n",
+	"-force-uid <value>\tset all file and directory uids to specified "
+		"<value>, <value> can be either an integer uid or user name\n",
+	"-force-gid <value>\tset all file and directory gids to specified "
+		"<value>, <value> can be either an integer gid or group name\n",
 	"-default-mode <mode>\ttar files often do not store permissions for "
 		"intermediate directories.  This option sets the default "
-		"directory permissions to octal <mode>, rather than 0755.  "
-		"This also sets the root inode mode\n",
+		"directory permissions to <mode>.  <Mode> can be symbolic or "
+		"octal (see section Symbolic mode specification).  Default "
+		"mode is u=rwx,go=rx or 0755 octal.  This also sets the root "
+		"directory mode\n",
 	"-default-uid <value>\ttar files often do not store uids for "
-	"intermediate directories.  This option sets the default directory "
-	"owner to <value>, rather than the user running Sqfstar.  <value> can "
-		"be either an integer uid or user name.  This also sets the "
-		"root inode uid\n",
+		"intermediate directories.  This option sets the default "
+		"directory owner to <value>, rather than the user running "
+		"Sqfstar.  <value> can be either an integer uid or user name.  "
+		"This also sets the root directory uid\n",
 	"-default-gid <value>\ttar files often do not store gids for "
 		"intermediate directories.  This option sets the default "
 		"directory group to <value>, rather than the group of the "
 		"user running Sqfstar.  <value> can be either an integer uid "
-		"or group name.  This also sets the root inode gid\n",
+		"or group name.  This also sets the root directory gid\n",
 	"-pseudo-override\tmake pseudo file uids and gids override -all-root, "
 		"-force-uid and -force-gid options\n",
 	"-exports\t\tmake the filesystem exportable via NFS\n",
@@ -567,7 +594,8 @@ static char *sqfstar_text[]={
 		"<section> to pager (or stdout if not a terminal).  Use "
 		"\"sections\" or \"h\" as section name to get a list of "
 		"sections and their names\n",
-	"-help-comp <comp>\tprint compressor options for compressor <comp>\n",
+	"-help-comp <comp>\tprint compressor options for compressor <comp>.  "
+		"Use <all> to get compressor options for all the compressors\n",
 	"-help-all\t\tprint help information for all Sqfstar options and "
 		"sections to pager (or stdout if not a terminal)\n",
 	"-Xhelp\t\t\tprint compressor options for selected compressor\n",
@@ -654,8 +682,6 @@ static void print_help_all(char *name, char *syntax, char **options_text)
 
 	for(i = 0; options_text[i] != NULL; i++)
 		autowrap_print(pager, options_text[i], cols);
-
-	autowrap_print(pager, "\nCompressors available and compressor specific options:\n", cols);
 
 	display_compressor_usage(pager, COMP_DEFAULT, cols);
 
@@ -881,4 +907,52 @@ void mksquashfs_option_help(char *option)
 void sqfstar_option_help(char *option)
 {
 	print_option_help("sqfstar", option, sqfstar_sections, sqfstar_text);
+}
+
+void display_compressors() {
+	int cols = get_column_width();
+
+	autowrap_print(stderr, "\t" COMPRESSORS "\n", cols);
+}
+
+void print_compressor_options(char *comp_name, char *prog_name)
+{
+	int cols, tty;
+	pid_t pager_pid;
+	FILE *pager;
+
+	if(strcmp(comp_name, "ALL") == 0 || strcmp(comp_name, "<all>") == 0)
+		comp_name = "all";
+
+	if(strcmp(comp_name, "all") && !valid_compressor(comp_name)) {
+		cols = get_column_width();
+		autowrap_printf(stderr, cols, "%s: Compressor \"%s\" is not "
+			"supported!\n", prog_name, comp_name);
+		autowrap_printf(stderr, cols, "%s: Compressors available:\n",
+			prog_name);
+		display_compressors();
+		exit(1);
+	}
+
+	tty = isatty(STDOUT_FILENO);
+
+	if(tty) {
+		cols = get_column_width();
+
+		pager = exec_pager(&pager_pid);
+		if(pager == NULL)
+			exit(1);
+	} else {
+		cols = 80;
+		pager = stdout;
+	}
+
+	print_comp_options(pager, cols, comp_name, prog_name);
+
+	if(tty) {
+		fclose(pager);
+		wait_to_die(pager_pid);
+	}
+
+	exit(0);
 }
