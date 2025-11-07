@@ -4,7 +4,7 @@
  * Create a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2011, 2012, 2013, 2014, 2021, 2022
+ * Copyright (c) 2011, 2012, 2013, 2014, 2021, 2022, 2024, 2025
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -23,6 +23,8 @@
  *
  * action.h
  */
+
+#include "alloc.h"
 
 /*
  * Lexical analyser definitions
@@ -69,7 +71,7 @@ struct token_entry {
 #define UNARY_TYPE		2
 
 #define SYNTAX_ERROR(S, ARGS...) { \
-	char *src = strdup(source); \
+	char *src = STRDUP(source); \
 	src[cur_ptr - source] = '\0'; \
 	fprintf(stderr, "Failed to parse action \"%s\"\n", source); \
 	fprintf(stderr, "Syntax error: "S, ##ARGS); \
@@ -78,7 +80,7 @@ struct token_entry {
 }
 
 #define TEST_SYNTAX_ERROR(TEST, ARG, S, ARGS...) { \
-	char *src = strdup(source); \
+	char *src = STRDUP(source); \
 	src[cur_ptr - source] = '\0'; \
 	fprintf(stderr, "Failed to parse action \"%s\"\n", source); \
 	fprintf(stderr, "Syntax error in \"%s()\", arg %d: "S, TEST->name, \
@@ -125,6 +127,8 @@ struct expr {
 #define NUM_EQ		1
 #define NUM_LESS	2
 #define NUM_GREATER	3
+#define NUM_GREATER_EQ	4
+#define NUM_LESS_EQ	5
 
 struct test_number_arg {
 	long long size;
@@ -180,6 +184,7 @@ struct type_entry {
 #define XATTR_EXC_ACTION	16
 #define XATTR_INC_ACTION	17
 #define XATTR_ADD_ACTION	18
+#define ALIGN_ACTION		19
 
 /*
  * Define what file types each action operates over
@@ -285,7 +290,15 @@ struct xattr_data {
 	struct xattr_data	*next;
 };
 
+/*
+ * Align action specfic definitions
+ */
+struct align_data {
+	char alignment;
+};
 
+/* allow alignment up to 64 Megabytes */
+#define MAX_ALIGN 67108864
 /*
  * Perm test function specific definitions
  */

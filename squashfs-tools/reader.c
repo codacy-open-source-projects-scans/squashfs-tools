@@ -2,7 +2,7 @@
  * Create a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2021, 2022, 2024
+ * Copyright (c) 2021, 2022, 2024, 2025
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -22,9 +22,6 @@
  * reader.c
  */
 
-/* if throttling I/O, time to sleep between reads (in tenths of a second) */
-int sleep_time;
-
 #define TRUE 1
 #define FALSE 0
 
@@ -41,17 +38,71 @@ int sleep_time;
 #include <stdlib.h>
 #include <stdio.h>
 #include <signal.h>
+#include <stddef.h>
+#include <limits.h>
+
 #include "squashfs_fs.h"
 #include "mksquashfs.h"
-#include "caches-queues-lists.h"
 #include "progressbar.h"
 #include "mksquashfs_error.h"
 #include "pseudo.h"
 #include "sort.h"
 #include "tar.h"
 #include "reader.h"
+#include "atomic_swap.h"
+#include "caches-queues-lists.h"
+#include "alloc.h"
 
+#define READER_ALLOC 1024
+
+static struct reader *reader = NULL;
 static struct readahead **readahead_table = NULL;
+static pthread_t *reader_thread = NULL;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static int total_rblocks, total_rmbytes;
+static int total_wblocks, total_wmbytes;
+
+/* if throttling I/O, time to sleep between reads (in tenths of a second) */
+static int sleep_time;
+
+static struct read_entry **block_array = NULL;
+static struct read_entry **fragment_array = NULL;
+
+/* total number of files to be read, excluding hard links  */
+static unsigned int file_count = 0;
+static unsigned int block_count = 0;
+static unsigned int fragment_count = 0;
+
+extern struct queue_cache *bwriter_buffer;
+extern int processors;
+extern int sparse_files;
+
+#ifdef SINGLE_READER_THREAD
+static int reader_threads = 1, fragment_threads = 0, block_threads = 1;
+static int single_threaded = TRUE;
+static int block_opt = FALSE;
+static int frag_opt = FALSE;
+
+int readers_sane()
+{
+	/*
+	 * The mksquashfs default is a single reader.  Changing from a single
+	 * reader requires the user to specify both -small-readers and
+	 * -block-readers options.
+	 */
+	if(frag_opt && block_opt) {
+		single_threaded = FALSE;
+		return TRUE;
+	}
+
+	return !frag_opt && !block_opt;
+}
+#else
+static int fragment_threads = SMALL_READER_THREADS;
+static int block_threads = BLOCK_READER_THREADS;
+static int reader_threads = SMALL_READER_THREADS + BLOCK_READER_THREADS;
+static int single_threaded = FALSE;
+#endif
 
 static void sigalrm_handler(int arg)
 {
@@ -64,41 +115,33 @@ static void sigalrm_handler(int arg)
 }
 
 
-static char *pathname(struct dir_ent *dir_ent)
+static char *pathname(struct reader *reader, struct dir_ent *dir_ent)
 {
-	static char *pathname = NULL;
-	static int size = ALLOC_SIZE;
-
 	if (dir_ent->nonstandard_pathname)
 		return dir_ent->nonstandard_pathname;
 
-	if(pathname == NULL) {
-		pathname = malloc(ALLOC_SIZE);
-		if(pathname == NULL)
-			MEM_ERROR();
-	}
+	if(reader->pathname == NULL)
+		reader->pathname = MALLOC(ALLOC_SIZE);
 
 	for(;;) {
-		int res = snprintf(pathname, size, "%s/%s",
+		int res = snprintf(reader->pathname, reader->size, "%s/%s",
 			dir_ent->our_dir->pathname,
 			dir_ent->source_name ? : dir_ent->name);
 
 		if(res < 0)
 			BAD_ERROR("snprintf failed in pathname\n");
-		else if(res >= size) {
+		else if(res >= reader->size) {
 			/*
 			 * pathname is too small to contain the result, so
 			 * increase it and try again
 			 */
-			size = (res + ALLOC_SIZE) & ~(ALLOC_SIZE - 1);
-			pathname = realloc(pathname, size);
-			if(pathname == NULL)
-				MEM_ERROR();
+			reader->size = (res + ALLOC_SIZE) & ~(ALLOC_SIZE - 1);
+			reader->pathname = REALLOC(reader->pathname, reader->size);
 		} else
 			break;
 	}
 
-	return pathname;
+	return reader->pathname;
 }
 
 
@@ -109,8 +152,10 @@ static inline int is_fragment(struct inode_info *inode)
 	/*
 	 * If this block is to be compressed differently to the
 	 * fragment compression then it cannot be a fragment
+	 *
+	 * Also if the file has an alignment it cannot be a fragment
 	 */
-	if(inode->noF != noF)
+	if(inode->noF != noF || inode->alignment)
 		return FALSE;
 
 	return !inode->no_fragments && file_size && (file_size < block_size ||
@@ -118,59 +163,79 @@ static inline int is_fragment(struct inode_info *inode)
 }
 
 
-static void put_file_buffer(struct file_buffer *file_buffer)
+static inline int is_large(struct inode_info *inode)
 {
+	return inode->buf.st_size >= block_size;
+}
+
+
+static void put_file_buffer(int id, struct file_buffer *file_buffer, int next_state)
+{
+	file_buffer->next_state = next_state;
+
 	/*
 	 * Decide where to send the file buffer:
 	 * - compressible non-fragment blocks go to the deflate threads,
 	 * - fragments go to the process fragment threads,
 	 * - all others go directly to the main thread
 	 */
-	if(file_buffer->error) {
+	if(is_sparse(file_buffer))
+		main_queue_put(to_main, file_buffer);
+	else if(file_buffer->error) {
 		file_buffer->fragment = 0;
-		seq_queue_put(to_main, file_buffer);
+		main_queue_put(to_main, file_buffer);
 	} else if (file_buffer->file_size == 0)
-		seq_queue_put(to_main, file_buffer);
+		main_queue_put(to_main, file_buffer);
 	else if(file_buffer->fragment)
-		queue_put(to_process_frag, file_buffer);
+		read_queue_put(to_process_frag, id, file_buffer);
 	else
-		queue_put(to_deflate, file_buffer);
+		queue_cache_put(to_deflate, id, file_buffer);
 }
 
 
-static void reader_read_process(struct dir_ent *dir_ent)
+static struct file_buffer *get_buffer(struct reader *reader, struct read_entry *entry,
+	long long file_size, long long block, int version)
 {
-	long long bytes = 0;
-	struct inode_info *inode = dir_ent->inode;
+	struct file_buffer *file_buffer = cache_get_nohash(reader->buffer);
+
+	file_buffer->noD = entry->dir_ent->inode->noD;
+	file_buffer->alignment = entry->dir_ent->inode->alignment;
+	file_buffer->file_count = entry->file_count;
+	file_buffer->file_size = file_size;
+	file_buffer->version = version;
+	file_buffer->block = block;
+	file_buffer->error = FALSE;
+	file_buffer->fragment = FALSE;
+	file_buffer->c_byte = 0;
+	file_buffer->next_state = FALSE;
+	file_buffer->thread = reader->id;
+
+	return file_buffer;
+}
+
+
+static void reader_read_process(struct reader *reader, struct read_entry *entry)
+{
+	long long bytes = 0, block = 0;
+	struct inode_info *inode = entry->dir_ent->inode;
 	struct file_buffer *prev_buffer = NULL, *file_buffer;
 	int status, byte, res, child;
 	int file;
 
-	if(inode->read)
-		return;
-
-	inode->read = TRUE;
-
 	file = pseudo_exec_file(inode->pseudo, &child);
 	if(!file) {
-		file_buffer = cache_get_nohash(reader_buffer);
-		file_buffer->sequence = sequence_count ++;
+		file_buffer = get_buffer(reader, entry, 0, block, 0);
 		goto read_err;
 	}
 
 	while(1) {
-		file_buffer = cache_get_nohash(reader_buffer);
-		file_buffer->sequence = sequence_count ++;
-		file_buffer->noD = inode->noD;
+		file_buffer = get_buffer(reader, entry, -1, block ++, 0);
 
 		byte = read_bytes(file, file_buffer->data, block_size);
 		if(byte == -1)
 			goto read_err2;
 
 		file_buffer->size = byte;
-		file_buffer->file_size = -1;
-		file_buffer->error = FALSE;
-		file_buffer->fragment = FALSE;
 		bytes += byte;
 
 		if(byte == 0)
@@ -186,7 +251,7 @@ static void reader_read_process(struct dir_ent *dir_ent)
 		progress_bar_size(1);
 
 		if(prev_buffer)
-			put_file_buffer(prev_buffer);
+			put_file_buffer(reader->id, prev_buffer, NEXT_BLOCK);
 		prev_buffer = file_buffer;
 	}
 
@@ -211,13 +276,12 @@ static void reader_read_process(struct dir_ent *dir_ent)
 
 	if(prev_buffer == NULL)
 		prev_buffer = file_buffer;
-	else {
+	else
 		cache_block_put(file_buffer);
-		sequence_count --;
-	}
+
 	prev_buffer->file_size = bytes;
 	prev_buffer->fragment = is_fragment(inode);
-	put_file_buffer(prev_buffer);
+	put_file_buffer(reader->id, prev_buffer, NEXT_FILE);
 
 	return;
 
@@ -226,49 +290,57 @@ read_err2:
 read_err:
 	if(prev_buffer) {
 		cache_block_put(file_buffer);
-		sequence_count --;
 		file_buffer = prev_buffer;
 	}
 	file_buffer->error = TRUE;
-	put_file_buffer(file_buffer);
+	put_file_buffer(reader->id, file_buffer, NEXT_FILE);
 }
 
 
-static void reader_read_file(struct dir_ent *dir_ent)
+static void reader_read_file(struct reader *reader, struct read_entry *entry, int reader_type)
 {
-	struct stat *buf = &dir_ent->inode->buf, buf2;
+	struct stat *buf = &entry->dir_ent->inode->buf, buf2;
 	struct file_buffer *file_buffer;
-	int blocks, file, res;
-	long long bytes, read_size;
-	struct inode_info *inode = dir_ent->inode;
+	int blocks, file, res, sparse;
+	long long bytes = 0, block = 0, read_size, data_pos = -1;
+	struct inode_info *inode = entry->dir_ent->inode;
+	unsigned short version = 0;
 
-	if(inode->read)
-		return;
-
-	inode->read = TRUE;
 again:
-	bytes = 0;
 	read_size = buf->st_size;
 	blocks = (read_size + block_size - 1) >> block_log;
+	sparse = sparse_files && ((long long) buf->st_blocks * 512) < read_size;
 
 	while(1) {
-		file = open(pathname(dir_ent), O_RDONLY);
+		file = open(pathname(reader, entry->dir_ent), O_RDONLY);
 		if(file != -1 || errno != EINTR)
 			break;
 	}
 
 	if(file == -1) {
-		file_buffer = cache_get_nohash(reader_buffer);
-		file_buffer->sequence = sequence_count ++;
+		file_buffer = get_buffer(reader, entry, 0, block, version);
 		goto read_err2;
 	}
 
 	do {
-		file_buffer = cache_get_nohash(reader_buffer);
-		file_buffer->file_size = read_size;
-		file_buffer->sequence = sequence_count ++;
-		file_buffer->noD = inode->noD;
-		file_buffer->error = FALSE;
+		file_buffer = get_buffer(reader, entry, read_size, block ++, version);
+
+		if(sparse && data_pos < bytes) {
+			data_pos = lseek(file, bytes, SEEK_DATA);
+			if(data_pos == -1) {
+				if(errno == ENXIO)
+					data_pos = read_size;
+				else
+					goto read_err;
+			}
+
+			if(data_pos > bytes) {
+				long long offset = lseek(file, data_pos, SEEK_SET);
+
+				if(offset != data_pos)
+					goto read_err;
+			}
+		}
 
 		/*
 		 * Always try to read block_size bytes from the file rather
@@ -279,22 +351,51 @@ again:
 		 * case where the file is an exact multiple of the block_size
 		 * is dealt with later.
 		 */
-		file_buffer->size = read_bytes(file, file_buffer->data,
-			block_size);
-		if(file_buffer->size == -1)
-			goto read_err;
+		if(sparse && (data_pos - bytes) >= block_size) {
+			long long count = (data_pos - bytes) / block_size;
+			int res = set_sparse(file_buffer, count);
 
-		bytes += file_buffer->size;
+			if(res == FALSE)
+				BAD_ERROR("Unexpectedly large sparse region in file\n");
 
-		if(blocks > 1) {
-			/* non-tail block should be exactly block_size */
-			if(file_buffer->size < block_size)
-				goto restat;
+			file_buffer->size = block_size;
+			bytes += count * block_size;
+			blocks -= count;
+		} else if(sparse && (data_pos - bytes)) {
+			int count = data_pos - bytes;
 
-			file_buffer->fragment = FALSE;
-			put_file_buffer(file_buffer);
+			memset(file_buffer->data, 0, count);
+			file_buffer->size = read_bytes(file, file_buffer->data + count, block_size - count);
+			if(file_buffer->size == -1)
+				goto read_err;
+
+			file_buffer->size += count;
+			bytes += file_buffer->size;
+
+			if(blocks -- > 1) {
+				/* non-tail block should be exactly block_size */
+				if(file_buffer->size < block_size)
+					goto restat;
+			}
+		} else {
+			file_buffer->size = read_bytes(file, file_buffer->data, block_size);
+			if(file_buffer->size == -1)
+				goto read_err;
+
+			bytes += file_buffer->size;
+
+			if(blocks -- > 1) {
+				/* non-tail block should be exactly block_size */
+				if(file_buffer->size < block_size)
+					goto restat;
+			}
 		}
-	} while(-- blocks > 0);
+
+		if(blocks > 0) {
+			file_buffer->fragment = FALSE;
+			put_file_buffer(reader->id, file_buffer, NEXT_BLOCK);
+		}
+	} while(blocks > 0);
 
 	/* Overall size including tail should match */
 	if(read_size != bytes)
@@ -318,17 +419,22 @@ again:
 	}
 
 	file_buffer->fragment = is_fragment(inode);
-	put_file_buffer(file_buffer);
+	put_file_buffer(reader->id, file_buffer, NEXT_FILE);
 
 	close(file);
 
 	return;
 
 restat:
+	if(version == 1023)
+		/* File has changed size too many times.  Treat this
+		 * as an irretrievable error */
+		goto read_err;
+
 	res = fstat(file, &buf2);
 	if(res == -1) {
 		ERROR("Cannot stat dir/file %s because %s\n",
-			pathname(dir_ent), strerror(errno));
+			pathname(reader, entry->dir_ent), strerror(errno));
 		goto read_err;
 	}
 
@@ -336,14 +442,16 @@ restat:
 		close(file);
 		memcpy(buf, &buf2, sizeof(struct stat));
 		file_buffer->error = 2;
-		put_file_buffer(file_buffer);
+		put_file_buffer(reader->id, file_buffer, NEXT_VERSION);
+		bytes = block = 0;
+		version ++;
 		goto again;
 	}
 read_err:
 	close(file);
 read_err2:
 	file_buffer->error = TRUE;
-	put_file_buffer(file_buffer);
+	put_file_buffer(reader->id, file_buffer, NEXT_FILE);
 }
 
 
@@ -437,12 +545,8 @@ static int get_readahead(struct pseudo_file *file, long long current,
 					memcpy(dest, buffer->src + offset - buffer_offset, size);
 
 					/* Split buffer into two */
-					left = malloc(sizeof(struct readahead) + left_size);
-					right = malloc(sizeof(struct readahead) + right_size);
-
-					if(left == NULL || right == NULL)
-						MEM_ERROR();
-
+					left = MALLOC(sizeof(struct readahead) + left_size);
+					right = MALLOC(sizeof(struct readahead) + right_size);
 					left->start = buffer->start;
 					left->size = left_size;
 					left->src = left->data;
@@ -479,20 +583,14 @@ static int do_readahead(struct pseudo_file *file, long long current,
 	long long readahead = current - file->current;
 
 	if(readahead_table == NULL) {
-		readahead_table = malloc(READAHEAD_ALLOC);
-		if(readahead_table == NULL)
-			MEM_ERROR();
-
+		readahead_table = MALLOC(READAHEAD_ALLOC);
 		memset(readahead_table, 0, READAHEAD_ALLOC);
 	}
 
 	while(readahead) {
 		int offset = READAHEAD_OFFSET(file->current);
 		int bytes = READAHEAD_SIZE - offset < readahead ? READAHEAD_SIZE - offset : readahead;
-		struct readahead *buffer = malloc(sizeof(struct readahead) + bytes);
-
-		if(buffer == NULL)
-			MEM_ERROR();
+		struct readahead *buffer = MALLOC(sizeof(struct readahead) + bytes);
 
 		res = get_bytes(buffer->data, bytes);
 
@@ -568,18 +666,14 @@ static int read_data(struct pseudo_file *file, long long current,
 }
 
 
-static void reader_read_data(struct dir_ent *dir_ent)
+static void reader_read_data(struct reader *reader, struct read_entry *entry)
 {
 	struct file_buffer *file_buffer;
 	int blocks;
-	long long bytes, read_size, current;
-	struct inode_info *inode = dir_ent->inode;
+	long long bytes, read_size, current, block = 0;
+	struct inode_info *inode = entry->dir_ent->inode;
 	static struct pseudo_file *file = NULL;
 
-	if(inode->read)
-		return;
-
-	inode->read = TRUE;
 	bytes = 0;
 	read_size = inode->pseudo->data->length;
 	blocks = (read_size + block_size - 1) >> block_log;
@@ -614,11 +708,7 @@ static void reader_read_data(struct dir_ent *dir_ent)
 	current = inode->pseudo->data->offset;
 
 	do {
-		file_buffer = cache_get_nohash(reader_buffer);
-		file_buffer->file_size = read_size;
-		file_buffer->sequence = sequence_count ++;
-		file_buffer->noD = inode->noD;
-		file_buffer->error = FALSE;
+		file_buffer = get_buffer(reader, entry, read_size, block ++, 0);
 
 		if(blocks > 1) {
 			/* non-tail block should be exactly block_size */
@@ -630,7 +720,7 @@ static void reader_read_data(struct dir_ent *dir_ent)
 			bytes += file_buffer->size;
 
 			file_buffer->fragment = FALSE;
-			put_file_buffer(file_buffer);
+			put_file_buffer(reader->id, file_buffer, NEXT_BLOCK);
 		} else {
 			int expected = read_size - bytes;
 
@@ -643,7 +733,29 @@ static void reader_read_data(struct dir_ent *dir_ent)
 	} while(-- blocks > 0);
 
 	file_buffer->fragment = is_fragment(inode);
-	put_file_buffer(file_buffer);
+	put_file_buffer(reader->id, file_buffer, NEXT_FILE);
+}
+
+
+static void _add_entry(struct dir_ent *entry, struct read_entry ***array, unsigned int *count)
+{
+	if(*array == NULL || *count % READER_ALLOC == 0)
+		*array = REALLOC(*array, (*count + READER_ALLOC) * sizeof(struct read_entry *));
+
+	(*array)[*count] = MALLOC(sizeof(struct read_entry));
+	(*array)[*count]->dir_ent = entry;
+	(*array)[(*count) ++]->file_count = file_count ++;
+}
+
+
+static void add_entry(struct dir_ent *dir_ent)
+{
+	if(IS_PSEUDO_PROCESS(dir_ent->inode) ||
+			IS_PSEUDO_DATA(dir_ent->inode) ||
+			is_large(dir_ent->inode))
+		_add_entry(dir_ent, &block_array, &block_count);
+	else
+		_add_entry(dir_ent, &fragment_array, &fragment_count);
 }
 
 
@@ -652,34 +764,199 @@ static void reader_scan(struct dir_info *dir)
 	struct dir_ent *dir_ent = dir->list;
 
 	for(; dir_ent; dir_ent = dir_ent->next) {
-		struct stat *buf = &dir_ent->inode->buf;
-
-		if(dir_ent->inode->root_entry || IS_TARFILE(dir_ent->inode))
+		if(dir_ent->inode->root_entry || IS_TARFILE(dir_ent->inode) || dir_ent->inode->scanned)
 			continue;
 
-		if(IS_PSEUDO_PROCESS(dir_ent->inode)) {
-			reader_read_process(dir_ent);
+		if(IS_PSEUDO_PROCESS(dir_ent->inode) ||
+				IS_PSEUDO_DATA(dir_ent->inode) ||
+				S_ISREG(dir_ent->inode->buf.st_mode)) {
+			dir_ent->inode->scanned = TRUE;
+			add_entry(dir_ent);
+		} else if(S_ISDIR(dir_ent->inode->buf.st_mode))
+			reader_scan(dir_ent->dir);
+	}
+}
+
+
+static void create_resources()
+{
+	int i, per_rthread = total_rblocks / (reader_threads ? reader_threads : 1);
+	int total_fwthread = (processors + 1) * fragment_threads;
+	int per_wthread = (total_wblocks - total_fwthread) / (block_threads ? block_threads : 1);
+
+	queue_cache_set(bwriter_buffer, fragment_threads, processors + 1,
+		block_threads, per_wthread, per_rthread);
+
+	read_queue_set(to_process_frag, reader_threads, per_rthread);
+
+	pthread_cleanup_push((void *) pthread_mutex_unlock, &mutex);
+	pthread_mutex_lock(&mutex);
+
+	reader = MALLOC(reader_threads * sizeof(struct reader));
+
+	for(i = 0; i < reader_threads; i++) {
+		reader[i].id = i;
+		reader[i].type = "";
+		reader[i].buffer = cache_init(block_size, per_rthread, 0, 0);
+		reader[i].size = ALLOC_SIZE;
+		reader[i].pathname = NULL;
+	}
+
+	pthread_cleanup_pop(1);
+}
+
+
+static void *block_reader(void *arg)
+{
+	struct reader *reader = arg;
+
+	for(int n = 0; n < block_count; n ++) {
+		struct read_entry *entry = atomic_swap(&block_array[n], &mutex);
+
+		if(entry == NULL)
+			continue;
+
+		if(IS_PSEUDO_PROCESS(entry->dir_ent->inode))
+			reader_read_process(reader, entry);
+		else if(S_ISREG(entry->dir_ent->inode->buf.st_mode))
+			reader_read_file(reader, entry, BLOCK_READER);
+		else
+			BAD_ERROR("Unexpected file type when reading files!\n");
+	}
+
+	pthread_exit(NULL);
+}
+
+
+static void *fragment_reader(void *arg)
+{
+	struct reader *reader = arg;
+
+	for(int n = 0; n < fragment_count; n ++) {
+		struct read_entry *entry = atomic_swap(&fragment_array[n], &mutex);
+
+		if(entry == NULL)
+			continue;
+
+		if(IS_PSEUDO_PROCESS(entry->dir_ent->inode))
+			reader_read_process(reader, entry);
+		else if(S_ISREG(entry->dir_ent->inode->buf.st_mode))
+			reader_read_file(reader, entry, FRAGMENT_READER);
+		else
+			BAD_ERROR("Unexpected file type when reading files!\n");
+	}
+
+	pthread_exit(NULL);
+}
+
+
+static void multi_thread(struct dir_info *dir)
+{
+	pthread_t *thread;
+	int i;
+
+	if(!sorted)
+		reader_scan(dir);
+	else {
+		struct priority_entry *entry;
+
+		for(i = 65535; i >= 0; i--) {
+			for(entry = priority_list[i]; entry; entry = entry->next) {
+				if(!entry->dir->inode->scanned) {
+					entry->dir->inode->scanned = TRUE;
+					add_entry(entry->dir);
+				}
+			}
+		}
+	}
+
+	if(fragment_threads > fragment_count)
+		fragment_threads = fragment_count;
+
+	if(block_threads > block_count)
+		block_threads = block_count;
+
+	reader_threads = fragment_threads + block_threads;
+	create_resources();
+
+	pthread_cleanup_push((void *) pthread_mutex_unlock, &mutex);
+	pthread_mutex_lock(&mutex);
+
+	thread = MALLOC(reader_threads * sizeof(pthread_t));
+
+	for(i = 0; i < fragment_threads; i++) {
+		reader[i].type = "small";
+		pthread_create(&thread[i], NULL, fragment_reader, &reader[i]);
+	}
+
+	for(i = 0; i < block_threads; i++) {
+		reader[i + fragment_threads].type = "block";
+		pthread_create(&thread[i + fragment_threads], NULL, block_reader, &reader[i + fragment_threads]);
+	}
+
+	reader_thread = thread;
+
+	pthread_cleanup_pop(1);
+}
+
+
+static void single_reader_scan(struct dir_info *dir)
+{
+	struct dir_ent *dir_ent = dir->list;
+	struct read_entry entry;
+
+	for(; dir_ent; dir_ent = dir_ent->next) {
+		if(dir_ent->inode->root_entry || dir_ent->inode->scanned)
+			continue;
+		if(S_ISDIR(dir_ent->inode->buf.st_mode)) {
+			single_reader_scan(dir_ent->dir);
 			continue;
 		}
-
-		if(IS_PSEUDO_DATA(dir_ent->inode)) {
-			reader_read_data(dir_ent);
+		if(IS_TARFILE(dir_ent->inode))
 			continue;
+
+		if(IS_PSEUDO_PROCESS(dir_ent->inode) ||
+				IS_PSEUDO_DATA(dir_ent->inode) ||
+				S_ISREG(dir_ent->inode->buf.st_mode)) {
+			dir_ent->inode->scanned = TRUE;
+			entry.dir_ent = dir_ent;
+			entry.file_count = file_count ++;
 		}
 
-		switch(buf->st_mode & S_IFMT) {
-			case S_IFREG:
-				reader_read_file(dir_ent);
-				break;
-			case S_IFDIR:
-				reader_scan(dir_ent->dir);
-				break;
+		if(IS_PSEUDO_PROCESS(dir_ent->inode))
+			reader_read_process(&reader[0], &entry);
+		else if(IS_PSEUDO_DATA(dir_ent->inode))
+			reader_read_data(&reader[0], &entry);
+		else if(S_ISREG(dir_ent->inode->buf.st_mode))
+			reader_read_file(&reader[0], &entry, COMBINED_READER);
+	}
+}
+
+
+static void single_thread(struct dir_info *dir)
+{
+	if(!sorted)
+		single_reader_scan(dir);
+	else {
+		int i;
+		struct priority_entry *entry;
+		struct read_entry ent;
+
+		for(i = 65535; i >= 0; i--) {
+			for(entry = priority_list[i]; entry; entry = entry->next) {
+				if(!entry->dir->inode->scanned) {
+					entry->dir->inode->scanned = TRUE;
+					ent.dir_ent = entry->dir;
+					ent.file_count = file_count ++;
+					reader_read_file(&reader[0], &ent, COMBINED_READER);
+				}
+			}
 		}
 	}
 }
 
 
-void *reader(void *arg)
+void *initial_reader(void *arg)
 {
 	struct itimerval itimerval;
 	struct dir_info *dir = queue_get(to_reader);
@@ -695,21 +972,157 @@ void *reader(void *arg)
 	}
 
 	if(tarfile) {
-		read_tar_file();
-		dir = queue_get(to_reader);
-	}
+		create_resources();
+		reader[0].type = "combined";
+		file_count = read_tar_file();
+		single_thread(queue_get(to_reader));
+	} else if(!sleep_time && reader_threads > 1)
+		multi_thread(dir);
+	else {
+		create_resources();
+		reader[0].type = "combined";
 
-	if(!sorted)
-		reader_scan(dir);
-	else{
-		int i;
-		struct priority_entry *entry;
-
-		for(i = 65535; i >= 0; i--)
-			for(entry = priority_list[i]; entry;
-							entry = entry->next)
-				reader_read_file(entry->dir);
+		single_thread(dir);
 	}
 
 	pthread_exit(NULL);
+}
+
+
+struct reader *get_readers(int *num)
+{
+	struct reader *readers;
+
+	pthread_cleanup_push((void *) pthread_mutex_unlock, &mutex);
+	pthread_mutex_lock(&mutex);
+
+	readers = reader;
+	*num = reader ? reader_threads : 0;
+
+	pthread_cleanup_pop(1);
+
+	return readers;
+}
+
+
+pthread_t *get_reader_threads(int *num)
+{
+	pthread_t *threads;
+
+	pthread_cleanup_push((void *) pthread_mutex_unlock, &mutex);
+	pthread_mutex_lock(&mutex);
+
+	threads = reader_thread;
+	*num = reader_thread ? reader_threads : 0;
+
+	pthread_cleanup_pop(1);
+
+	return threads;
+}
+
+
+void set_read_frag_threads(int fragments)
+{
+	fragment_threads = fragments;
+	reader_threads = fragment_threads + block_threads;
+#ifdef SINGLE_READER_THREAD
+	frag_opt = TRUE;
+#endif
+}
+
+
+void set_read_block_threads(int blocks)
+{
+	block_threads = blocks;
+	reader_threads = fragment_threads + block_threads;
+#ifdef SINGLE_READER_THREAD
+	block_opt = TRUE;
+#endif
+}
+
+
+void set_single_threaded()
+{
+	single_threaded = TRUE;
+	reader_threads = 1;
+	block_threads = 1;
+	fragment_threads = 0;
+}
+
+
+int get_reader_num()
+{
+	return reader_threads;
+}
+
+
+void set_sleep_time(int time)
+{
+	sleep_time = time;
+}
+
+
+void check_min_memory(int rmbytes, int wmbytes, int block_log)
+{
+	int rblocks = rmbytes << (20 - block_log);
+	int wblocks = wmbytes << (20 - block_log);
+	int per_rthread = rblocks / reader_threads;
+	int total_fwthread = processors * fragment_threads;
+	int per_wthread = (wblocks - total_fwthread) / block_threads;
+
+	if(per_wthread < processors || per_rthread < BLOCKS_MIN) {
+		int twblocks = total_fwthread + processors * block_threads;
+		int twmbytes = twblocks >> (20 - block_log) ? : 1;
+		int twmin_mem = twmbytes * SQUASHFS_BWRITEQ_MEM;
+		int trblocks = BLOCKS_MIN * reader_threads;
+		int trmbytes = trblocks >> (20 - block_log) ? : 1;
+		int trmin_mem = trmbytes * SQUASHFS_READQ_MEM;
+		int reader_only = twmin_mem <= trmin_mem;
+		int min_mem = reader_only ? trmin_mem : twmin_mem;
+
+		ERROR("\nERROR: Insufficient memory for specified options!  "
+			"Please increase memory\nto %d Mbytes (-mem option)\n"
+			"\n", min_mem);
+
+		if(reader_only && !single_threaded) {
+			ERROR("Alternatively, you could try reducing the "
+				"number of reader threads\n"
+				"(-single-reader thread option, and "
+				"-small-readers/-block-readers options)\n\n");
+			ERROR("Current options:\n");
+			ERROR("\t-small-readers is set to %d\n", fragment_threads);
+			ERROR("\t-block-readers is set to %d\n\n", block_threads);
+		} else if(!reader_only && !single_threaded && processors > 1) {
+			ERROR("Alternatively, you could try reducing the "
+				"number of reader threads\n"
+				"(-single-reader thread option, and "
+				"-small-readers/-block-readers options)\n\n");
+			ERROR("Or you could reduce the number of processors "
+				"used (-processors option)\n\n");
+			ERROR("Current options:\n");
+			ERROR("\t-small-readers is set to %d\n", fragment_threads);
+			ERROR("\t-block-readers is set to %d\n", block_threads);
+			ERROR("\t-processors is set to %d\n\n", processors);
+		} else if(!reader_only && !single_threaded && processors == 1) {
+			ERROR("Alternatively, you could try reducing the "
+				"number of reader threads\n"
+				"(-single-reader thread option, and "
+				"-small-readers/-block-readers options)\n\n");
+			ERROR("Current options:\n");
+			ERROR("\t-small-readers is set to %d\n", fragment_threads);
+			ERROR("\t-block-readers is set to %d\n", block_threads);
+		} else if(!reader_only && single_threaded && processors > 1) {
+			ERROR("Alternatively, you could reduce the number of "
+				"processors used (-processors option)\n\n");
+			ERROR("-processors set to %d\n\n", processors);
+		}
+
+		BAD_ERROR("Insufficient memory\n");
+
+	}
+
+	total_rblocks = rblocks;
+	total_rmbytes = rmbytes;
+	total_wblocks = wblocks;
+	total_wmbytes = wmbytes;
 }

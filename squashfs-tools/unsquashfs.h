@@ -4,7 +4,7 @@
  * Unsquash a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2009, 2010, 2013, 2014, 2019, 2021, 2022, 2023, 2024
+ * Copyright (c) 2009, 2010, 2012, 2013, 2014, 2019, 2021, 2022, 2023, 2024
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -309,6 +309,7 @@ extern void disable_progress_bar();
 extern void dump_queue(struct queue *);
 extern void dump_cache(struct cache *);
 extern int write_bytes(int, char *, int);
+extern long long read_bytes(int, void *, long long);
 
 /* unsquash-1.c */
 int read_super_1(squashfs_operations **, void *);

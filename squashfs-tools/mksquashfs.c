@@ -3,7 +3,7 @@
  * filesystem.
  *
  * Copyright (c) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011,
- * 2012, 2013, 2014, 2017, 2019, 2021, 2022, 2023, 2024
+ * 2012, 2013, 2014, 2017, 2019, 2020, 2021, 2022, 2023, 2024, 2025
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -77,6 +77,11 @@
 #include "mksquashfs_help.h"
 #include "print_pager.h"
 #include "symbolic_mode.h"
+#include "thread.h"
+#include "reader.h"
+#include "limit.h"
+#include "alloc.h"
+#include "virt_disk_pos.h"
 
 /* Compression options */
 int noF = FALSE;
@@ -109,8 +114,6 @@ int root_uid_opt = FALSE;
 unsigned int root_uid;
 int root_gid_opt = FALSE;
 unsigned int root_gid;
-unsigned int root_time;
-int root_time_opt = FALSE;
 
 /* Options which override inode settings for all files and directories */
 int global_file_mode_opt = FALSE;
@@ -122,15 +125,24 @@ unsigned int global_uid;
 int global_gid_opt = FALSE;
 unsigned int global_gid;
 
+/* Offset all uid/gid */
+unsigned int uid_gid_offset = 0;
+
 /* Do pseudo uids and guids override -all-root, -force-uid and -force-gid? */
 int pseudo_override = FALSE;
 
 /* Time value over-ride options */
 unsigned int mkfs_time;
 int mkfs_time_opt = FALSE;
-unsigned int all_time;
-int all_time_opt = FALSE;
+unsigned int root_time;
+int root_time_opt = FALSE;
+unsigned int inode_time;
+int inode_time_opt = FALSE;
 int clamping = TRUE;
+unsigned int inode_time_latest = 0;
+int mkfs_inode_opt = FALSE;
+int root_inode_opt = FALSE;
+int inode_inode_opt = FALSE;
 
 /* Is max depth option in effect, and max depth to descend into directories */
 int max_depth_opt = FALSE;
@@ -195,6 +207,9 @@ int mem_options_disabled = FALSE;
 /* Is filesystem stored at an offset from the start of the block device/file? */
 long long start_offset = 0;
 
+/* Is Mksquashfs streaming the output filesystem to stdout? */
+int streaming = FALSE;
+
 /* File count statistics used to print summary and fill in superblock */
 unsigned int file_count = 0, sym_count = 0, dev_count = 0, dir_count = 0,
 fifo_count = 0, sock_count = 0, id_count = 0;
@@ -203,9 +218,8 @@ long long hardlnk_count = 0;
 /* superblock attributes */
 struct squashfs_super_block sBlk;
 
-/* write position within data section */
-long long pos = 0, total_bytes = 0;
-long long marked_pos = 0;
+/* count of the uncompressed size of the filesystem */
+long long total_bytes = 0;
 
 /* in memory directory table - possibly compressed */
 char *directory_table = NULL;
@@ -248,13 +262,13 @@ struct pathname *stickypath = NULL;
 unsigned int fragments = 0;
 
 struct squashfs_fragment_entry *fragment_table = NULL;
-int fragments_outstanding = 0;
 
 int fragments_locked = FALSE;
 
 /* current inode number for directories and non directories */
 unsigned int inode_no = 1;
 unsigned int root_inode_number = 0;
+unsigned int inode_start_no = 1;
 
 /* list of source dirs/files */
 int source = 0;
@@ -277,30 +291,29 @@ unsigned int sid_count = 0, suid_count = 0, sguid_count = 0;
 
 /* caches used to store buffers being worked on, and queues
  * used to send buffers between threads */
-struct cache *reader_buffer, *fragment_buffer, *reserve_cache;
-struct cache *bwriter_buffer, *fwriter_buffer;
-struct queue *to_reader, *to_deflate, *to_writer, *from_writer,
-	*to_frag, *locked_fragment, *to_process_frag;
+struct cache *fragment_buffer, *reserve_cache;
+struct cache *fwriter_buffer;
+struct queue_cache *bwriter_buffer;
+struct queue *to_reader, *to_writer, *from_writer, *to_frag, *from_order;
+struct queue_cache *to_deflate;
+struct read_queue *to_process_frag;
 struct seq_queue *to_main;
 
 /* pthread threads and mutexes */
-pthread_t reader_thread, writer_thread, main_thread;
+pthread_t reader_thread1, writer_thread, main_thread;
 pthread_t *deflator_thread, *frag_deflator_thread, *frag_thread;
 pthread_t *restore_thread = NULL;
 pthread_mutex_t	fragment_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t	pos_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t	lseek_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t	dup_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t	pos_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* reproducible image queues and threads */
 struct seq_queue *to_order;
 pthread_t order_thread;
-pthread_cond_t fragment_waiting = PTHREAD_COND_INITIALIZER;
-int sequence_count = 0;
-int reproducible = REP_DEF;
 
 /* user options that control parallelisation */
 int processors = -1;
-int bwriter_size;
 
 /* Compressor options (-X) and initialised compressor (-comp XXX) */
 int comp_opts = FALSE;
@@ -318,6 +331,9 @@ int logging=FALSE;
 
 /* file descriptor of the output filesystem */
 int fd;
+
+/* Current file position in output filesystem */
+off_t fd_pos = 0;
 
 /* Variables used for appending */
 int appending = TRUE;
@@ -346,8 +362,11 @@ char *recovery_file = NULL;
 char *recovery_pathname = NULL;
 int recover = TRUE;
 
+/* variable to force single threaded reader mode */
+int force_single_threaded = FALSE;
+
 /* list of options that have an argument */
-char *option_table[] = { "comp", "b", "mkfs-time", "fstime", "all-time",
+char *option_table[] = { "comp", "b", "mkfs-time", "fstime", "inode-time",
 	"root-mode", "force-uid", "force-gid", "action", "log-action",
 	"true-action", "false-action", "action-file", "log-action-file",
 	"true-action-file", "false-action-file", "p", "pf", "sort",
@@ -357,16 +376,19 @@ char *option_table[] = { "comp", "b", "mkfs-time", "fstime", "all-time",
 	"root-time", "root-uid", "root-gid", "xattrs-exclude", "xattrs-include",
 	"xattrs-add", "default-mode", "default-uid", "default-gid",
 	"mem-percent", "-pd", "-pseudo-dir", "help-option", "ho", "help-section",
-	"hs", "info-file", "force-file-mode", "force-dir-mode", NULL
+	"hs", "info-file", "force-file-mode", "force-dir-mode",
+	"small-readers", "block-readers", "uid-gid-offset", "all-time",
+	"overcommit", "repro-time", "cols", NULL
 };
 
-char *sqfstar_option_table[] = { "comp", "b", "mkfs-time", "fstime", "all-time",
-	"root-mode", "force-uid", "force-gid", "throttle", "limit",
-	"processors", "mem", "offset", "o", "root-time", "root-uid",
+char *sqfstar_option_table[] = { "comp", "b", "mkfs-time", "fstime",
+	"inode-time", "root-mode", "force-uid", "force-gid", "throttle",
+	"limit", "processors", "mem", "offset", "o", "root-time", "root-uid",
 	"root-gid", "xattrs-exclude", "xattrs-include", "xattrs-add", "p", "pf",
 	"default-mode", "default-uid", "default-gid", "mem-percent", "pd",
 	"pseudo-dir", "help-option", "ho", "help-section", "hs", "info-file",
-	"force-file-mode", "force-dir-mode", NULL
+	"force-file-mode", "force-dir-mode", "uid-gid-offset", "all-time",
+	"overcommit", "repro-time", "cols", NULL
 };
 
 static char *read_from_disk(long long start, unsigned int avail_bytes, int buff);
@@ -374,9 +396,9 @@ static void add_old_root_entry(char *name, squashfs_inode inode,
 	unsigned int inode_number, int type);
 static struct file_info *duplicate(int *dup, int *block_dup,
 	long long file_size, long long bytes, unsigned int *block_list,
-	long long start, struct dir_ent *dir_ent,
-	struct file_buffer *file_buffer, int blocks, long long sparse,
-	int bl_hash);
+	struct file_buffer **buffer_list, long long start,
+	struct dir_ent *dir_ent, struct file_buffer *file_buffer, int blocks,
+	long long sparse, int bl_hash);
 static struct dir_info *dir_scan1(char *, char *, struct pathnames *,
 	struct dir_ent *(_readdir)(struct dir_info *), unsigned int);
 static void dir_scan2(struct dir_info *dir, struct pseudo *pseudo);
@@ -384,7 +406,8 @@ static void dir_scan3(struct dir_info *dir);
 static void dir_scan4(struct dir_info *dir, int symlink);
 static void dir_scan5(struct dir_info *dir);
 static void dir_scan6(struct dir_info *dir);
-static void dir_scan7(squashfs_inode *inode, struct dir_info *dir_info);
+static void dir_scan7(struct dir_info *dir);
+static void dir_scan8(squashfs_inode *inode, struct dir_info *dir_info);
 static struct dir_ent *scan1_readdir(struct dir_info *dir);
 static struct dir_ent *scan1_single_readdir(struct dir_info *dir);
 static struct dir_ent *scan1_encomp_readdir(struct dir_info *dir);
@@ -402,6 +425,7 @@ unsigned short get_checksum_mem(char *buff, int bytes);
 static void print_summary();
 void write_destination(int fd, long long byte, long long bytes, void *buff);
 static int old_excluded(char *filename, struct stat *buf);
+static void write_superblock(struct squashfs_super_block *sBlk);
 
 
 void prep_exit()
@@ -422,10 +446,16 @@ void prep_exit()
 			pthread_exit(NULL);
 		}
 	} else if(!appending) {
-		if(destination_file && !block_device)
+		if(destination_file && !block_device && !streaming)
 			unlink(destination_file);
 	} else if(recovery_file)
 		unlink(recovery_file);
+}
+
+
+void pre_exit_squashfs()
+{
+	prep_exit();
 }
 
 
@@ -457,88 +487,70 @@ int multiply_overflowll(long long a, int multiplier)
 			+ (((char *)A) - data_cache)))
 
 
-inline void set_pos(long long value)
+static long long get_sequence()
 {
-	pos = value;
+	static long long sequence = 0;
+
+	return sequence ++;
 }
 
 
-inline long long get_pos(void)
+static inline void send_orderer_reset(long long vpos)
 {
-	return pos;
+	struct file_buffer *buffer = MALLOC(sizeof(struct file_buffer));
+
+	buffer->cache = NULL;
+	buffer->sequence = get_sequence();
+	buffer->buffer_type = RESET_CMD;
+	buffer->block = vpos;
+
+	order_queue_put(to_order, buffer);
 }
 
 
-long long get_and_inc_pos(long long value)
+static inline void  sync_writer_thread()
 {
-	long long tmp = pos;
+	struct file_buffer *buffer = MALLOC(sizeof(struct file_buffer));
 
-	pos += value;
-	return tmp;
+	buffer->cache = NULL;
+	buffer->sequence = get_sequence();
+	buffer->buffer_type = WSYNC_CMD;
+
+	order_queue_put(to_order, buffer);
+	if(queue_get(from_writer) != 0)
+		BAD_ERROR("Got unexpected response in sync_writer_thread\n");
 }
 
 
-inline int reset_pos(void)
+
+static inline void send_orderer_create_map(long long vpos)
 {
-	if(marked_pos == 0)
-		BAD_ERROR("BUG: Saved write position is empty!\n");
-	else if(marked_pos == 1)
-		return FALSE;
-	else {
-		set_pos(marked_pos);
-		return TRUE;
-	}
+	struct file_buffer *buffer = MALLOC(sizeof(struct file_buffer));
+
+	buffer->cache = NULL;
+	buffer->sequence = get_sequence();
+	buffer->buffer_type = MAP_CMD;
+	buffer->block = vpos;
+
+	order_queue_put(to_order, buffer);
 }
 
 
-inline void unmark_pos()
-{
-	if(marked_pos == 0)
-		BAD_ERROR("BUG: Saved write position should not be empty!\n");
 
-	marked_pos = 0;
+static inline void put_write_buffer_hash(struct file_buffer *buffer)
+{
+	buffer->block = get_and_inc_vpos(buffer->size);
+	buffer->sequence = get_sequence();
+	queue_cache_hash(buffer, buffer->block);
+	order_queue_put(to_order, buffer);
 }
 
 
-inline void mark_pos()
+static inline void put_write_buffer(struct file_buffer *buffer)
 {
-	if(marked_pos != 0)
-		BAD_ERROR("BUG: Saved write position should be empty!\n");
-
-	marked_pos = 1;
-}
-
-
-inline long long get_marked_pos(void)
-{
-	if(marked_pos == 0)
-		BAD_ERROR("BUG: Saved write position is empty!\n");
-	else if(marked_pos == 1)
-		return get_pos();
-	else
-		return marked_pos;
-}
-
-
-inline long long set_write_buffer(struct file_buffer *buffer, int size)
-{
-	buffer->block = get_and_inc_pos(size);
-	return buffer->block;
-}
-
-
-inline void put_write_buffer_hash(struct file_buffer *buffer, int put)
-{
-	if(marked_pos == 0)
-		BAD_ERROR("BUG: Saved write position should not be empty!\n");
-	else if(marked_pos == 1)
-		marked_pos = get_pos();
-
-	buffer->block = get_and_inc_pos(buffer->size);
-	cache_hash(buffer, buffer->block);
-
-	if(put)
-		queue_put(to_writer, buffer);
+	buffer->block = get_and_inc_vpos(buffer->size);
+	buffer->sequence = get_sequence();
+	order_queue_put(to_order, buffer);
 }
 
 
@@ -548,7 +560,7 @@ void restorefs()
 
 	ERROR("Exiting - restoring original filesystem!\n\n");
 
-	set_pos(sbytes);
+	set_dpos(sbytes);
 	memcpy(data_cache, sdata_cache, cache_bytes = scache_bytes);
 	memcpy(directory_data_cache, sdirectory_data_cache,
 		sdirectory_cache_bytes);
@@ -575,16 +587,18 @@ void restorefs()
 	write_filesystem_tables(&sBlk);
 
 	if(!block_device) {
-		int res = ftruncate(fd, get_pos());
+		int res = ftruncate(fd, get_dpos());
 		if(res != 0)
 			BAD_ERROR("Failed to truncate dest file because %s\n",
 				strerror(errno));
 	}
 
-	if(!nopad && (i = get_pos() & (4096 - 1))) {
+	if(!nopad && (i = get_dpos() & (4096 - 1))) {
 		char temp[4096] = {0};
-		write_destination(fd, get_pos(), 4096 - i, temp);
+		write_destination(fd, get_dpos(), 4096 - i, temp);
 	}
+
+	write_superblock(&sBlk);
 
 	res = close(fd);
 
@@ -643,29 +657,28 @@ static void *get_inode(int req_size)
 {
 	int data_space;
 	unsigned short c_byte;
+	char *cur = data_cache;
 
 	while(cache_bytes >= SQUASHFS_METADATA_SIZE) {
 		if((inode_size - inode_bytes) <
 				((SQUASHFS_METADATA_SIZE << 1)) + 2) {
-			void *it = realloc(inode_table, inode_size +
+			inode_table = REALLOC(inode_table, inode_size +
 				(SQUASHFS_METADATA_SIZE << 1) + 2);
-			if(it == NULL)
-				MEM_ERROR();
-			inode_table = it;
 			inode_size += (SQUASHFS_METADATA_SIZE << 1) + 2;
 		}
 
-		c_byte = mangle(inode_table + inode_bytes + BLOCK_OFFSET,
-			data_cache, SQUASHFS_METADATA_SIZE,
-			SQUASHFS_METADATA_SIZE, noI, 0);
+		c_byte = mangle(inode_table + inode_bytes + BLOCK_OFFSET, cur,
+			SQUASHFS_METADATA_SIZE, SQUASHFS_METADATA_SIZE, noI, 0);
 		TRACE("Inode block @ 0x%x, size %d\n", inode_bytes, c_byte);
 		SQUASHFS_SWAP_SHORTS(&c_byte, inode_table + inode_bytes, 1);
 		inode_bytes += SQUASHFS_COMPRESSED_SIZE(c_byte) + BLOCK_OFFSET;
 		total_inode_bytes += SQUASHFS_METADATA_SIZE + BLOCK_OFFSET;
-		memmove(data_cache, data_cache + SQUASHFS_METADATA_SIZE,
-			cache_bytes - SQUASHFS_METADATA_SIZE);
+		cur += SQUASHFS_METADATA_SIZE;
 		cache_bytes -= SQUASHFS_METADATA_SIZE;
 	}
+
+	if(cache_bytes && cur != data_cache)
+		memcpy(data_cache, cur, cache_bytes);
 
 	data_space = (cache_size - cache_bytes);
 	if(data_space < req_size) {
@@ -674,12 +687,9 @@ static void *get_inode(int req_size)
 				~(SQUASHFS_METADATA_SIZE - 1)) : req_size -
 				data_space;
 
-			void *dc = realloc(data_cache, cache_size +
+			data_cache = REALLOC(data_cache, cache_size +
 				realloc_size);
-			if(dc == NULL)
-				MEM_ERROR();
 			cache_size += realloc_size;
-			data_cache = dc;
 	}
 
 	cache_bytes += req_size;
@@ -716,20 +726,37 @@ bytes_read:
 
 int read_fs_bytes(int fd, long long byte, long long bytes, void *buff)
 {
-	off_t off = byte;
+	off_t off = byte + start_offset;
 	int res = 1;
 
 	TRACE("read_fs_bytes: reading from position 0x%llx, bytes %lld\n",
 		byte, bytes);
 
-	if(lseek(fd, start_offset + off, SEEK_SET) == -1) {
-		ERROR("read_fs_bytes: Lseek on destination failed because %s, "
-			"offset=0x%llx\n", strerror(errno), start_offset + off);
-		res = 0;
-	} else if(read_bytes(fd, buff, bytes) < bytes) {
-		ERROR("Read on destination failed\n");
-		res = 0;
+	pthread_cleanup_push((void *) pthread_mutex_unlock, &lseek_mutex);
+	pthread_mutex_lock(&lseek_mutex);
+
+	if(fd_pos != off) {
+		if(lseek(fd, off, SEEK_SET) == -1) {
+			ERROR("read_fs_bytes: Lseek on destination failed "
+				"because %s, offset=0x%llx\n", strerror(errno),
+				(long long) off);
+			fd_pos = LLONG_MAX;
+			res = FALSE;
+			goto unlock;
+		}
 	}
+
+	if(read_bytes(fd, buff, bytes) < bytes) {
+		ERROR("Read on destination failed\n");
+		fd_pos = LLONG_MAX;
+		res = FALSE;
+		goto unlock;
+	}
+
+	fd_pos = off + bytes;
+
+unlock:
+	pthread_cleanup_pop(1);
 
 	return res;
 }
@@ -760,19 +787,39 @@ static int write_bytes(int fd, void *buff, long long bytes)
 
 void write_destination(int fd, long long byte, long long bytes, void *buff)
 {
-	off_t off = byte;
+	off_t off = start_offset + byte;
 
-	if(lseek(fd, start_offset + off, SEEK_SET) == -1) {
-		ERROR("write_destination: Lseek on destination "
-			"failed because %s, offset=0x%llx\n", strerror(errno),
-			start_offset + off);
+	pthread_cleanup_push((void *) pthread_mutex_unlock, &lseek_mutex);
+	pthread_mutex_lock(&lseek_mutex);
+
+	if(fd_pos != off) {
+		if(streaming)
+			/*
+			 * We cannot seek on the output filesystem, and this
+			 * situation is a bug - with no duplicate checking,
+			 * no seeking on the output filesystem should be
+			 * necessary.
+			 */
+			BAD_ERROR("BUG: trying to seek on stdout when streaming!\n");
+
+		if(lseek(fd, off, SEEK_SET) == -1) {
+			ERROR("write_destination: Lseek on destination failed "
+				"because %s, offset=0x%llx\n", strerror(errno),
+				(long long) off);
+			BAD_ERROR("Probably out of space on output %s\n",
+				block_device ? "block device" : "filesystem");
+		}
+	}
+
+	if(write_bytes(fd, buff, bytes) == -1) {
+		ERROR("Failed to write to output %s\n",
+			block_device ? "block device" : "filesystem");
 		BAD_ERROR("Probably out of space on output %s\n",
 			block_device ? "block device" : "filesystem");
 	}
 
-	if(write_bytes(fd, buff, bytes) == -1)
-		BAD_ERROR("Failed to write to output %s\n",
-			block_device ? "block device" : "filesystem");
+	fd_pos = off + bytes;
+	pthread_cleanup_pop(1);
 }
 
 
@@ -786,12 +833,9 @@ static long long write_inodes()
 	while(cache_bytes) {
 		if(inode_size - inode_bytes <
 				((SQUASHFS_METADATA_SIZE << 1) + 2)) {
-			void *it = realloc(inode_table, inode_size +
+			inode_table = REALLOC(inode_table, inode_size +
 				((SQUASHFS_METADATA_SIZE << 1) + 2));
-			if(it == NULL)
-				MEM_ERROR();
 			inode_size += (SQUASHFS_METADATA_SIZE << 1) + 2;
-			inode_table = it;
 		}
 		avail_bytes = cache_bytes > SQUASHFS_METADATA_SIZE ?
 			SQUASHFS_METADATA_SIZE : cache_bytes;
@@ -805,7 +849,7 @@ static long long write_inodes()
 		cache_bytes -= avail_bytes;
 	}
 
-	start_bytes = get_and_inc_pos(inode_bytes);
+	start_bytes = get_and_inc_dpos(inode_bytes);
 	write_destination(fd, start_bytes, inode_bytes,  inode_table);
 
 	return start_bytes;
@@ -822,13 +866,10 @@ static long long write_directories()
 	while(directory_cache_bytes) {
 		if(directory_size - directory_bytes <
 				((SQUASHFS_METADATA_SIZE << 1) + 2)) {
-			void *dt = realloc(directory_table,
+			directory_table = REALLOC(directory_table,
 				directory_size + ((SQUASHFS_METADATA_SIZE << 1)
 				+ 2));
-			if(dt == NULL)
-				MEM_ERROR();
 			directory_size += (SQUASHFS_METADATA_SIZE << 1) + 2;
-			directory_table = dt;
 		}
 		avail_bytes = directory_cache_bytes > SQUASHFS_METADATA_SIZE ?
 			SQUASHFS_METADATA_SIZE : directory_cache_bytes;
@@ -846,10 +887,29 @@ static long long write_directories()
 		directory_cache_bytes -= avail_bytes;
 	}
 
-	start_bytes = get_and_inc_pos(directory_bytes);
+	start_bytes = get_and_inc_dpos(directory_bytes);
 	write_destination(fd, start_bytes, directory_bytes, directory_table);
 
 	return start_bytes;
+}
+
+
+static int check_id_table_offset()
+{
+	int i;
+
+	INFO("Updating id table with -uid-gid-offset value %u", uid_gid_offset);
+
+	for(i = 0; i < id_count; i++) {
+		long long id = id_table[i]->id + uid_gid_offset;
+
+		if(id > (((long long) 1 << 32) - 1))
+			return FALSE;
+
+		id_table[i]->id = id;
+	}
+
+	return TRUE;
 }
 
 
@@ -885,9 +945,7 @@ static struct id *get_id(unsigned int id)
 struct id *create_id(unsigned int id)
 {
 	int hash = ID_HASH(id);
-	struct id *entry = malloc(sizeof(struct id));
-	if(entry == NULL)
-		MEM_ERROR();
+	struct id *entry = MALLOC(sizeof(struct id));
 	entry->id = id;
 	entry->index = id_count ++;
 	entry->flags = 0;
@@ -944,11 +1002,8 @@ char *pathname(struct dir_ent *dir_ent)
 	if (dir_ent->nonstandard_pathname)
 		return dir_ent->nonstandard_pathname;
 
-	if(pathname == NULL) {
-		pathname = malloc(ALLOC_SIZE);
-		if(pathname == NULL)
-			MEM_ERROR();
-	}
+	if(pathname == NULL)
+		pathname = MALLOC(ALLOC_SIZE);
 
 	for(;;) {
 		int res = snprintf(pathname, size, "%s/%s",
@@ -963,9 +1018,7 @@ char *pathname(struct dir_ent *dir_ent)
 			 * increase it and try again
 			 */
 			size = (res + ALLOC_SIZE) & ~(ALLOC_SIZE - 1);
-			pathname = realloc(pathname, size);
-			if(pathname == NULL)
-				MEM_ERROR();
+			pathname = REALLOC(pathname, size);
 		} else
 			break;
 	}
@@ -981,11 +1034,8 @@ char *subpathname(struct dir_ent *dir_ent)
 	static int size = ALLOC_SIZE;
 	int res;
 
-	if(subpath == NULL) {
-		subpath = malloc(ALLOC_SIZE);
-		if(subpath == NULL)
-			MEM_ERROR();
-	}
+	if(subpath == NULL)
+		subpath = MALLOC(ALLOC_SIZE);
 
 	for(;;) {
 		if(dir_ent->our_dir->subpath[0] != '\0')
@@ -1002,9 +1052,7 @@ char *subpathname(struct dir_ent *dir_ent)
 			 * increase it and try again
 			 */
 			size = (res + ALLOC_SIZE) & ~(ALLOC_SIZE - 1);
-			subpath = realloc(subpath, size);
-			if(subpath == NULL)
-				MEM_ERROR();
+			subpath = REALLOC(subpath, size);
 		} else
 			break;
 	}
@@ -1025,16 +1073,28 @@ static inline unsigned int get_parent_no(struct dir_info *dir)
 }
 
 	
-static inline time_t get_time(time_t time)
+static inline unsigned int get_time(time_t orig)
 {
-	if(all_time_opt) {
+	unsigned int ts;
+
+	if(orig != -1)
+		ts = orig;
+	else if(mkfs_inode_opt || root_inode_opt || inode_inode_opt)
+		ts = inode_time_latest;
+	else
+		ts = time(NULL);
+
+	if(inode_inode_opt)
+		ts = inode_time_latest;
+
+	if(inode_time_opt) {
 		if(clamping)
-			return time > all_time ? all_time : time;
+			ts = ts > inode_time ? inode_time : ts;
 		else
-			return all_time;
+			ts = inode_time;
 	}
 
-	return time;
+	return ts;
 }
 
 
@@ -1316,7 +1376,6 @@ squashfs_inode create_inode(struct dir_info *dir_info,
 static void add_dir(squashfs_inode inode, unsigned int inode_number, char *name,
 	int type, struct directory *dir)
 {
-	unsigned char *buff;
 	struct squashfs_dir_entry idir;
 	unsigned int start_block = inode >> 16;
 	unsigned int offset = inode & 0xffff;
@@ -1330,13 +1389,8 @@ static void add_dir(squashfs_inode inode, unsigned int inode_number, char *name,
 	}
 
 	if(dir->offset + sizeof(struct squashfs_dir_entry) + size +
-			sizeof(struct squashfs_dir_header) >= dir->size) {
-		buff = realloc(dir->buff, dir->size += SQUASHFS_METADATA_SIZE);
-		if(buff == NULL)
-			MEM_ERROR();
-
-		dir->buff = buff;
-	}
+			sizeof(struct squashfs_dir_header) >= dir->size)
+		dir->buff= REALLOC(dir->buff, dir->size += SQUASHFS_METADATA_SIZE);
 
 	if(dir->entry_count == 256 || start_block != dir->start_block ||
 			(dir->have_dir_header &&
@@ -1351,13 +1405,10 @@ static void add_dir(squashfs_inode inode, unsigned int inode_number, char *name,
 			if((dir->offset + sizeof(struct squashfs_dir_entry) + size -
 					dir->index_count_offset) >
 					SQUASHFS_METADATA_SIZE) {
-				if(dir->i_count % I_COUNT_SIZE == 0) {
-					dir->index = realloc(dir->index,
+				if(dir->i_count % I_COUNT_SIZE == 0)
+					dir->index = REALLOC(dir->index,
 						(dir->i_count + I_COUNT_SIZE) *
 						sizeof(struct cached_dir_index));
-					if(dir->index == NULL)
-						MEM_ERROR();
-				}
 				dir->index[dir->i_count].index.index = dir->offset;
 				dir->index[dir->i_count].index.size = size - 1;
 				dir->index[dir->i_count++].name = name;
@@ -1401,18 +1452,16 @@ static squashfs_inode write_dir(struct dir_info *dir_info,
 	int data_space = directory_cache_size - directory_cache_bytes;
 	unsigned int directory_block, directory_offset, i_count, index;
 	unsigned short c_byte;
+	void *cache;
 
 	if(data_space < dir_size) {
 		int realloc_size = directory_cache_size == 0 ?
 			((dir_size + SQUASHFS_METADATA_SIZE) &
 			~(SQUASHFS_METADATA_SIZE - 1)) : dir_size - data_space;
 
-		void *dc = realloc(directory_data_cache,
+		directory_data_cache = REALLOC(directory_data_cache,
 			directory_cache_size + realloc_size);
-		if(dc == NULL)
-			MEM_ERROR();
 		directory_cache_size += realloc_size;
-		directory_data_cache = dc;
 	}
 
 	if(dir_size) {
@@ -1430,6 +1479,7 @@ static squashfs_inode write_dir(struct dir_info *dir_info,
 	directory_cache_bytes += dir_size;
 	i_count = 0;
 	index = SQUASHFS_METADATA_SIZE - directory_offset;
+	cache = directory_data_cache;
 
 	while(1) {
 		while(i_count < dir->i_count &&
@@ -1443,19 +1493,15 @@ static squashfs_inode write_dir(struct dir_info *dir_info,
 
 		if((directory_size - directory_bytes) <
 					((SQUASHFS_METADATA_SIZE << 1) + 2)) {
-			void *dt = realloc(directory_table,
+			directory_table = REALLOC(directory_table,
 				directory_size + (SQUASHFS_METADATA_SIZE << 1)
 				+ 2);
-			if(dt == NULL)
-				MEM_ERROR();
 			directory_size += SQUASHFS_METADATA_SIZE << 1;
-			directory_table = dt;
 		}
 
 		c_byte = mangle(directory_table + directory_bytes +
-				BLOCK_OFFSET, directory_data_cache,
-				SQUASHFS_METADATA_SIZE, SQUASHFS_METADATA_SIZE,
-				noI, 0);
+				BLOCK_OFFSET, cache, SQUASHFS_METADATA_SIZE,
+				SQUASHFS_METADATA_SIZE, noI, 0);
 		TRACE("Directory block @ 0x%x, size %d\n", directory_bytes,
 			c_byte);
 		SQUASHFS_SWAP_SHORTS(&c_byte,
@@ -1463,11 +1509,12 @@ static squashfs_inode write_dir(struct dir_info *dir_info,
 		directory_bytes += SQUASHFS_COMPRESSED_SIZE(c_byte) +
 			BLOCK_OFFSET;
 		total_directory_bytes += SQUASHFS_METADATA_SIZE + BLOCK_OFFSET;
-		memmove(directory_data_cache, directory_data_cache +
-			SQUASHFS_METADATA_SIZE, directory_cache_bytes -
-			SQUASHFS_METADATA_SIZE);
 		directory_cache_bytes -= SQUASHFS_METADATA_SIZE;
+		cache += SQUASHFS_METADATA_SIZE;
 	}
+
+	if(directory_cache_bytes && cache != directory_data_cache)
+		memcpy(directory_data_cache, cache, directory_cache_bytes);
 
 	dir_count ++;
 
@@ -1630,7 +1677,7 @@ again:
 	}
 
 	cache_unlock(buffer);
-	cache_block_put(compressed_buffer);
+	gen_cache_block_put(compressed_buffer);
 
 finished:
 	pthread_cleanup_pop(0);
@@ -1677,31 +1724,10 @@ static unsigned short get_fragment_checksum(struct file_info *file)
 		pthread_mutex_unlock(&dup_mutex);
 	}
 
-	cache_block_put(frag_buffer);
+	gen_cache_block_put(frag_buffer);
 	pthread_cleanup_pop(0);
 
 	return checksum;
-}
-
-
-static void ensure_fragments_flushed()
-{
-	pthread_cleanup_push((void *) pthread_mutex_unlock, &fragment_mutex);
-	pthread_mutex_lock(&fragment_mutex);
-
-	while(fragments_outstanding)
-		pthread_cond_wait(&fragment_waiting, &fragment_mutex);
-
-	pthread_cleanup_pop(1);
-}
-
-
-static void lock_fragments()
-{
-	pthread_cleanup_push((void *) pthread_mutex_unlock, &fragment_mutex);
-	pthread_mutex_lock(&fragment_mutex);
-	fragments_locked = TRUE;
-	pthread_cleanup_pop(1);
 }
 
 
@@ -1712,58 +1738,15 @@ static void log_fragment(unsigned int fragment, long long start)
 }
 
 
-static void unlock_fragments()
-{
-	int frg, size;
-	struct file_buffer *write_buffer;
-
-	pthread_cleanup_push((void *) pthread_mutex_unlock, &fragment_mutex);
-	pthread_mutex_lock(&fragment_mutex);
-
-	/*
-	 * Note queue_empty() is inherently racy with respect to concurrent
-	 * queue get and pushes.  We avoid this because we're holding the
-	 * fragment_mutex which ensures no other threads can be using the
-	 * queue at this time.
-	 */
-	while(!queue_empty(locked_fragment)) {
-		write_buffer = queue_get(locked_fragment);
-		frg = write_buffer->block;	
-		size = SQUASHFS_COMPRESSED_SIZE_BLOCK(fragment_table[frg].size);
-		fragment_table[frg].start_block = set_write_buffer(write_buffer, size);
-		fragments_outstanding --;
-		queue_put(to_writer, write_buffer);
-		log_fragment(frg, fragment_table[frg].start_block);
-		TRACE("fragment_locked writing fragment %d, compressed size %d"
-			"\n", frg, size);
-	}
-	fragments_locked = FALSE;
-	pthread_cleanup_pop(1);
-}
-
-/* Called with the fragment_mutex locked */
-static void add_pending_fragment(struct file_buffer *write_buffer, int c_byte,
-	int fragment)
-{
-	fragment_table[fragment].size = c_byte;
-	write_buffer->block = fragment;
-
-	queue_put(locked_fragment, write_buffer);
-}
-
-
 static void write_fragment(struct file_buffer *fragment)
 {
-	static long long sequence = 0;
-
 	if(fragment == NULL)
 		return;
 
 	pthread_cleanup_push((void *) pthread_mutex_unlock, &fragment_mutex);
 	pthread_mutex_lock(&fragment_mutex);
 	fragment_table[fragment->block].unused = 0;
-	fragment->sequence = sequence ++;
-	fragments_outstanding ++;
+	fragment->sequence = get_sequence();
 	queue_put(to_frag, fragment);
 	pthread_cleanup_pop(1);
 }
@@ -1776,13 +1759,9 @@ static struct file_buffer *allocate_fragment()
 	pthread_cleanup_push((void *) pthread_mutex_unlock, &fragment_mutex);
 	pthread_mutex_lock(&fragment_mutex);
 
-	if(fragments % FRAG_SIZE == 0) {
-		void *ft = realloc(fragment_table, (fragments +
+	if(fragments % FRAG_SIZE == 0)
+		fragment_table = REALLOC(fragment_table, (fragments +
 			FRAG_SIZE) * sizeof(struct squashfs_fragment_entry));
-		if(ft == NULL)
-			MEM_ERROR();
-		fragment_table = ft;
-	}
 
 	fragment->size = 0;
 	fragment->block = fragments ++;
@@ -1819,9 +1798,7 @@ static struct fragment *get_and_fill_fragment(struct file_buffer *file_buffer,
 		*fragment = NULL;
 	}
 
-	ffrg = malloc(sizeof(struct fragment));
-	if(ffrg == NULL)
-		MEM_ERROR();
+	ffrg = MALLOC(sizeof(struct fragment));
 
 	if(*fragment == NULL)
 		*fragment = allocate_fragment();
@@ -1842,19 +1819,15 @@ long long generic_write_table(long long length, void *buffer, int length2,
 {
 	int meta_blocks = (length + SQUASHFS_METADATA_SIZE - 1) /
 		SQUASHFS_METADATA_SIZE;
-	long long *list, start_bytes, bytes;
 	int compressed_size, i, list_size = meta_blocks * sizeof(long long);
+	long long *list = MALLOC(list_size), start_bytes, bytes;
 	unsigned short c_byte;
 	char cbuffer[(SQUASHFS_METADATA_SIZE << 2) + 2];
 	
 #ifdef SQUASHFS_TRACE
-	long long obytes = get_pos();
+	long long obytes = get_dpos();
 	long long olength = length;
 #endif
-
-	list = malloc(list_size);
-	if(list == NULL)
-		MEM_ERROR();
 
 	for(i = 0; i < meta_blocks; i++) {
 		int avail_bytes = length > SQUASHFS_METADATA_SIZE ?
@@ -1865,7 +1838,7 @@ long long generic_write_table(long long length, void *buffer, int length2,
 		SQUASHFS_SWAP_SHORTS(&c_byte, cbuffer, 1);
 		compressed_size = SQUASHFS_COMPRESSED_SIZE(c_byte) +
 			BLOCK_OFFSET;
-		bytes = get_and_inc_pos(compressed_size);
+		bytes = get_and_inc_dpos(compressed_size);
 		write_destination(fd, bytes, compressed_size, cbuffer);
 		list[i] = bytes;
 		total_bytes += avail_bytes;
@@ -1874,19 +1847,19 @@ long long generic_write_table(long long length, void *buffer, int length2,
 			compressed_size);
 	}
 
-	start_bytes = get_and_inc_pos(length2);
+	start_bytes = get_and_inc_dpos(length2);
 	if(length2) {
 		write_destination(fd, start_bytes, length2, buffer2);
 		total_bytes += length2;
 	}
 		
 	SQUASHFS_INSWAP_LONG_LONGS(list, meta_blocks);
-	bytes = get_and_inc_pos(list_size);
+	bytes = get_and_inc_dpos(list_size);
 	write_destination(fd, bytes, list_size, list);
 	total_bytes += list_size;
 
 	TRACE("generic_write_table: total uncompressed %lld compressed %lld\n",
-		olength, get_pos() - obytes);
+		olength, get_dpos() - obytes);
 
 	free(list);
 
@@ -1918,11 +1891,8 @@ static char *read_from_disk(long long start, unsigned int avail_bytes, int buff)
 	static char *buffer1 = NULL, *buffer2 = NULL;
 	char **buffer = buff == 0 ? &buffer1 : &buffer2;
 
-	if(*buffer == NULL) {
-		*buffer = malloc(block_size);
-		if(*buffer == NULL)
-			MEM_ERROR();
-	}
+	if(*buffer == NULL)
+		*buffer = MALLOC(block_size);
 
 	res = read_fs_bytes(fd, start, avail_bytes, *buffer);
 	if(res == 0)
@@ -1951,6 +1921,7 @@ unsigned short get_checksum(char *buff, int bytes, unsigned short chksum)
 static unsigned short get_checksum_disk(long long start, long long l,
 	unsigned int *blocks)
 {
+	long long dpos = -1;
 	unsigned short chksum = 0;
 	unsigned int bytes;
 	struct file_buffer *write_buffer;
@@ -1960,14 +1931,53 @@ static unsigned short get_checksum_disk(long long start, long long l,
 		bytes = SQUASHFS_COMPRESSED_SIZE_BLOCK(blocks[i]);
 		if(bytes == 0) /* sparse block */
 			continue;
-		write_buffer = cache_lookup(bwriter_buffer, start);
+		write_buffer = queue_cache_lookup(bwriter_buffer, start);
 		if(write_buffer) {
 			chksum = get_checksum(write_buffer->data, bytes,
 				chksum);
-			cache_block_put(write_buffer);
+			gen_cache_block_put(write_buffer);
 		} else {
-			void *data = read_from_disk(start, bytes, 0);
+			void *data;
+
+			if(dpos == -1)
+				dpos = get_virt_disk(start);
+
+			data = read_from_disk(dpos, bytes, 0);
 			if(data == NULL) {	
+				ERROR("Failed to checksum data from output"
+					" filesystem\n");
+				BAD_ERROR("Output filesystem corrupted?\n");
+			}
+
+			chksum = get_checksum(data, bytes, chksum);
+		}
+
+		l -= bytes;
+		start += bytes;
+		if(dpos != -1)
+			dpos += bytes;
+	}
+
+	return chksum;
+}
+
+
+static unsigned short get_checksum_buffers(long long start, long long l,
+	unsigned int *blocks, struct file_buffer **buffers)
+{
+	unsigned short chksum = 0;
+	unsigned int bytes;
+	int i;
+
+	for(i = 0; l; i++)  {
+		bytes = SQUASHFS_COMPRESSED_SIZE_BLOCK(blocks[i]);
+		if(bytes == 0) /* sparse block */
+			continue;
+		if(buffers[i])
+			chksum = get_checksum(buffers[i]->data, bytes, chksum);
+		else {
+			void *data = read_from_disk(start, bytes, 0);
+			if(data == NULL) {
 				ERROR("Failed to checksum data from output"
 					" filesystem\n");
 				BAD_ERROR("Output filesystem corrupted?\n");
@@ -2068,10 +2078,7 @@ void add_file(long long start, long long file_size, long long file_bytes,
 		}
 	}
 
-	frg = malloc(sizeof(struct fragment));
-	if(frg == NULL)
-		MEM_ERROR();
-
+	frg = MALLOC(sizeof(struct fragment));
 	frg->index = fragment;
 	frg->offset = offset;
 	frg->size = bytes;
@@ -2082,10 +2089,7 @@ void add_file(long long start, long long file_size, long long file_bytes,
 	if(fragment == SQUASHFS_INVALID_FRAG)
 		return;
 
-	append_file = malloc(sizeof(struct append_file));
-	if(append_file == NULL)
-		MEM_ERROR();
-
+	append_file = MALLOC(sizeof(struct append_file));
 	append_file->file = file;
 	append_file->next = file_mapping[fragment];
 	file_mapping[fragment] = append_file;
@@ -2098,8 +2102,9 @@ static int pre_duplicate(long long file_size, struct inode_info *inode,
 	struct file_info *dupl_ptr;
 	long long fragment_size;
 	int blocks;
+	int c_byte = is_sparse(buffer) ? 0 : buffer->c_byte;
 
-	if(inode->no_fragments || (!inode->always_use_fragments && file_size >=
+	if(inode->no_fragments || inode->alignment || (!inode->always_use_fragments && file_size >=
 								block_size)) {
 		blocks = (file_size + block_size - 1) >> block_log;
 		fragment_size = 0;
@@ -2112,7 +2117,7 @@ static int pre_duplicate(long long file_size, struct inode_info *inode,
 	if(blocks) {
 		*bl_hash = block_hash(buffer->size, blocks);
 		for(dupl_ptr = dupl_block[*bl_hash]; dupl_ptr;dupl_ptr = dupl_ptr->block_next)
-			if(dupl_ptr->blocks == blocks && dupl_ptr->block_list[0] == buffer->c_byte)
+			if(dupl_ptr->blocks == blocks && dupl_ptr->block_list[0] == c_byte)
 				return TRUE;
 	}
 
@@ -2133,10 +2138,7 @@ static struct file_info *create_non_dup(long long file_size, long long bytes,
 	unsigned short fragment_checksum, int checksum_flag,
 	int checksum_frag_flag)
 {
-	struct file_info *dupl_ptr = malloc(sizeof(struct file_info));
-
-	if(dupl_ptr == NULL)
-		MEM_ERROR();
+	struct file_info *dupl_ptr = MALLOC(sizeof(struct file_info));
 
 	dupl_ptr->file_size = file_size;
 	dupl_ptr->bytes = bytes;
@@ -2163,11 +2165,8 @@ static struct file_info *add_non_dup(long long file_size, long long bytes,
 	unsigned short fragment_checksum, int checksum_flag,
 	int checksum_frag_flag, int blocks_dup, int frag_dup, int bl_hash)
 {
-	struct file_info *dupl_ptr = malloc(sizeof(struct file_info));
+	struct file_info *dupl_ptr = MALLOC(sizeof(struct file_info));
 	int fragment_size = fragment->size;
-
-	if(dupl_ptr == NULL)
-		MEM_ERROR();
 
 	dupl_ptr->file_size = file_size;
 	dupl_ptr->bytes = bytes;
@@ -2227,7 +2226,7 @@ static struct file_info *frag_duplicate(struct file_buffer *file_buffer, int *du
 						buffer->data +
 						dupl_ptr->fragment->offset,
 						file_size);
-					cache_block_put(buffer);
+					gen_cache_block_put(buffer);
 					if(res == 0)
 						break;
 				}
@@ -2260,10 +2259,7 @@ static struct file_info *frag_duplicate(struct file_buffer *file_buffer, int *du
 			return dupl_ptr->dup->file;
 		}
 
-		dup = malloc(sizeof(struct dup_info));
-		if(dup == NULL)
-			MEM_ERROR();
-
+		dup = MALLOC(sizeof(struct dup_info));
 		dup->file = create_non_dup(file_size, 0, 0, 0, NULL, 0,
 				dupl_ptr->fragment, 0, checksum, TRUE, TRUE);
 		dup->next = NULL;
@@ -2276,27 +2272,18 @@ static struct file_info *frag_duplicate(struct file_buffer *file_buffer, int *du
 
 static void reset_and_truncate(void)
 {
-	int res = reset_pos();
+	int res = reset_vpos();
 
-	if(res && !block_device) {
-		int res;
-
-		queue_put(to_writer, NULL);
-		if(queue_get(from_writer) != 0)
-			EXIT_MKSQUASHFS();
-		res = ftruncate(fd, get_pos());
-		if(res != 0)
-			BAD_ERROR("Failed to truncate dest file because"
-				"  %s\n", strerror(errno));
-	}
+	if(res)
+		send_orderer_reset(get_marked_vpos());
 }
 
 
 static struct file_info *duplicate(int *dupf, int *block_dup,
 	long long file_size, long long bytes, unsigned int *block_list,
-	long long start, struct dir_ent *dir_ent,
-	struct file_buffer *file_buffer, int blocks, long long sparse,
-	int bl_hash)
+	struct file_buffer **buffer_list, long long start,
+	struct dir_ent *dir_ent, struct file_buffer *file_buffer, int blocks,
+	long long sparse, int bl_hash)
 {
 	struct file_info *dupl_ptr, *file;
 	struct file_info *block_dupl = NULL, *frag_dupl = NULL;
@@ -2307,13 +2294,14 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 	unsigned short checksum = 0;
 	char checksum_flag = FALSE;
 	struct fragment *fragment;
-	long long dupl_start;
+	long long dupl_start, cached_target = -1;
 
 	/* Look for a possible duplicate set of blocks */
 	for(dupl_ptr = dupl_block[bl_hash]; dupl_ptr;
 					dupl_ptr = dupl_ptr->block_next) {
 		if(bytes == dupl_ptr->bytes && blocks == dupl_ptr->blocks) {
-			long long target_start, dup_start = dupl_ptr->start;
+			long long target_start = start, dup_start = dupl_ptr->start;
+			long long dtarget_start = -1, ddup_start = -1;
 			int block;
 
 			/*
@@ -2327,14 +2315,14 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 
 			/* Now get the checksums and compare */
 			if(checksum_flag == FALSE) {
-				checksum = get_checksum_disk(start, bytes, block_list);
+				checksum = get_checksum_buffers(start, bytes, block_list, buffer_list);
 				checksum_flag = TRUE;
 			}
 
 			if(!dupl_ptr->have_checksum) {
 				dupl_ptr->checksum =
 					get_checksum_disk(dupl_ptr->start,
-					dupl_ptr->bytes, dupl_ptr->block_list);
+						dupl_ptr->bytes, dupl_ptr->block_list);
 				dupl_ptr->have_checksum = TRUE;
 			}
 
@@ -2345,10 +2333,8 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 			 * Checksums match, so now we need to do a byte by byte
 			 * comparison
 			 */
-			target_start = start;
 			for(block = 0; block < blocks; block ++) {
 				int size = SQUASHFS_COMPRESSED_SIZE_BLOCK(block_list[block]);
-				struct file_buffer *target_buffer = NULL;
 				struct file_buffer *dup_buffer = NULL;
 				char *target_data, *dup_data;
 				int res;
@@ -2363,12 +2349,15 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 				 * enough to hold the entire file, in which case
 				 * the block will have been written to disk.
 				 */
-				target_buffer = cache_lookup(bwriter_buffer,
-								target_start);
-				if(target_buffer)
-					target_data = target_buffer->data;
+				if(buffer_list[block])
+					target_data = buffer_list[block]->data;
 				else {
-					target_data = read_from_disk(target_start, size, 0);
+					if(dtarget_start == -1) {
+						if(cached_target == -1)
+							cached_target = get_virt_disk(target_start);
+						dtarget_start = cached_target;
+					}
+					target_data = read_from_disk(dtarget_start, size, 0);
 					if(target_data == NULL) {
 						ERROR("Failed to read data from"
 							" output filesystem\n");
@@ -2383,11 +2372,13 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 				 * recently), otherwise it will have to be read
 				 * back from disk
 				 */
-				dup_buffer = cache_lookup(bwriter_buffer, dup_start);
+				dup_buffer = queue_cache_lookup(bwriter_buffer, dup_start);
 				if(dup_buffer)
 					dup_data = dup_buffer->data;
 				else {
-					dup_data = read_from_disk(dup_start, size, 1);
+					if(ddup_start == -1)
+						ddup_start  = get_virt_disk(dup_start);
+					dup_data = read_from_disk(ddup_start, size, 1);
 					if(dup_data == NULL) {
 						ERROR("Failed to read data from"
 							" output filesystem\n");
@@ -2397,12 +2388,15 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 				}
 
 				res = memcmp(target_data, dup_data, size);
-				cache_block_put(target_buffer);
-				cache_block_put(dup_buffer);
+				gen_cache_block_put(dup_buffer);
 				if(res != 0)
 					break;
 				target_start += size;
 				dup_start += size;
+				if(dtarget_start)
+					dtarget_start += size;
+				if(ddup_start != -1)
+					ddup_start += size;
 			}
 
 			if(block != blocks)
@@ -2455,7 +2449,7 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 					frag_buffer->data +
 					dupl_ptr->fragment->offset, frag_bytes);
 
-				cache_block_put(frag_buffer);
+				gen_cache_block_put(frag_buffer);
 
 				if(res == 0) {
 					/*
@@ -2494,7 +2488,7 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 					frag_buffer->data +
 					dupl_ptr->fragment->offset, frag_bytes);
 
-				cache_block_put(frag_buffer);
+				gen_cache_block_put(frag_buffer);
 
 				if(res == 0) {
 					/*
@@ -2627,10 +2621,7 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 
 		pthread_cleanup_pop(1);
 	} else {
-		dup = malloc(sizeof(struct dup_info));
-		if(dup == NULL)
-			MEM_ERROR();
-
+		dup = MALLOC(sizeof(struct dup_info));
 		dup->frag = frag_dupl;
 		dup->file = file;
 		dup->next = block_dupl->dup;
@@ -2642,23 +2633,8 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 }
 
 
-void cleanup(void *arg)
-{
-	int fd = *((int *) arg);
-
-	close(fd);
-}
-
-
 static void *writer(void *arg)
 {
-	off_t wpos = 0;
-	int fd = open(destination_file, O_WRONLY);
-	if(fd == -1)
-		BAD_ERROR("Writer failed to open destination file\n");
-
-	pthread_cleanup_push(cleanup, &fd);
-
 	while(1) {
 		struct file_buffer *file_buffer = queue_get(to_writer);
 		off_t off;
@@ -2670,27 +2646,33 @@ static void *writer(void *arg)
 
 		off = start_offset + file_buffer->block;
 
-		if(wpos != off) {
+		pthread_cleanup_push((void *) pthread_mutex_unlock, &lseek_mutex);
+		pthread_mutex_lock(&lseek_mutex);
+
+		if(fd_pos != off) {
 			if(lseek(fd, off, SEEK_SET) == -1) {
-				ERROR("writer: Lseek on destination failed because "
-					"%s, offset=0x%llx\n", strerror(errno), off);
+				ERROR("writer: Lseek on destination failed "
+					"because %s, offset=0x%llx\n",
+					strerror(errno), (long long) off);
 				BAD_ERROR("Probably out of space on output "
 					"%s\n", block_device ? "block device" :
 					"filesystem");
 			}
 
-			wpos = off;
 		}
 
-		if(write_bytes(fd, file_buffer->data, file_buffer->size) == -1)
-			BAD_ERROR("Failed to write to output %s\n",
+		if(write_bytes(fd, file_buffer->data, file_buffer->size) == -1) {
+			ERROR("Failed to write to output %s\n",
 				block_device ? "block device" : "filesystem");
+			BAD_ERROR("Probably out of space on output %s\n",
+				block_device ? "block device" : "filesystem");
+		}
 
-		wpos += file_buffer->size;
-		cache_block_put(file_buffer);
+		fd_pos = off + file_buffer->size;
+		pthread_cleanup_pop(1);
+
+		gen_cache_block_put(file_buffer);
 	}
-
-	pthread_cleanup_pop(1);
 }
 
 
@@ -2716,35 +2698,41 @@ static int all_zero(struct file_buffer *file_buffer)
 
 static void *deflator(void *arg)
 {
-	struct file_buffer *write_buffer = cache_get_nohash(bwriter_buffer);
 	void *stream = NULL;
-	int res;
+	int res, tid = get_thread_id(THREAD_BLOCK);
 
 	res = compressor_init(comp, &stream, block_size, 1);
 	if(res)
 		BAD_ERROR("deflator:: compressor_init failed\n");
 
 	while(1) {
-		struct file_buffer *file_buffer = queue_get(to_deflate);
+		struct file_buffer *write_buffer;
+		struct file_buffer *file_buffer = queue_cache_get_tid(tid, to_deflate, &write_buffer);
 
 		if(sparse_files && all_zero(file_buffer)) { 
-			file_buffer->c_byte = 0;
-			seq_queue_put(to_main, file_buffer);
+			set_sparse(file_buffer, 1);
+			gen_cache_block_put(write_buffer);
+			main_queue_put(to_main, file_buffer);
 		} else {
 			write_buffer->c_byte = mangle2(stream,
 				write_buffer->data, file_buffer->data,
 				file_buffer->size, block_size,
 				file_buffer->noD, 1);
-			write_buffer->sequence = file_buffer->sequence;
 			write_buffer->file_size = file_buffer->file_size;
+			write_buffer->file_count = file_buffer->file_count;
 			write_buffer->block = file_buffer->block;
+			write_buffer->version = file_buffer->version;
+			write_buffer->next_state = file_buffer->next_state;
 			write_buffer->size = SQUASHFS_COMPRESSED_SIZE_BLOCK
 				(write_buffer->c_byte);
 			write_buffer->fragment = FALSE;
 			write_buffer->error = FALSE;
-			cache_block_put(file_buffer);
-			seq_queue_put(to_main, write_buffer);
-			write_buffer = cache_get_nohash(bwriter_buffer);
+			if(write_buffer->block == 0)
+				write_buffer->alignment = file_buffer->alignment;
+			else
+				write_buffer->alignment = 0;
+			gen_cache_block_put(file_buffer);
+			main_queue_put(to_main, write_buffer);
 		}
 	}
 }
@@ -2753,53 +2741,7 @@ static void *deflator(void *arg)
 static void *frag_deflator(void *arg)
 {
 	void *stream = NULL;
-	int res;
-
-	res = compressor_init(comp, &stream, block_size, 1);
-	if(res)
-		BAD_ERROR("frag_deflator:: compressor_init failed\n");
-
-	pthread_cleanup_push((void *) pthread_mutex_unlock, &fragment_mutex);
-
-	while(1) {
-		int c_byte, compressed_size;
-		struct file_buffer *file_buffer = queue_get(to_frag);
-		struct file_buffer *write_buffer =
-			cache_get(fwriter_buffer, file_buffer->block);
-
-		c_byte = mangle2(stream, write_buffer->data, file_buffer->data,
-			file_buffer->size, block_size, noF, 1);
-		compressed_size = SQUASHFS_COMPRESSED_SIZE_BLOCK(c_byte);
-		write_buffer->size = compressed_size;
-		pthread_mutex_lock(&fragment_mutex);
-		if(fragments_locked == FALSE) {
-			fragment_table[file_buffer->block].size = c_byte;
-			fragment_table[file_buffer->block].start_block = set_write_buffer(write_buffer, compressed_size);
-			fragments_outstanding --;
-			queue_put(to_writer, write_buffer);
-			log_fragment(file_buffer->block, fragment_table[file_buffer->block].start_block);
-			pthread_mutex_unlock(&fragment_mutex);
-			TRACE("Writing fragment %lld, uncompressed size %d, "
-				"compressed size %d\n", file_buffer->block,
-				file_buffer->size, compressed_size);
-		} else {
-				add_pending_fragment(write_buffer, c_byte,
-					file_buffer->block);
-				pthread_mutex_unlock(&fragment_mutex);
-		}
-		cache_block_put(file_buffer);
-	}
-
-	pthread_cleanup_pop(0);
-	return NULL;
-
-}
-
-
-static void *frag_order_deflator(void *arg)
-{
-	void *stream = NULL;
-	int res;
+	int res, tid = get_thread_id(THREAD_FRAGMENT);
 
 	res = compressor_init(comp, &stream, block_size, 1);
 	if(res)
@@ -2807,7 +2749,7 @@ static void *frag_order_deflator(void *arg)
 
 	while(1) {
 		int c_byte;
-		struct file_buffer *file_buffer = queue_get(to_frag);
+		struct file_buffer *file_buffer = queue_get_tid(tid, to_frag);
 		struct file_buffer *write_buffer =
 			cache_get(fwriter_buffer, file_buffer->block);
 
@@ -2815,36 +2757,50 @@ static void *frag_order_deflator(void *arg)
 			file_buffer->size, block_size, noF, 1);
 		write_buffer->block = file_buffer->block;
 		write_buffer->sequence = file_buffer->sequence;
+		write_buffer->c_byte = c_byte;
 		write_buffer->size = SQUASHFS_COMPRESSED_SIZE_BLOCK(c_byte);
 		write_buffer->fragment = FALSE;
-		pthread_cleanup_push((void *) pthread_mutex_unlock, &fragment_mutex);
-		pthread_mutex_lock(&fragment_mutex);
-		fragment_table[file_buffer->block].size = c_byte;
-		pthread_cleanup_pop(1);
-		seq_queue_put(to_order, write_buffer);
+		order_queue_put(to_order, write_buffer);
 		TRACE("Writing fragment %lld, uncompressed size %d, "
 			"compressed size %d\n", file_buffer->block,
 			file_buffer->size, SQUASHFS_COMPRESSED_SIZE_BLOCK(c_byte));
-		cache_block_put(file_buffer);
+		gen_cache_block_put(file_buffer);
 	}
 }
 
 
-static void *frag_orderer(void *arg)
+static void *orderer(void *arg)
 {
 	pthread_cleanup_push((void *) pthread_mutex_unlock, &fragment_mutex);
 
 	while(1) {
-		struct file_buffer *write_buffer = seq_queue_get(to_order);
-		int block = write_buffer->block;
+		struct file_buffer *write_buffer = order_queue_get(to_order);
+		long long block = write_buffer->block;
 
-		pthread_mutex_lock(&fragment_mutex);
-		fragment_table[block].start_block = set_write_buffer(write_buffer, SQUASHFS_COMPRESSED_SIZE_BLOCK(write_buffer->size));
-		fragments_outstanding --;
-		log_fragment(block, write_buffer->block);
-		queue_put(to_writer, write_buffer);
-		pthread_cond_signal(&fragment_waiting);
-		pthread_mutex_unlock(&fragment_mutex);
+		if(write_buffer->buffer_type == GEN_CACHE) {
+			pthread_mutex_lock(&fragment_mutex);
+			write_buffer->block = get_and_inc_dpos(SQUASHFS_COMPRESSED_SIZE_BLOCK(write_buffer->size));
+			fragment_table[block].start_block = write_buffer->block;
+			fragment_table[block].size = write_buffer->c_byte;
+			pthread_mutex_unlock(&fragment_mutex);
+			log_fragment(block, write_buffer->block);
+			queue_put(to_writer, write_buffer);
+		} else if(write_buffer->buffer_type == QUEUE_CACHE) {
+			write_buffer->block = get_and_inc_dpos_aligned(write_buffer);
+			add_virt_disk(block, write_buffer->block);
+			queue_put(to_writer, write_buffer);
+		} else if(write_buffer->buffer_type == WSYNC_CMD) {
+			free(write_buffer);
+			queue_put(to_writer, NULL);
+		} else if(write_buffer->buffer_type == RESET_CMD) {
+			set_dpos(get_virt_disk(write_buffer->block));
+			free(write_buffer);
+		} else if(write_buffer->buffer_type == MAP_CMD) {
+			add_virt_disk(block, get_dpos());
+			free(write_buffer);
+		} else
+
+			BAD_ERROR("Bug in orderer\n");
 	}
 
 	pthread_cleanup_pop(0);
@@ -2854,7 +2810,7 @@ static void *frag_orderer(void *arg)
 
 static struct file_buffer *get_file_buffer()
 {
-	struct file_buffer *file_buffer = seq_queue_get(to_main);
+	struct file_buffer *file_buffer = main_queue_get(to_main);
 
 	return file_buffer;
 }
@@ -2865,7 +2821,7 @@ static struct file_info *write_file_empty(struct dir_ent *dir_ent,
 {
 	file_count ++;
 	*duplicate_file = FALSE;
-	cache_block_put(file_buffer);
+	gen_cache_block_put(file_buffer);
 	return create_non_dup(0, 0, 0, 0, NULL, 0, &empty_fragment, 0, 0,
 								FALSE, FALSE);
 }
@@ -2879,19 +2835,19 @@ static struct file_info *write_file_frag(struct dir_ent *dir_ent,
 	unsigned short checksum = file_buffer->checksum;
 	struct file_info *file;
 
-	file = frag_duplicate(file_buffer, duplicate_file);
-	if(!file) {
-		fragment = get_and_fill_fragment(file_buffer, dir_ent, FALSE);
+	if(duplicate_checking) {
+		file = frag_duplicate(file_buffer, duplicate_file);
 
-		if(duplicate_checking)
-			file = add_non_dup(size, 0, 0, 0, NULL, 0, fragment, 0,
-				checksum, TRUE, TRUE, FALSE, FALSE, 0);
-		else
-			file = create_non_dup(size, 0, 0, 0, NULL, 0, fragment,
-				0, checksum, TRUE, TRUE);
+		if(!file) {
+			fragment = get_and_fill_fragment(file_buffer, dir_ent, FALSE);
+			file = add_non_dup(size, 0, 0, 0, NULL, 0, fragment, 0, checksum, TRUE, TRUE, FALSE, FALSE, 0);
+		}
+	} else {
+		fragment = get_and_fill_fragment(file_buffer, dir_ent, FALSE);
+		file = create_non_dup(size, 0, 0, 0, NULL, 0, fragment, 0, checksum, TRUE, TRUE);
 	}
 
-	cache_block_put(file_buffer);
+	gen_cache_block_put(file_buffer);
 
 	total_bytes += size;
 	file_count ++;
@@ -2915,36 +2871,31 @@ static struct file_info *write_file_process(int *status, struct dir_ent *dir_ent
 	long long read_size, file_bytes;
 	struct fragment *fragment;
 	unsigned int *block_list = NULL;
-	int block = 0, res;
+	int block = 0;
 	long long sparse = 0;
 	struct file_buffer *fragment_buffer = NULL;
 	struct file_info *file;
 
 	*duplicate_file = FALSE;
 
-	if(reproducible)
-		ensure_fragments_flushed();
-	else
-		lock_fragments();
-
 	file_bytes = 0;
-	mark_pos();
+	mark_vpos();
 	while (1) {
 		read_size = read_buffer->file_size;
 		if(read_buffer->fragment) {
 			fragment_buffer = read_buffer;
 		} else {
-			block_list = realloc(block_list, (block + 1) *
+			block_list = REALLOC(block_list, (block + 1) *
 				sizeof(unsigned int));
-			if(block_list == NULL)
-				MEM_ERROR();
 			block_list[block ++] = read_buffer->c_byte;
-			if(read_buffer->c_byte) {
+			if(!is_sparse(read_buffer)) {
+				if(sparse_count(read_buffer) > 1)
+					BAD_ERROR("Sparse block too large in write file process\n");
 				file_bytes += read_buffer->size;
-				put_write_buffer_hash(read_buffer, TRUE);
+				put_write_buffer_hash(read_buffer);
 			} else {
 				sparse += read_buffer->size;
-				cache_block_put(read_buffer);
+				gen_cache_block_put(read_buffer);
 			}
 		}
 		inc_progress_bar();
@@ -2957,54 +2908,41 @@ static struct file_info *write_file_process(int *status, struct dir_ent *dir_ent
 			goto read_err;
 	}
 
-	if(!reproducible)
-		unlock_fragments();
-
 	fragment = get_and_fill_fragment(fragment_buffer, dir_ent, block != 0);
 
 	if(duplicate_checking) {
 		int bl_hash = block ? block_hash(block_list[0], block) : 0;
 
 		file = add_non_dup(read_size, file_bytes, block, sparse,
-			block_list, get_marked_pos(), fragment, 0,
+			block_list, get_marked_vpos(), fragment, 0,
 			fragment_buffer ?  fragment_buffer->checksum : 0, FALSE,
 			TRUE, FALSE, FALSE, bl_hash);
 	} else
 		file = create_non_dup(read_size, file_bytes, block, sparse,
-			block_list, get_marked_pos(), fragment, 0,
+			block_list, get_marked_vpos(), fragment, 0,
 			fragment_buffer ?  fragment_buffer->checksum : 0, FALSE,
 			TRUE);
 
-	cache_block_put(fragment_buffer);
+	if(!is_vpos_marked())
+		send_orderer_create_map(get_marked_vpos());
+
+	gen_cache_block_put(fragment_buffer);
 	file_count ++;
 	total_bytes += read_size;
 
 	log_file(dir_ent, file->start);
 
 	*status = 0;
-	unmark_pos();
+	unmark_vpos();
 	return file;
 
 read_err:
 	dec_progress_bar(block);
 	*status = read_buffer->error;
-	res = reset_pos();
-	if(res && !block_device) {
-		int res;
-
-		queue_put(to_writer, NULL);
-		if(queue_get(from_writer) != 0)
-			EXIT_MKSQUASHFS();
-		res = ftruncate(fd, get_pos());
-		if(res != 0)
-			BAD_ERROR("Failed to truncate dest file because %s\n",
-				strerror(errno));
-	}
-	if(!reproducible)
-		unlock_fragments();
+	reset_and_truncate();
 	free(block_list);
-	cache_block_put(read_buffer);
-	unmark_pos();
+	gen_cache_block_put(read_buffer);
+	unmark_vpos();
 	return NULL;
 }
 
@@ -3012,7 +2950,7 @@ read_err:
 static struct file_info *write_file_blocks_dup(int *status, struct dir_ent *dir_ent,
 	struct file_buffer *read_buffer, int *duplicate_file, int bl_hash)
 {
-	int block, thresh, res;
+	int block, thresh;
 	long long read_size = read_buffer->file_size;
 	long long file_bytes;
 	int blocks = (read_size + block_size - 1) >> block_log;
@@ -3022,46 +2960,47 @@ static struct file_info *write_file_blocks_dup(int *status, struct dir_ent *dir_
 	struct file_buffer *fragment_buffer = NULL;
 	struct file_info *file;
 	int block_dup;
+	int cache_size = cache_maxsize(read_buffer);
 
-	block_list = malloc(blocks * sizeof(unsigned int));
-	if(block_list == NULL)
-		MEM_ERROR();
-
-	buffer_list = malloc(blocks * sizeof(struct file_buffer *));
-	if(buffer_list == NULL)
-		MEM_ERROR();
-
-	if(reproducible)
-		ensure_fragments_flushed();
-	else
-		lock_fragments();
+	block_list = MALLOC(blocks * sizeof(unsigned int));
+	buffer_list = MALLOC(blocks * sizeof(struct file_buffer *));
 
 	file_bytes = 0;
-	mark_pos();
-	thresh = blocks > bwriter_size ? blocks - bwriter_size : 0;
+	mark_vpos();
+	thresh = blocks > cache_size ? blocks - cache_size : 0;
 
 	for(block = 0; block < blocks;) {
 		if(read_buffer->fragment) {
 			block_list[block] = 0;
-			buffer_list[block] = NULL;
+			buffer_list[block++] = NULL;
 			fragment_buffer = read_buffer;
 			blocks = read_size >> block_log;
+			inc_progress_bar();
 		} else {
-			block_list[block] = read_buffer->c_byte;
-
-			if(read_buffer->c_byte) {
+			if(!is_sparse(read_buffer)) {
+				block_list[block] = read_buffer->c_byte;
 				file_bytes += read_buffer->size;
-				buffer_list[block] = block >= thresh ? read_buffer : NULL;
-				put_write_buffer_hash(read_buffer, block < thresh);
+				if(block < thresh) {
+					buffer_list[block++] = NULL;
+					put_write_buffer(read_buffer);
+				} else
+					buffer_list[block++] = read_buffer;
+				inc_progress_bar();
 			} else {
-				buffer_list[block] = NULL;
-				sparse += read_buffer->size;
-				cache_block_put(read_buffer);
+				int i;
+				long long count = sparse_count(read_buffer);
+
+				for(i = 0; i < count; i++) {
+					block_list[block] = 0;
+					buffer_list[block++] = NULL;
+					inc_progress_bar();
+				}
+				sparse += count * read_buffer->size;
+				gen_cache_block_put(read_buffer);
 			}
 		}
-		inc_progress_bar();
 
-		if(++block < blocks) {
+		if(block < blocks) {
 			read_buffer = get_file_buffer();
 			if(read_buffer->error)
 				goto read_err;
@@ -3079,21 +3018,23 @@ static struct file_info *write_file_blocks_dup(int *status, struct dir_ent *dir_
 	if(sparse && (dir_ent->inode->buf.st_blocks << 9) >= read_size)
 		sparse = 0;
 
-	file = duplicate(duplicate_file, &block_dup, read_size, file_bytes, block_list,
-		get_marked_pos(), dir_ent, fragment_buffer, blocks, sparse, bl_hash);
+	file = duplicate(duplicate_file, &block_dup, read_size, file_bytes,
+		block_list, buffer_list, get_marked_vpos(), dir_ent,
+		fragment_buffer, blocks, sparse, bl_hash);
 
 	if(block_dup == FALSE) {
 		for(block = thresh; block < blocks; block ++)
 			if(buffer_list[block])
-				queue_put(to_writer, buffer_list[block]);
+				put_write_buffer_hash(buffer_list[block]);
+
+		if(!is_vpos_marked())
+			send_orderer_create_map(get_marked_vpos());
 	} else {
 		for(block = thresh; block < blocks; block ++)
-			cache_block_put(buffer_list[block]);
+			gen_cache_block_put(buffer_list[block]);
 	}
 
-	if(!reproducible)
-		unlock_fragments();
-	cache_block_put(fragment_buffer);
+	gen_cache_block_put(fragment_buffer);
 	free(buffer_list);
 	file_count ++;
 	total_bytes += read_size;
@@ -3104,32 +3045,19 @@ static struct file_info *write_file_blocks_dup(int *status, struct dir_ent *dir_
 		log_file(dir_ent, file->start);
 
 	*status = 0;
-	unmark_pos();
+	unmark_vpos();
 	return file;
 
 read_err:
 	dec_progress_bar(block);
 	*status = read_buffer->error;
-	res = reset_pos();
-	if(res && thresh && !block_device) {
-		int res;
-
-		queue_put(to_writer, NULL);
-		if(queue_get(from_writer) != 0)
-			EXIT_MKSQUASHFS();
-		res = ftruncate(fd, get_pos());
-		if(res != 0)
-			BAD_ERROR("Failed to truncate dest file because %s\n",
-				strerror(errno));
-	}
-	if(!reproducible)
-		unlock_fragments();
+	reset_and_truncate();
 	for(blocks = thresh; blocks < block; blocks ++)
-		cache_block_put(buffer_list[blocks]);
+		gen_cache_block_put(buffer_list[blocks]);
 	free(buffer_list);
 	free(block_list);
-	cache_block_put(read_buffer);
-	unmark_pos();
+	gen_cache_block_put(read_buffer);
+	unmark_vpos();
 	return NULL;
 }
 
@@ -3141,7 +3069,7 @@ static struct file_info *write_file_blocks(int *status, struct dir_ent *dir_ent,
 	long long file_bytes;
 	struct fragment *fragment;
 	unsigned int *block_list;
-	int block, res;
+	int block;
 	int blocks = (read_size + block_size - 1) >> block_log;
 	long long sparse = 0;
 	struct file_buffer *fragment_buffer = NULL;
@@ -3153,35 +3081,36 @@ static struct file_info *write_file_blocks(int *status, struct dir_ent *dir_ent,
 
 	*dup = FALSE;
 
-	block_list = malloc(blocks * sizeof(unsigned int));
-	if(block_list == NULL)
-		MEM_ERROR();
-
-	if(reproducible)
-		ensure_fragments_flushed();
-	else
-		lock_fragments();
+	block_list = MALLOC(blocks * sizeof(unsigned int));
 
 	file_bytes = 0;
-	mark_pos();
+	mark_vpos();
 	for(block = 0; block < blocks;) {
 		if(read_buffer->fragment) {
-			block_list[block] = 0;
+			block_list[block++] = 0;
 			fragment_buffer = read_buffer;
 			blocks = read_size >> block_log;
+			inc_progress_bar();
 		} else {
-			block_list[block] = read_buffer->c_byte;
-			if(read_buffer->c_byte) {
+			if(!is_sparse(read_buffer)) {
+				block_list[block++] = read_buffer->c_byte;
 				file_bytes += read_buffer->size;
-				put_write_buffer_hash(read_buffer, TRUE);
+				put_write_buffer_hash(read_buffer);
+				inc_progress_bar();
 			} else {
-				sparse += read_buffer->size;
-				cache_block_put(read_buffer);
+				int i;
+				long long count = sparse_count(read_buffer);
+
+				for(i = 0; i < count; i++) {
+					block_list[block++] = 0;
+					inc_progress_bar();
+				}
+				sparse += count * read_buffer->size;
+				gen_cache_block_put(read_buffer);
 			}
 		}
-		inc_progress_bar();
 
-		if(++block < blocks) {
+		if(block < blocks) {
 			read_buffer = get_file_buffer();
 			if(read_buffer->error)
 				goto read_err;
@@ -3199,51 +3128,38 @@ static struct file_info *write_file_blocks(int *status, struct dir_ent *dir_ent,
 	if(sparse && (dir_ent->inode->buf.st_blocks << 9) >= read_size)
 		sparse = 0;
 
-	if(!reproducible)
-		unlock_fragments();
-
 	fragment = get_and_fill_fragment(fragment_buffer, dir_ent, TRUE);
 
 	if(duplicate_checking)
 		file = add_non_dup(read_size, file_bytes, blocks, sparse,
-			block_list, get_marked_pos(), fragment, 0, fragment_buffer ?
+			block_list, get_marked_vpos(), fragment, 0, fragment_buffer ?
 			fragment_buffer->checksum : 0, FALSE, TRUE, FALSE,
 			FALSE, bl_hash);
 	else
 		file = create_non_dup(read_size, file_bytes, blocks, sparse,
-			block_list, get_marked_pos(), fragment, 0, fragment_buffer ?
+			block_list, get_marked_vpos(), fragment, 0, fragment_buffer ?
 			fragment_buffer->checksum : 0, FALSE, TRUE);
 
-	cache_block_put(fragment_buffer);
+	if(!is_vpos_marked())
+		send_orderer_create_map(get_marked_vpos());
+
+	gen_cache_block_put(fragment_buffer);
 	file_count ++;
 	total_bytes += read_size;
 
 	log_file(dir_ent, file->start);
 
 	*status = 0;
-	unmark_pos();
+	unmark_vpos();
 	return file;
 
 read_err:
 	dec_progress_bar(block);
 	*status = read_buffer->error;
-	res = reset_pos();
-	if(res && !block_device) {
-		int res;
-
-		queue_put(to_writer, NULL);
-		if(queue_get(from_writer) != 0)
-			EXIT_MKSQUASHFS();
-		res = ftruncate(fd, get_pos());
-		if(res != 0)
-			BAD_ERROR("Failed to truncate dest file because %s\n",
-				strerror(errno));
-	}
-	if(!reproducible)
-		unlock_fragments();
+	reset_and_truncate();
 	free(block_list);
-	cache_block_put(read_buffer);
-	unmark_pos();
+	gen_cache_block_put(read_buffer);
+	unmark_vpos();
 	return NULL;
 }
 
@@ -3259,7 +3175,7 @@ again:
 	status = read_buffer->error;
 
 	if(status)
-		cache_block_put(read_buffer);
+		gen_cache_block_put(read_buffer);
 	else if(read_buffer->file_size == -1)
 		file = write_file_process(&status, dir, read_buffer, dup);
 	else if(read_buffer->file_size == 0)
@@ -3278,7 +3194,7 @@ again:
 		ERROR_EXIT(", creating empty file\n");
 		file = write_file_empty(dir, NULL, dup);
 	} else if(status)
-		BAD_ERROR("Unexpected status value in write_file()");
+		BAD_ERROR("Unexpected status value in write_file()\n");
 
 	return file;
 }
@@ -3294,11 +3210,8 @@ static char *getbase(char *pathname)
 	static int b_size = BUFF_SIZE;
 	char *result;
 
-	if(b_buffer == NULL) {
-		b_buffer = malloc(b_size);
-		if(b_buffer == NULL)
-			MEM_ERROR();
-	}
+	if(b_buffer == NULL)
+		b_buffer = MALLOC(b_size);
 
 	while(1) {
 		if(*pathname != '/') {
@@ -3318,9 +3231,7 @@ static char *getbase(char *pathname)
 		}
 
 		/* Buffer not large enough, realloc and try again */
-		b_buffer = realloc(b_buffer, b_size += BUFF_SIZE);
-		if(b_buffer == NULL)
-			MEM_ERROR();
+		b_buffer = REALLOC(b_buffer, b_size += BUFF_SIZE);
 	}
 
 	name = b_buffer;
@@ -3397,11 +3308,32 @@ static inline void dec_nlink_inode(struct dir_ent *dir_ent)
 }
 
 
-static struct inode_info *lookup_inode3(struct stat *buf, struct pseudo_dev *pseudo,
-	char *symlink, int bytes)
+static struct inode_info *lookup_inode4(struct stat *buf, struct pseudo_dev *pseudo,
+	char *symlink, int bytes, int have_time)
 {
+	static char warned = FALSE;
 	int ino_hash = INODE_HASH(buf->st_dev, buf->st_ino);
 	struct inode_info *inode;
+
+	if(have_time && buf->st_mtime < 0) {
+		/* Squashfs cannot store timestamps before the epoch
+		 * (1970-01-01), and so round up to zero.  But warn
+		 * the first time this happens
+		 */
+		if(!warned) {
+			ERROR("WARNING: File has timestamp before the epoch of "
+				"1970-01-01, this cannot be\nstored in "
+				"Squashfs.  Rounding to 1970-01-01.\nFurther "
+				"messages are supressed.\n");
+			warned = TRUE;
+		}
+
+		buf->st_mtime = 0;
+	} else if(!have_time)
+		/* Frabicated inode with no time defined.  Set to -1 to avoid
+		 * being the latest inode timestamp
+		 */
+		buf->st_mtime = -1;
 
 	/*
 	 * Look-up inode in hash table, if it already exists we have a
@@ -3422,13 +3354,12 @@ static struct inode_info *lookup_inode3(struct stat *buf, struct pseudo_dev *pse
 		progress_bar_size((buf->st_size + block_size - 1)
 							 >> block_log);
 
-	inode = malloc(sizeof(struct inode_info) + bytes);
-	if(inode == NULL)
-		MEM_ERROR();
+	inode = MALLOC(sizeof(struct inode_info) + bytes);
 
 	if(bytes)
 		memcpy(&inode->symlink, symlink, bytes);
 	memcpy(&inode->buf, buf, sizeof(struct stat));
+	inode->scanned = FALSE;
 	inode->read = FALSE;
 	inode->root_entry = FALSE;
 	inode->pseudo = pseudo;
@@ -3438,6 +3369,7 @@ static struct inode_info *lookup_inode3(struct stat *buf, struct pseudo_dev *pse
 	inode->dummy_root_dir = FALSE;
 	inode->xattr = NULL;
 	inode->tarfile = FALSE;
+	inode->alignment = 0;
 
 	/*
 	 * Copy filesystem wide defaults into inode, these filesystem
@@ -3457,6 +3389,11 @@ static struct inode_info *lookup_inode3(struct stat *buf, struct pseudo_dev *pse
 }
 
 
+static struct inode_info *lookup_inode3(struct stat *buf, struct pseudo_dev *pseudo, char *symlink, int bytes) {
+	return lookup_inode4(buf, pseudo, symlink, bytes, TRUE);
+}
+
+
 static struct inode_info *lookup_inode2(struct stat *buf, struct pseudo_dev *pseudo)
 {
 	return lookup_inode3(buf, pseudo, NULL, 0);
@@ -3466,6 +3403,18 @@ static struct inode_info *lookup_inode2(struct stat *buf, struct pseudo_dev *pse
 struct inode_info *lookup_inode(struct stat *buf)
 {
 	return lookup_inode2(buf, NULL);
+}
+
+
+struct inode_info *lookup_inode_flag2(struct stat *buf, struct pseudo_dev *pseudo, int have_time)
+{
+	return lookup_inode4(buf, pseudo, NULL, 0, have_time);
+}
+
+
+struct inode_info *lookup_inode_flag(struct stat *buf, int have_time)
+{
+	return lookup_inode_flag2(buf, NULL, have_time);
 }
 
 
@@ -3479,14 +3428,10 @@ static inline void alloc_inode_no(struct inode_info *inode, unsigned int use_thi
 
 struct dir_info *create_dir(char *pathname, char *subpath, unsigned int depth)
 {
-	struct dir_info *dir;
+	struct dir_info *dir = MALLOC(sizeof(struct dir_info));
 
-	dir = malloc(sizeof(struct dir_info));
-	if(dir == NULL)
-		MEM_ERROR();
-
-	dir->pathname = strdup(pathname);
-	dir->subpath = strdup(subpath);
+	dir->pathname = STRDUP(pathname);
+	dir->subpath = STRDUP(subpath);
 	dir->count = 0;
 	dir->directory_count = 0;
 	dir->dir_is_ldir = TRUE;
@@ -3512,9 +3457,7 @@ struct dir_ent *lookup_name(struct dir_info *dir, char *name)
 struct dir_ent *create_dir_entry(char *name, char *source_name,
 	char *nonstandard_pathname, struct dir_info *dir)
 {
-	struct dir_ent *dir_ent = malloc(sizeof(struct dir_ent));
-	if(dir_ent == NULL)
-		MEM_ERROR();
+	struct dir_ent *dir_ent = MALLOC(sizeof(struct dir_ent));
 
 	dir_ent->name = name;
 	dir_ent->source_name = source_name;
@@ -3631,7 +3574,22 @@ squashfs_inode do_directory_scans(struct dir_ent *dir_ent, int progress)
 	 */
 	dir_scan6(root_dir);
 
+	if((mkfs_inode_opt || root_inode_opt || inode_inode_opt) && inode_time_latest < root_dir->dir_ent->inode->buf.st_mtime)
+		inode_time_latest = root_dir->dir_ent->inode->buf.st_mtime;
+
+	if(mkfs_inode_opt || root_inode_opt || inode_inode_opt)
+		inode_time_latest = get_time(inode_time_latest);
+
+	if(root_inode_opt)
+		dir_ent->inode->buf.st_mtime = inode_time_latest;
+
 	alloc_inode_no(dir_ent->inode, root_inode_number);
+
+	/* Increase the progress bar by 5%, and map the inode count to
+	 * that 5%.  This means the progress bar will continue to show
+	 * progress after all the file data blocks have been processed
+	 */
+	progress_bar_metadata(inode_no - inode_start_no);
 
 	eval_actions(root_dir, dir_ent);
 
@@ -3656,8 +3614,11 @@ squashfs_inode do_directory_scans(struct dir_ent *dir_ent, int progress)
 
 	if(sorted)
 		sort_files_and_write(root_dir);
+	else
+		dir_scan7(root_dir);
 
-	dir_scan7(&inode, root_dir);
+	dir_scan8(&inode, root_dir);
+	inc_meta_progress_bar();
 	dir_ent->inode->inode = inode;
 	dir_ent->inode->type = SQUASHFS_DIR_TYPE;
 
@@ -3749,8 +3710,6 @@ static squashfs_inode scan_encomp(int progress)
 		buf.st_gid = getgid();
 	if(root_time_opt)
 		buf.st_mtime = root_time;
-	else
-		buf.st_mtime = time(NULL);
 	if(pseudo_override && global_uid_opt)
 		buf.st_uid = global_uid;
 
@@ -3759,7 +3718,7 @@ static squashfs_inode scan_encomp(int progress)
 
 	buf.st_dev = 0;
 	buf.st_ino = 0;
-	dir_ent->inode = lookup_inode(&buf);
+	dir_ent->inode = lookup_inode_flag(&buf, root_time_opt);
 	dir_ent->inode->dummy_root_dir = TRUE;
 	dir_ent->dir = root_dir;
 	root_dir->dir_ent = dir_ent;
@@ -3787,11 +3746,7 @@ static squashfs_inode dir_scan(int directory, int progress)
  */
 struct dir_info *scan1_opendir(char *pathname, char *subpath, unsigned int depth)
 {
-	struct dir_info *dir;
-
-	dir = malloc(sizeof(struct dir_info));
-	if(dir == NULL)
-		MEM_ERROR();
+	struct dir_info *dir = MALLOC(sizeof(struct dir_info));
 
 	if(pathname[0] != '\0') {
 		dir->linuxdir = opendir(pathname);
@@ -3801,8 +3756,8 @@ struct dir_info *scan1_opendir(char *pathname, char *subpath, unsigned int depth
 		}
 	}
 
-	dir->pathname = strdup(pathname);
-	dir->subpath = strdup(subpath);
+	dir->pathname = STRDUP(pathname);
+	dir->subpath = STRDUP(subpath);
 	dir->count = 0;
 	dir->directory_count = 0;
 	dir->dir_is_ldir = TRUE;
@@ -3832,7 +3787,7 @@ static struct dir_ent *scan1_encomp_readdir(struct dir_info *dir)
 	while(index < source) {
 		char *basename = NULL;
 		char *dir_name = getbase(source_path[index]);
-		int pass = 1, res;
+		int pass = 1;
 
 		if(dir_name == NULL) {
 			ERROR_START("Bad source directory %s",
@@ -3841,7 +3796,7 @@ static struct dir_ent *scan1_encomp_readdir(struct dir_info *dir)
 			index ++;
 			continue;
 		}
-		dir_name = strdup(dir_name);
+		dir_name = STRDUP(dir_name);
 		for(;;) {
 			struct dir_ent *dir_ent = dir->list;
 
@@ -3855,10 +3810,7 @@ static struct dir_ent *scan1_encomp_readdir(struct dir_info *dir)
 				basename = dir_name;
 			else
 				free(dir_name);
-			res = asprintf(&dir_name, "%s_%d", basename, pass++);
-			if(res == -1)
-				BAD_ERROR("asprintf failed in "
-					"scan1_encomp_readdir\n");
+			ASPRINTF(&dir_name, "%s_%d", basename, pass++);
 			ERROR("%s\n", dir_name);
 		}
 
@@ -3866,7 +3818,7 @@ static struct dir_ent *scan1_encomp_readdir(struct dir_info *dir)
 			cur_dev = source_dev[index];
 
 		return create_dir_entry(dir_name, basename,
-			strdup(source_path[index ++]), dir);
+			STRDUP(source_path[index ++]), dir);
 	}
 	return NULL;
 }
@@ -3888,8 +3840,8 @@ static struct dir_ent *scan1_single_readdir(struct dir_info *dir)
 
 	if((d_name = readdir(dir->linuxdir)) != NULL) {
 		char *basename = NULL;
-		char *dir_name = strdup(d_name->d_name);
-		int pass = 1, res;
+		char *dir_name = STRDUP(d_name->d_name);
+		int pass = 1;
 
 		for(;;) {
 			struct dir_ent *dir_ent = dir->list;
@@ -3904,10 +3856,7 @@ static struct dir_ent *scan1_single_readdir(struct dir_info *dir)
 				basename = dir_name;
 			else
 				free(dir_name);
-			res = asprintf(&dir_name, "%s_%d", d_name->d_name, pass++);
-			if(res == -1)
-				BAD_ERROR("asprintf failed in "
-					"scan1_single_readdir\n");
+			ASPRINTF(&dir_name, "%s_%d", d_name->d_name, pass++);
 			ERROR("%s\n", dir_name);
 		}
 		return create_dir_entry(dir_name, basename, NULL, dir);
@@ -3922,7 +3871,7 @@ static struct dir_ent *scan1_readdir(struct dir_info *dir)
 	struct dirent *d_name = readdir(dir->linuxdir);
 
 	return d_name ?
-		create_dir_entry(strdup(d_name->d_name), NULL, NULL, dir) :
+		create_dir_entry(STRDUP(d_name->d_name), NULL, NULL, dir) :
 		NULL;
 }
 
@@ -4160,7 +4109,7 @@ static void dir_scan2(struct dir_info *dir, struct pseudo *pseudo)
 
 				dir_scan2(sub_dir, pseudo_ent->pseudo);
 				dir->directory_count ++;
-				add_dir_entry(dir_ent, sub_dir, lookup_inode2(&buf, pseudo_dir));
+				add_dir_entry(dir_ent, sub_dir, lookup_inode_flag2(&buf, pseudo_dir, buf.st_mtime != -1));
 				continue;
 			} else if(dir_ent == NULL && pseudo_ent->pseudo)
 				BAD_ERROR("Pathname \"%s\" does not exist in "
@@ -4230,13 +4179,14 @@ static void dir_scan2(struct dir_info *dir, struct pseudo *pseudo)
 			dir_scan2(sub_dir, pseudo_ent->pseudo);
 			dir->directory_count ++;
 			add_dir_entry(dir_ent, sub_dir,
-				lookup_inode2(&buf, pseudo_ent->dev));
+				lookup_inode_flag2(&buf, pseudo_ent->dev, buf.st_mtime != -1));
 		} else if(pseudo_ent->dev->type == 's') {
 			add_dir_entry2(pseudo_ent->name, NULL,
 				pseudo_ent->pathname, NULL,
-				lookup_inode3(&buf, pseudo_ent->dev,
+				lookup_inode4(&buf, pseudo_ent->dev,
 				pseudo_ent->dev->symlink,
-				strlen(pseudo_ent->dev->symlink) + 1), dir);
+				strlen(pseudo_ent->dev->symlink) + 1,
+				buf.st_mtime != -1), dir);
 		} else if(pseudo_ent->dev->type == 'l') {
 			if(S_ISLNK(pseudo_ent->dev->linkbuf->st_mode)) {
 				int byte;
@@ -4262,7 +4212,7 @@ static void dir_scan2(struct dir_info *dir, struct pseudo *pseudo)
 		} else {
 			add_dir_entry2(pseudo_ent->name, NULL,
 				pseudo_ent->pathname, NULL,
-				lookup_inode2(&buf, pseudo_ent->dev), dir);
+				lookup_inode_flag2(&buf, pseudo_ent->dev, buf.st_mtime != -1), dir);
 		}
 	}
 
@@ -4470,6 +4420,9 @@ static void dir_scan6(struct dir_info *dir)
 		if(dir_ent->inode->root_entry)
 			continue;
 
+		if((mkfs_inode_opt || root_inode_opt || inode_inode_opt) && inode_time_latest < dir_ent->inode->buf.st_mtime)
+			inode_time_latest = dir_ent->inode->buf.st_mtime;
+
 		alloc_inode_no(dir_ent->inode, 0);
 
 		if((dir_ent->inode->buf.st_mode & S_IFMT) == S_IFDIR)
@@ -4482,15 +4435,43 @@ static void dir_scan6(struct dir_info *dir)
 
 
 /*
- * dir_scan6 routines...
+ * dir_scan7 routines...
+ * This writes out the file data to the destination
+ */
+static void dir_scan7(struct dir_info *dir)
+{
+	struct dir_ent *dir_ent;
+	int duplicate_file;
+
+	for(dir_ent = dir->list; dir_ent; dir_ent = dir_ent->next) {
+		struct inode_info *inode = dir_ent->inode;
+
+		if(inode->root_entry)
+			continue;
+		else if(S_ISREG(inode->buf.st_mode) && inode->read == FALSE) {
+			update_info(dir_ent);
+			inode->file = write_file(dir_ent, &duplicate_file);
+			inode->read = TRUE;
+			INFO("file %s, uncompressed size %lld " "bytes %s\n",
+				subpathname(dir_ent), (long long)
+				inode->buf.st_size, duplicate_file ?
+				"DUPLICATE" : "");
+		} else if(S_ISREG(inode->buf.st_mode) && inode->read)
+			INFO("file %s, uncompressed size %lld bytes LINK\n",
+				subpathname(dir_ent), (long long) inode->buf.st_size);
+		else if(S_ISDIR(inode->buf.st_mode))
+			dir_scan7(dir_ent->dir);
+	}
+}
+
+
+/*
+ * dir_scan8 routines...
  * This generates the filesystem metadata and writes it out to the destination
  */
-static void scan7_init_dir(struct directory *dir)
+static void scan8_init_dir(struct directory *dir)
 {
-	dir->buff = malloc(SQUASHFS_METADATA_SIZE);
-	if(dir->buff == NULL)
-		MEM_ERROR();
-
+	dir->buff = MALLOC(SQUASHFS_METADATA_SIZE);
 	dir->size = SQUASHFS_METADATA_SIZE;
 	dir->offset = 0;
 	dir->index_count_offset = 0;
@@ -4502,7 +4483,7 @@ static void scan7_init_dir(struct directory *dir)
 }
 
 
-static struct dir_ent *scan7_readdir(struct directory *dir, struct dir_info *dir_info,
+static struct dir_ent *scan8_readdir(struct directory *dir, struct dir_info *dir_info,
 	struct dir_ent *dir_ent)
 {
 	if (dir_ent == NULL)
@@ -4518,7 +4499,7 @@ static struct dir_ent *scan7_readdir(struct directory *dir, struct dir_info *dir
 }
 
 
-static void scan7_freedir(struct directory *dir)
+static void scan8_freedir(struct directory *dir)
 {
 	if(dir->index)
 		free(dir->index);
@@ -4526,40 +4507,30 @@ static void scan7_freedir(struct directory *dir)
 }
 
 
-static void dir_scan7(squashfs_inode *inode, struct dir_info *dir_info)
+static void dir_scan8(squashfs_inode *inode, struct dir_info *dir_info)
 {
 	int squashfs_type;
-	int duplicate_file;
 	struct directory dir;
 	struct dir_ent *dir_ent = NULL;
 	struct file_info *file;
 	
-	scan7_init_dir(&dir);
+	scan8_init_dir(&dir);
 	
-	while((dir_ent = scan7_readdir(&dir, dir_info, dir_ent)) != NULL) {
+	while((dir_ent = scan8_readdir(&dir, dir_info, dir_ent)) != NULL) {
 		struct stat *buf = &dir_ent->inode->buf;
-
-		update_info(dir_ent);
 
 		if(dir_ent->inode->inode == SQUASHFS_INVALID_BLK) {
 			switch(buf->st_mode & S_IFMT) {
 				case S_IFREG:
-					if(dir_ent->inode->tarfile && dir_ent->inode->tar_file->file)
+					if(dir_ent->inode->tarfile)
 						file = dir_ent->inode->tar_file->file;
-					else {
-						file = write_file(dir_ent, &duplicate_file);
-						INFO("file %s, uncompressed size %lld "
-							"bytes %s\n",
-							subpathname(dir_ent),
-							(long long) buf->st_size,
-							duplicate_file ?  "DUPLICATE" :
-							 "");
-					}
+					else
+						file = dir_ent->inode->file;
 					squashfs_type = SQUASHFS_FILE_TYPE;
 					*inode = create_inode(NULL, dir_ent,
 						squashfs_type, file->file_size,
-						file->start, file->blocks,
-						file->block_list,
+						get_virt_disk_wait(file->start),
+						file->blocks, file->block_list,
 						file->fragment, NULL,
 						file->sparse);
 					if((duplicate_checking == FALSE &&
@@ -4573,7 +4544,7 @@ static void dir_scan7(squashfs_inode *inode, struct dir_info *dir_info)
 
 				case S_IFDIR:
 					squashfs_type = SQUASHFS_DIR_TYPE;
-					dir_scan7(inode, dir_ent->dir);
+					dir_scan8(inode, dir_ent->dir);
 					break;
 
 				case S_IFLNK:
@@ -4636,19 +4607,11 @@ static void dir_scan7(squashfs_inode *inode, struct dir_info *dir_info)
 			}
 			dir_ent->inode->inode = *inode;
 			dir_ent->inode->type = squashfs_type;
+			inc_meta_progress_bar();
 		 } else {
 			*inode = dir_ent->inode->inode;
 			squashfs_type = dir_ent->inode->type;
 			switch(squashfs_type) {
-				case SQUASHFS_FILE_TYPE:
-					if(!sorted)
-						INFO("file %s, uncompressed "
-							"size %lld bytes LINK"
-							"\n",
-							subpathname(dir_ent),
-							(long long)
-							buf->st_size);
-					break;
 				case SQUASHFS_SYMLINK_TYPE:
 					INFO("symbolic link %s inode 0x%llx "
 						"LINK\n", subpathname(dir_ent),
@@ -4685,7 +4648,7 @@ static void dir_scan7(squashfs_inode *inode, struct dir_info *dir_info)
 	INFO("directory %s inode 0x%llx\n", subpathname(dir_info->dir_ent),
 		*inode);
 
-	scan7_freedir(&dir);
+	scan8_freedir(&dir);
 }
 
 
@@ -4697,7 +4660,7 @@ static void handle_root_entries(struct dir_info *dir)
 		for(i = 0; i < old_root_entries; i++) {
 			if(old_root_entry[i].inode.type == SQUASHFS_DIR_TYPE)
 				dir->directory_count ++;
-			add_dir_entry2(strdup(old_root_entry[i].name), NULL,
+			add_dir_entry2(STRDUP(old_root_entry[i].name), NULL,
 				NULL, NULL, &old_root_entry[i].inode, dir);
 		}
 	}
@@ -4715,15 +4678,15 @@ static char *walk_source(char *source, char **pathname, char **name)
 	while(*source != '/' && *source != '\0')
 		source ++;
 
-	*name = strndup(start, source - start);
+	*name = STRNDUP(start, source - start);
 
 	if(*pathname == NULL)
-		*pathname = strndup(path, source - path);
+		*pathname = STRNDUP(path, source - path);
 	else {
 		char *orig = *pathname;
 		int size = strlen(orig) + (source - path) + 2;
 
-		*pathname = malloc(size);
+		*pathname = MALLOC(size);
 		strcpy(*pathname, orig);
 		strcat(*pathname, "/");
 		strncat(*pathname, path, source - path);
@@ -4755,7 +4718,7 @@ static struct dir_info *add_source(struct dir_info *sdir, char *source,
 		dir = create_dir("", subpath, depth);
 
 	if(depth == 1)
-		*prefix = source[0] == '/' ? strdup("/") : strdup(".");
+		*prefix = source[0] == '/' ? STRDUP("/") : STRDUP(".");
 
 	if(appending && file == NULL)
 		handle_root_entries(dir);
@@ -5015,11 +4978,8 @@ static char *get_filename_from_stdin(char terminator)
 	if(path_max == -1)
 		path_max = get_pathmax();
 
-	if(buffer == NULL) {
-		buffer = malloc(4096);
-		if(buffer == NULL)
-			MEM_ERROR();
-	}
+	if(buffer == NULL)
+		buffer = MALLOC(4096);
 
 	while(1) {
 		if(bytes == 0) {
@@ -5040,11 +5000,8 @@ static char *get_filename_from_stdin(char terminator)
 
 		if(size - used <= 1) {
 			int offset = dest - filename;
-			char *buff = realloc(filename, size += 100);
-			if(buff == NULL)
-				MEM_ERROR();
-			dest = buff + offset;
-			filename = buff;
+			filename = REALLOC(filename, size += 100);
+			dest = filename + offset;
 		}
 
 		if(*src == terminator) {
@@ -5106,7 +5063,7 @@ static squashfs_inode process_source(int progress)
 						prefix, strerror(errno));
 				first = FALSE;
 				same = TRUE;
-				pathname = strdup(prefix);
+				pathname = STRDUP(prefix);
 			} else if(same) {
 				res = lstat(prefix, &buf2);
 				if (res == -1)
@@ -5158,15 +5115,13 @@ static squashfs_inode process_source(int progress)
 			buf.st_gid = getgid();
 		if(root_time_opt)
 			buf.st_mtime = root_time;
-		else
-			buf.st_mtime = time(NULL);
 		if(pseudo_override && global_uid_opt)
 			buf.st_uid = global_uid;
 		if(pseudo_override && global_gid_opt)
 			buf.st_gid = global_gid;
 
 		entry = create_dir_entry("", NULL, "", new);
-		entry->inode = lookup_inode(&buf);
+		entry->inode = lookup_inode_flag(&buf, root_time_opt);
 		entry->inode->dummy_root_dir = TRUE;
 	} else {
 		if(global_dir_mode_opt) {
@@ -5210,16 +5165,18 @@ static squashfs_inode no_sources(int progress)
 {
 	struct stat buf;
 	struct dir_ent *dir_ent;
-	struct pseudo_entry *pseudo_ent;
+	struct pseudo_dev *pseudo_dev;
 	struct pseudo *pseudo = get_pseudo();
 
 	if(pseudo == NULL || pseudo->names != 1 || strcmp(pseudo->head->name, "/") != 0) {
-		ERROR_START("Source is \"-\", but no pseudo definition for \"/\"\n");
-		ERROR_EXIT("Did you forget to specify -cpiostyle or -tar?\n");
-		EXIT_MKSQUASHFS();
-	}
-
-	pseudo_ent = pseudo->head;
+		if(!pseudo_dir) {
+			ERROR_START("Source is \"-\", but no pseudo definition for \"/\"\n");
+			ERROR_EXIT("Did you forget to specify -cpiostyle or -tar?\n");
+			EXIT_MKSQUASHFS();
+		} else
+			pseudo_dev = pseudo_dir;
+	} else
+		pseudo_dev = pseudo->head->dev;
 
 	/* create root directory */
 	root_dir = scan1_opendir("", "", 1);
@@ -5233,27 +5190,27 @@ static squashfs_inode no_sources(int progress)
 
 	memset(&buf, 0, sizeof(buf));
 
-	buf.st_mode = pseudo_ent->dev->buf->mode;
+	buf.st_mode = pseudo_dev->buf->mode;
 	if(root_mode_opt && !global_dir_mode_opt)
 		buf.st_mode = mode_execute(root_mode, buf.st_mode);
 	if(root_uid_opt)
 		buf.st_uid = root_uid;
 	else
-		buf.st_uid = pseudo_ent->dev->buf->uid;
+		buf.st_uid = pseudo_dev->buf->uid;
 
 	if(root_gid_opt)
 		buf.st_gid = root_gid;
 	else
-		buf.st_gid = pseudo_ent->dev->buf->gid;
+		buf.st_gid = pseudo_dev->buf->gid;
 
 	if(root_time_opt)
 		buf.st_mtime = root_time;
 	else
-		buf.st_mtime = pseudo_ent->dev->buf->mtime;
+		buf.st_mtime = pseudo_dev->buf->mtime;
 
-	buf.st_ino = pseudo_ent->dev->buf->ino;
+	buf.st_ino = pseudo_dev->buf->ino;
 
-	dir_ent->inode = lookup_inode2(&buf, pseudo_ent->dev);
+	dir_ent->inode = lookup_inode_flag2(&buf, pseudo_dev, buf.st_mtime != -1);
 	dir_ent->dir = root_dir;
 	root_dir->dir_ent = dir_ent;
 
@@ -5285,12 +5242,9 @@ static int old_excluded(char *filename, struct stat *buf)
 
 
 #define ADD_ENTRY(buf) \
-	if(exclude % EXCLUDE_SIZE == 0) { \
-		exclude_paths = realloc(exclude_paths, (exclude + EXCLUDE_SIZE) \
+	if(exclude % EXCLUDE_SIZE == 0) \
+		exclude_paths = REALLOC(exclude_paths, (exclude + EXCLUDE_SIZE) \
 			* sizeof(struct exclude_info)); \
-		if(exclude_paths == NULL) \
-			MEM_ERROR(); \
-	} \
 	exclude_paths[exclude].st_dev = buf.st_dev; \
 	exclude_paths[exclude++].st_ino = buf.st_ino;
 static int old_add_exclude(char *path)
@@ -5312,9 +5266,7 @@ static int old_add_exclude(char *path)
 	}
 
 	for(i = 0; i < source; i++) {
-		int res = asprintf(&filename, "%s/%s", source_path[i], path);
-		if(res == -1)
-			BAD_ERROR("asprintf failed in old_add_exclude\n");
+		ASPRINTF(&filename, "%s/%s", source_path[i], path);
 		if(lstat(filename, &buf) == -1) {
 			if(!(errno == ENOENT || errno == ENOTDIR)) {
 				ERROR_START("Cannot stat exclude dir/file %s "
@@ -5334,12 +5286,10 @@ static int old_add_exclude(char *path)
 static void add_old_root_entry(char *name, squashfs_inode inode,
 	unsigned int inode_number, int type)
 {
-	old_root_entry = realloc(old_root_entry,
+	old_root_entry = REALLOC(old_root_entry,
 		sizeof(struct old_root_entry_info) * (old_root_entries + 1));
-	if(old_root_entry == NULL)
-		MEM_ERROR();
 
-	old_root_entry[old_root_entries].name = strdup(name);
+	old_root_entry[old_root_entries].name = STRDUP(name);
 	old_root_entry[old_root_entries].inode.inode = inode;
 	old_root_entry[old_root_entries].inode.inode_number = inode_number;
 	old_root_entry[old_root_entries].inode.type = type;
@@ -5348,18 +5298,19 @@ static void add_old_root_entry(char *name, squashfs_inode inode,
 
 
 static void initialise_threads(int readq, int fragq, int bwriteq, int fwriteq,
-	int freelst, char *destination_file, char *command)
+	int freelst, char *destination_file, char *command, int overcommit)
 {
 	int i, res;
 	sigset_t sigmask, old_mask;
 	int total_mem = readq;
-	int reader_size;
 	int fragment_size;
 	int fwriter_size;
-	/*
-	 * bwriter_size is global because it is needed in
-	 * write_file_blocks_dup()
-	 */
+	int bwriter_size;
+
+	if(processors == -1)
+		processors = get_nprocessors();
+
+	set_overcommit(overcommit);
 
 	/*
 	 * Never allow the total size of the queues to be larger than
@@ -5391,10 +5342,11 @@ static void initialise_threads(int readq, int fragq, int bwriteq, int fwriteq,
 	 * This isn't going to overflow an int unless there exists
 	 * systems with more than 8 Petabytes of RAM!
 	 */
-	reader_size = readq << (20 - block_log);
 	fragment_size = fragq << (20 - block_log);
 	bwriter_size = bwriteq << (20 - block_log);
 	fwriter_size = fwriteq << (20 - block_log);
+
+	check_min_memory(readq, bwriteq, block_log);
 
 	/*
 	 * setup signal handlers for the main thread, these cleanup
@@ -5429,37 +5381,27 @@ static void initialise_threads(int readq, int fragq, int bwriteq, int fwriteq,
 	if(pthread_sigmask(SIG_BLOCK, &sigmask, &old_mask) != 0)
 		BAD_ERROR("Failed to set signal mask in initialise_threads\n");
 
-	if(processors == -1)
-		processors = get_nprocessors();
-
 	if(multiply_overflow(processors, 3) ||
 			multiply_overflow(processors * 3, sizeof(pthread_t)))
 		BAD_ERROR("Processors too large\n");
 
-	deflator_thread = malloc(processors * 3 * sizeof(pthread_t));
-	if(deflator_thread == NULL)
-		MEM_ERROR();
-
+	deflator_thread = MALLOC(processors * 3 * sizeof(pthread_t));
 	frag_deflator_thread = &deflator_thread[processors];
 	frag_thread = &frag_deflator_thread[processors];
 
-	to_reader = queue_init(1);
-	to_deflate = queue_init(reader_size);
-	to_process_frag = queue_init(reader_size);
-	to_writer = queue_init(bwriter_size + fwriter_size);
-	from_writer = queue_init(1);
-	to_frag = queue_init(fragment_size);
+	to_reader = queue_init(1, NULL);
+	bwriter_buffer = to_deflate = queue_cache_init(&thread_mutex, block_size, freelst);
+	to_process_frag = read_queue_init();
+	to_writer = queue_init(bwriter_size + fwriter_size, NULL);
+	from_writer = queue_init(1, NULL);
+	from_order = queue_init(1, NULL);
+	to_frag = queue_init(fragment_size, &thread_mutex);
 	to_main = seq_queue_init();
-	if(reproducible)
-		to_order = seq_queue_init();
-	else
-		locked_fragment = queue_init(fragment_size);
-	reader_buffer = cache_init(block_size, reader_size, 0, 0);
-	bwriter_buffer = cache_init(block_size, bwriter_size, 1, freelst);
+	to_order = seq_queue_init();
 	fwriter_buffer = cache_init(block_size, fwriter_size, 1, freelst);
 	fragment_buffer = cache_init(block_size, fragment_size, 1, 0);
 	reserve_cache = cache_init(block_size, processors + 1, 1, 0);
-	pthread_create(&reader_thread, NULL, reader, NULL);
+	pthread_create(&reader_thread1, NULL, initial_reader, NULL);
 	pthread_create(&writer_thread, NULL, writer, NULL);
 	init_progress_bar();
 	init_info();
@@ -5467,8 +5409,7 @@ static void initialise_threads(int readq, int fragq, int bwriteq, int fwriteq,
 	for(i = 0; i < processors; i++) {
 		if(pthread_create(&deflator_thread[i], NULL, deflator, NULL))
 			BAD_ERROR("Failed to create thread\n");
-		if(pthread_create(&frag_deflator_thread[i], NULL, reproducible ?
-				frag_order_deflator : frag_deflator, NULL) != 0)
+		if(pthread_create(&frag_deflator_thread[i], NULL, frag_deflator, NULL) != 0)
 			BAD_ERROR("Failed to create thread\n");
 		if(pthread_create(&frag_thread[i], NULL, frag_thrd,
 				(void *) destination_file) != 0)
@@ -5477,8 +5418,7 @@ static void initialise_threads(int readq, int fragq, int bwriteq, int fwriteq,
 
 	main_thread = pthread_self();
 
-	if(reproducible)
-		pthread_create(&order_thread, NULL, frag_orderer, NULL);
+	pthread_create(&order_thread, NULL, orderer, NULL);
 
 	if(!quiet)
 		printf("Parallel mksquashfs: Using %d processor%s\n", processors,
@@ -5494,15 +5434,11 @@ static long long write_inode_lookup_table()
 {
 	int i, lookup_bytes = SQUASHFS_LOOKUP_BYTES(inode_count);
 	unsigned int inode_number;
-	void *it;
 
 	if(inode_count == sinode_count)
 		goto skip_inode_hash_table;
 
-	it = realloc(inode_lookup_table, lookup_bytes);
-	if(it == NULL)
-		MEM_ERROR();
-	inode_lookup_table = it;
+	inode_lookup_table = REALLOC(inode_lookup_table, lookup_bytes);
 
 	for(i = 0; i < INODE_HASH_SIZE; i ++) {
 		struct inode_info *inode;
@@ -5543,7 +5479,7 @@ static char *get_component(char *target, char **targname)
 	while(*target != '/' && *target != '\0')
 		target ++;
 
-	*targname = strndup(start, target - start);
+	*targname = STRNDUP(start, target - start);
 
 	while(*target == '/')
 		target ++;
@@ -5578,10 +5514,7 @@ static struct pathname *add_path(struct pathname *paths, char *target, char *all
 	target = get_component(target, &targname);
 
 	if(paths == NULL) {
-		paths = malloc(sizeof(struct pathname));
-		if(paths == NULL)
-			MEM_ERROR();
-
+		paths = MALLOC(sizeof(struct pathname));
 		paths->names = 0;
 		paths->name = NULL;
 	}
@@ -5593,16 +5526,12 @@ static struct pathname *add_path(struct pathname *paths, char *target, char *all
 	if(i == paths->names) {
 		/* allocate new name entry */
 		paths->names ++;
-		paths->name = realloc(paths->name, (i + 1) *
+		paths->name = REALLOC(paths->name, (i + 1) *
 			sizeof(struct path_entry));
-		if(paths->name == NULL)
-			MEM_ERROR();
 		paths->name[i].name = targname;
 		paths->name[i].paths = NULL;
 		if(use_regex) {
-			paths->name[i].preg = malloc(sizeof(regex_t));
-			if(paths->name[i].preg == NULL)
-				MEM_ERROR();
+			paths->name[i].preg = MALLOC(sizeof(regex_t));
 			error = regcomp(paths->name[i].preg, targname,
 				REG_EXTENDED|REG_NOSUB);
 			if(error) {
@@ -5665,12 +5594,9 @@ static struct pathnames *add_subdir(struct pathnames *paths, struct pathname *pa
 {
 	int count = paths == NULL ? 0 : paths->count;
 
-	if(count % PATHS_ALLOC_SIZE == 0) {
-		paths = realloc(paths, sizeof(struct pathnames) +
+	if(count % PATHS_ALLOC_SIZE == 0)
+		paths = REALLOC(paths, sizeof(struct pathnames) +
 			(count + PATHS_ALLOC_SIZE) * sizeof(struct pathname *));
-		if(paths == NULL)
-			MEM_ERROR();
-	}
 
 	paths->path[count] = path;
 	paths->count = count  + 1;
@@ -5819,15 +5745,9 @@ static void write_recovery_data(struct squashfs_super_block *sBlk)
 			BAD_ERROR("Could not read $HOME, use -recovery-path or -no-recovery options\n");
 	}
 
-	res = asprintf(&recovery_file, "%s/squashfs_recovery_%s_%d", recovery_pathname,
+	ASPRINTF(&recovery_file, "%s/squashfs_recovery_%s_%d", recovery_pathname,
 		getbase(destination_file), pid);
-	if(res == -1)
-		MEM_ERROR();
-
-	metadata = malloc(bytes);
-	if(metadata == NULL)
-		MEM_ERROR();
-
+	metadata = MALLOC(bytes);
 	res = read_fs_bytes(fd, sBlk->inode_table_start, bytes, metadata);
 	if(res == 0) {
 		ERROR("Failed to read append filesystem metadata\n");
@@ -5920,10 +5840,7 @@ static void read_recovery_data(char *recovery_file, char *destination_file)
 
 	bytes = sBlk.bytes_used - sBlk.inode_table_start;
 
-	metadata = malloc(bytes);
-	if(metadata == NULL)
-		MEM_ERROR();
-
+	metadata = MALLOC(bytes);
 	res = read_bytes(recoverfd, metadata, bytes);
 	if(res == -1)
 		BAD_ERROR("Failed to read recovery file, because %s\n",
@@ -5974,15 +5891,22 @@ static void write_filesystem_tables(struct squashfs_super_block *sBlk)
 		TRACE("sBlk->lookup_table_start 0x%llx\n",
 			sBlk->lookup_table_start);
 
-	sBlk->bytes_used = get_pos();
+	sBlk->bytes_used = get_dpos();
 
 	sBlk->compression = comp->id;
 
-	SQUASHFS_INSWAP_SUPER_BLOCK(sBlk); 
-	write_destination(fd, SQUASHFS_START, sizeof(*sBlk), sBlk);
-
 	total_bytes += total_inode_bytes + total_directory_bytes +
 		sizeof(struct squashfs_super_block) + total_xattr_bytes;
+}
+
+
+static void write_superblock(struct squashfs_super_block *sBlk)
+{
+	long long block = streaming ? get_dpos() : SQUASHFS_START;
+
+	SQUASHFS_INSWAP_SUPER_BLOCK(sBlk);
+
+	write_destination(fd, block, sizeof(*sBlk), sBlk);
 }
 
 
@@ -6134,22 +6058,19 @@ static int get_default_phys_mem()
 	/*
 	 * get_physical_memory() relies on /proc being mounted.
 	 * If it fails, issue a warning, and use
-	 * SQUASHFS_LOWMEM / SQUASHFS_TAKE as default,
-	 * and allow a larger value to be set with -mem.
+	 * SQUASHFS_UNKNOWN_MEM / SQUASHFS_TAKE as default.
 	 */
 	int mem = get_physical_memory();
 
 	if(mem == 0) {
-		mem = SQUASHFS_LOWMEM / SQUASHFS_TAKE;
+		mem = SQUASHFS_UNKNOWN_MEM / SQUASHFS_TAKE;
 
 		ERROR("Warning: Cannot get size of physical memory, probably "
 				"because /proc is missing.\n");
-		ERROR("Warning: Defaulting to minimal use of %d Mbytes, fix "
+		ERROR("Warning: Defaulting to use of %d Mbytes, fix "
 				"/proc to get a better value,\n", mem);
 		mem_options_disabled = TRUE;
-	} else if(mem < SQUASHFS_LOWMEM)
-                BAD_ERROR("Mksquashfs requires more physical memory than is available!\n");
-	else
+	} else
 		mem /= SQUASHFS_TAKE;
 
 	if(sizeof(void *) == 4 && mem > 640) {
@@ -6198,12 +6119,30 @@ static void check_source_date_epoch()
 		/*
 		 * We cannot have both command-line options and environment
 		 * variable trying to set the timestamp(s) at the same
-		 * time.  Semantically both are FORCE options which cannot be
-		 * over-ridden elsewhere (otherwise they can't be relied on).
+		 * time.  These options are mutually exclusive because both
+		 * want to be master, and Mksquashfs can't serve two masters
+		 * at the same time [*].  Obviously both are mutually exclusive
+		 * if they have different values, but they're mutually exclusive
+		 * with the same value, because one sets to that value, and the
+		 * other one clamps to that value.
 		 *
 		 * So refuse to continue if both are set.
+		 *
+		 * But, we can have the environment variable and the new
+		 * "use latest inode time" variants set at the same time, as
+		 * they're not mutually exclusive.  The latest inode time is
+		 * whatever is left after clamping may or may not happened,
+		 * or in otherwords it is relative and not absolute.
+		 *
+		 * [*] If both command line timestamp options and the
+		 * environment variable were allowed, then it would be possible
+		 * to subvert a build system by defining the environment
+		 * variable and over-riding the command line options.  In
+		 * general anything that could lead to unexpected behaviour
+		 * could become an exploit vector, and it is better to disallow
+		 * it.
 		 */
-		if(mkfs_time_opt || all_time_opt)
+		if(mkfs_time_opt || inode_time_opt)
 			BAD_ERROR("SOURCE_DATE_EPOCH and command line options "
 				"can't be used at the same time to set "
 				"timestamp(s)\n");
@@ -6213,8 +6152,8 @@ static void check_source_date_epoch()
 			EXIT_MKSQUASHFS();
 		}
 
-		all_time = mkfs_time = time;
-		all_time_opt = mkfs_time_opt = TRUE;
+		inode_time = mkfs_time = time;
+		inode_time_opt = mkfs_time_opt = TRUE;
 	}
 }
 
@@ -6228,6 +6167,61 @@ static void check_pager()
 
 		if(res == FALSE)
 			EXIT_MKSQUASHFS();
+	}
+}
+
+
+static void check_sqfs_cmdline(int argc, char *argv[])
+{
+	char *dirname = getenv("SQFS_CMDLINE"), *filename, *arg;
+	int file, i, res;
+	struct stat buf;
+
+	if(dirname != NULL) {
+		ASPRINTF(&filename, "%s/%s", dirname, "sqfs_cmdline");
+		file = open(filename, O_CREAT | O_APPEND | O_NOFOLLOW | O_WRONLY,
+					S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
+		if(file == -1) {
+			if(errno == ELOOP)
+				BAD_ERROR("Failed to append to SQFS_CMDLINE "
+					"filename \"%s\" because it is a symbolic "
+					"link or too many symbolic links were "
+					"encountered\n", filename);
+			else
+				BAD_ERROR("Failed to append to SQFS_CMDLINE filename "
+					"\"%s\" because %s\n", filename,
+					strerror(errno));
+		}
+
+		res = fstat(file, &buf);
+		if(res == -1)
+			BAD_ERROR("Failed to fstat SQFS_CMDLINE filename "
+				"\"%s\" because %s\n", filename, strerror(errno));
+
+		if(buf.st_nlink > 1)
+			BAD_ERROR("SQFS_CMDLINE filename \"%s\" is a hard "
+				"link, refusing to append to it\n", filename);
+
+		if(buf.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))
+			BAD_ERROR("SQFS_CMDLINE filename \"%s\" has execute "
+				"permissions, refusing to append to it\n", filename);
+
+		for(i = 0;  i < argc; i++) {
+			ASPRINTF(&arg, "\"%s\" ", argv[i]);
+			res = write_bytes(file, arg, strlen(arg));
+			if(res == -1)
+				BAD_ERROR("write failed in check_sqfs_cmdline\n");
+
+			free(arg);
+		}
+
+		res = write_bytes(file, "\n", 1);
+		if(res == -1)
+			BAD_ERROR("write failed in check_sqfs_cmdline\n");
+
+		close(file);
+		free(filename);
 	}
 }
 
@@ -6264,10 +6258,10 @@ static void print_summary()
 		"compressed", noI || noId ? "uncompressed" : "compressed");
 	printf("\tduplicates are %sremoved\n", duplicate_checking ? "" :
 		"not ");
-	printf("Filesystem size %.2f Kbytes (%.2f Mbytes)\n", get_pos() / 1024.0,
-		get_pos() / (1024.0 * 1024.0));
+	printf("Filesystem size %.2f Kbytes (%.2f Mbytes)\n", get_dpos() / 1024.0,
+		get_dpos() / (1024.0 * 1024.0));
 	printf("\t%.2f%% of uncompressed filesystem size (%.2f Kbytes)\n",
-		((float) get_pos() / total_bytes) * 100.0, total_bytes / 1024.0);
+		((float) get_dpos() / total_bytes) * 100.0, total_bytes / 1024.0);
 	printf("Inode table size %lld bytes (%.2f Kbytes)\n",
 		inode_bytes, inode_bytes / 1024.0);
 	printf("\t%.2f%% of uncompressed inode table size (%lld bytes)\n",
@@ -6395,6 +6389,24 @@ static int get_gid_from_arg(char *arg, unsigned int *gid)
 }
 
 
+static int get_uid_gid_offset_from_arg(char *arg, unsigned int *offset)
+{
+	char *last;
+	long long res;
+
+	res = strtoll(arg, &last, 10);
+	if(*last == '\0') {
+		if(res < 0 || res > (((long long) 1 << 32) - 1))
+			return -2;
+
+		*offset = res;
+		return 0;
+    }
+
+    return -1;
+}
+
+
 FILE *open_info_file(char *filename)
 {
 	FILE *file;
@@ -6404,7 +6416,7 @@ FILE *open_info_file(char *filename)
 	res = stat(filename, &buf);
 	if(res == -1) {
 		if(errno != ENOENT)
-			BAD_ERROR("Failed to stat info_file filename \"%s\" because %s\n", strerror(errno));
+			BAD_ERROR("Failed to stat info_file filename \"%s\" because %s\n", filename, strerror(errno));
 
 		file = fopen(filename, "w");
 		if(file == NULL)
@@ -6413,6 +6425,51 @@ FILE *open_info_file(char *filename)
 		BAD_ERROR("Info_file filename \"%s\" already exists!\n", filename);
 
 	return file;
+}
+
+
+static void fix_file(char *filename)
+{
+	struct squashfs_super_block sblk;
+	long long res, offset;
+	int fd = open(filename, O_RDWR);
+
+	if(fd == -1)
+		BAD_ERROR("Failed to open file \"%s\" because %s\n", filename, strerror(errno));
+
+	res = read_bytes(fd, &sblk, sizeof(struct squashfs_super_block));
+	if(res < sizeof(struct squashfs_super_block))
+		BAD_ERROR("Failed to read file \"%s\"\n", filename);
+
+	SQUASHFS_INSWAP_SUPER_BLOCK(&sblk);
+
+	if(sblk.s_magic != SQUASHFS_MAGIC_STREAMED)
+		BAD_ERROR("File \"%s\" is not a streamed Squashfs file, incorrect magic found!\n", filename);
+
+	offset = lseek(fd, -sizeof(struct squashfs_super_block), SEEK_END);
+	if(offset == -1)
+		BAD_ERROR("Failed to lseek to end of file \"%s\"\n", filename);
+
+	res = read_bytes(fd, &sblk, sizeof(struct squashfs_super_block));
+	if(res < sizeof(struct squashfs_super_block))
+		BAD_ERROR("Failed to read file \"%s\"\n", filename);
+
+	SQUASHFS_INSWAP_SUPER_BLOCK(&sblk);
+
+	if(sblk.s_magic != SQUASHFS_MAGIC)
+		BAD_ERROR("File \"%s\" is not a streamed Squashfs file, incorrect magic found!\n", filename);
+
+	res = lseek(fd, SQUASHFS_START, SEEK_SET);
+	if(res == -1)
+		BAD_ERROR("Failed to lseek to start of file \"%s\"\n", filename);
+
+	res = write_bytes(fd, &sblk, sizeof(struct squashfs_super_block));
+	if(res == -1)
+		BAD_ERROR("Failed to write file \"%s\"\n", filename);
+
+	res = ftruncate(fd, offset);
+	if(res == -1)
+		BAD_ERROR("Failed to truncate file \"%s\" because %s\n", filename, strerror(errno));
 }
 
 
@@ -6434,40 +6491,57 @@ static int sqfstar(int argc, char *argv[])
 	struct file_buffer **fragment = NULL;
 	int size;
 	void *comp_data;
+	int overcommit = OVERCOMMIT_DEFAULT;
+	int repro_opt = FALSE;
+	int repro_time_opt = FALSE;
+	unsigned int repro_time;
+
+	/* Scan the command line for any -no-pager option.  This needs to be
+	 * parsed before any help options or help output on error which will by
+	 * default go to the pager */
+	for(i = 1; i < argc; i++) {
+		if(strcmp(argv[i], "-no-pager") == 0)
+			no_pager = TRUE;
+		else if(strcmp(argv[i], "-cols") == 0) {
+			if((++i == argc) || !parse_num(argv[i], &user_cols))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -cols  missing or invalid column width\n");
+			if(user_cols  < 0)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -cols should be 0 or larger\n");
+		} else if(argv[i][0] != '-')
+			break;
+		else if(option_with_arg(argv[i], sqfstar_option_table))
+			i++;
+	}
 
 	/* Scan the command line for options that will immediately quit afterwards */
 	for(i = 1; i < argc; i++) {
-		if(strcmp(argv[i], "-version") == 0) {
+		if(strcmp(argv[i], "-version") == 0 || strcmp(argv[i], "--version") == 0) {
 			print_version("sqfstar");
 			exit(0);
 		} else if(strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "-h") == 0)
-			sqfstar_help(FALSE);
+			sqfstar_help(NULL);
 		else if(strcmp(argv[i], "-help-all") == 0 || strcmp(argv[i], "-ha") == 0)
 			sqfstar_help_all();
 		else if(strcmp(argv[i], "-help-option") == 0 || strcmp(argv[i], "-ho") == 0) {
-			if(++i == argc) {
-				ERROR("sqfstar: %s missing regex\n", argv[i - 1]);
-				sqfstar_option_help(argv[i - 1]);
-			}
-
+			if(++i == argc)
+				sqfstar_option_help(argv[i - 1], "sqfstar: %s missing regex\n", argv[i - 1]);
 			sqfstar_option(argv[i - 1], argv[i]);
 		} else if(strcmp(argv[i], "-help-section") == 0 || strcmp(argv[i], "-hs") == 0) {
-			if(++i == argc) {
-				ERROR("sqfstar: %s missing section\n", argv[i - 1]);
-				sqfstar_option_help(argv[i - 1]);
-			}
-
+			if(++i == argc)
+				sqfstar_option_help(argv[i - 1], "sqfstar: %s missing section\n", argv[i - 1]);
 			sqfstar_section(argv[i - 1], argv[i]);
 		} else if(strcmp(argv[i], "-help-comp") == 0) {
-			if(++i == argc) {
-				ERROR("sqfstar: -help-comp missing compressor name\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-
+			if(++i == argc)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -help-comp missing compressor name\n");
 			print_compressor_options(argv[i], "sqfstar");
 			exit(0);
-		} else if(strcmp(argv[1], "-mem-default") == 0) {
+		} else if(strcmp(argv[i], "-mem-default") == 0) {
 			printf("%d\n", total_mem);
+			exit(0);
+		} else if(strcmp(argv[i], "-fix") == 0) {
+			if(++i == argc)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -fix missing filename\n");
+			fix_file(argv[i]);
 			exit(0);
 		} else if(argv[i][0] != '-')
 			break;
@@ -6494,10 +6568,8 @@ static int sqfstar(int argc, char *argv[])
 		if(strcmp(argv[i], "-comp") == 0) {
 			struct compressor *prev_comp = comp;
 
-			if(++i == argc) {
-				ERROR("sqfstar: -comp missing compression type\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -comp missing compression type\n");
 			comp = lookup_compressor(argv[i]);
 			if(!comp->supported) {
 				ERROR("sqfstar: Compressor \"%s\" is not supported!\n", argv[i]);
@@ -6514,7 +6586,7 @@ static int sqfstar(int argc, char *argv[])
 			}
 			compressor_opt_parsed = 1;
 			if(X_opt_parsed) {
-				ERROR("%s: -comp option should be before any "
+				ERROR("sqfstar: -comp option should be before any "
 					"-X option\n");
 				exit(1);
 			}
@@ -6554,140 +6626,143 @@ static int sqfstar(int argc, char *argv[])
 	always_use_fragments = TRUE;
 
 	for(i = 1; i < dest_index; i++) {
-		if(strcmp(argv[i], "-ignore-zeros") == 0)
+		if(strcmp(argv[i], "-stream") == 0)
+			streaming = TRUE;
+		else if(strcmp(argv[i], "-no-pager") == 0)
+			; /* ignore, already parsed */
+		else if(strcmp(argv[i], "-cols") == 0)
+			i++; /* already parsed */
+		else if(strcmp(argv[i], "-ignore-zeros") == 0)
 			ignore_zeros = TRUE;
 		else if(strcmp(argv[i], "-no-hardlinks") == 0)
 			no_hardlinks = TRUE;
 		else if(strcmp(argv[i], "-throttle") == 0) {
-			if((++i == dest_index) || !parse_number(argv[i], &sleep_time, 2)) {
-				ERROR("sqfstar: -throttle missing or invalid value\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-			if(sleep_time > 99) {
-				ERROR("sqfstar: -throttle value should be between 0 and 99\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+			if((++i == dest_index) || !parse_number(argv[i], &res, 2))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -throttle missing or invalid value\n");
+			if(res > 99)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -throttle value should be between 0 and 99\n");
+			set_sleep_time(res);
 			readq = 4;
 		} else if(strcmp(argv[i], "-limit") == 0) {
-			if((++i == dest_index) || !parse_number(argv[i], &sleep_time, 0)) {
-				ERROR("sqfstar: -limit missing or invalid value\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-			if(sleep_time < 1 || sleep_time > 100) {
-				ERROR("sqfstar: -limit value should be between 1 and 100\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-			sleep_time = 100 - sleep_time;
+			if((++i == dest_index) || !parse_number(argv[i], &res, 0))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -limit missing or invalid value\n");
+			if(res < 1 || res > 100)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -limit value should be between 1 and 100\n");
+			set_sleep_time(100 - res);
 			readq = 4;
 		} else if(strcmp(argv[i], "-mkfs-time") == 0 ||
 				strcmp(argv[i], "-fstime") == 0) {
-			if((++i == dest_index) ||
-				(!parse_num_unsigned(argv[i], &mkfs_time) &&
-				!exec_date(argv[i], &mkfs_time))) {
-					ERROR("sqfstar: %s missing or invalid time "
-						"value\n", argv[i - 1]);
-				sqfstar_option_help(argv[i - 1]);
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: %s missing time value\n", argv[i - 1]);
+			else if(strcmp(argv[i], "inode") == 0)
+				mkfs_inode_opt = TRUE;
+			else if(!parse_num_unsigned(argv[i], &mkfs_time) &&
+					!exec_date(argv[i], &mkfs_time))
+				sqfstar_option_help(argv[i - 1], "sqfstar: %s invalid time value\n", argv[i - 1]);
+			else {
+				mkfs_time_opt = TRUE;
+				clamping = FALSE;
 			}
-			mkfs_time_opt = TRUE;
-		} else if(strcmp(argv[i], "-all-time") == 0) {
-			if((++i == dest_index) ||
-				(!parse_num_unsigned(argv[i], &all_time) &&
-				!exec_date(argv[i], &all_time))) {
-					ERROR("sqfstar: -all-time missing or invalid time value\n");
-				sqfstar_option_help(argv[i - 1]);
+		} else if(strcmp(argv[i], "-all-time") == 0 || strcmp(argv[i], "-inode-time") == 0) {
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: %s missing time value\n", argv[i - 1]);
+			else if(strcmp(argv[i], "inode") == 0)
+				inode_inode_opt = TRUE;
+			else if(!parse_num_unsigned(argv[i], &inode_time) &&
+					!exec_date(argv[i], &inode_time))
+				sqfstar_option_help(argv[i - 1], "sqfstar: %s invalid time value\n", argv[i - 1]);
+			else {
+				inode_time_opt = TRUE;
+				clamping = FALSE;
 			}
-			all_time_opt = TRUE;
-			clamping = FALSE;
-		} else if(strcmp(argv[i], "-reproducible") == 0)
-			reproducible = TRUE;
-		else if(strcmp(argv[i], "-not-reproducible") == 0)
-			reproducible = FALSE;
-		else if(strcmp(argv[i], "-root-mode") == 0) {
-			if((++i == dest_index) || !parse_mode(argv[i], &root_mode)) {
-				ERROR("sqfstar: -root-mode missing or invalid mode,"
-					" symbolic mode or octal number expected\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+		} else if(strcmp(argv[i], "-reproducible") == 0);
+			/* obsolete option, ignored and retained for backwards
+			 * compatibility */
+		else if(strcmp(argv[i], "-not-reproducible") == 0);
+			/* obsolete option, ignored and retained for backwards
+			 * compatibility */
+		else if(strcmp(argv[i], "-repro") == 0)
+			repro_opt = TRUE;
+		else if(strcmp(argv[i], "-repro-time") == 0) {
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -repro-time missing time value\n");
+			else if(!parse_num_unsigned(argv[i], &repro_time) &&
+					!exec_date(argv[i], &repro_time))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -repro-time invalid time value\n", argv[i - 1]);
+			else
+				repro_time_opt = TRUE;
+		} else if(strcmp(argv[i], "-root-mode") == 0) {
+			if((++i == dest_index) || !parse_mode(argv[i], &root_mode))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -root-mode missing or invalid mode, symbolic mode or octal number expected\n");
 			root_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-uid") == 0) {
-			if(++i == dest_index) {
-				ERROR("sqfstar: -root-uid missing uid or user name\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -root-uid missing uid or user name\n");
 			res = get_uid_from_arg(argv[i], &root_uid);
 			if(res) {
 				if(res == -2)
-					ERROR("sqfstar: -root-uid uid out of range\n");
+					sqfstar_option_help(argv[i - 1], "sqfstar: -root-uid uid out of range\n");
 				else
-					ERROR("sqfstar: -root-uid invalid uid or "
-						"unknown user name\n");
-				sqfstar_option_help(argv[i - 1]);
+					sqfstar_option_help(argv[i - 1], "sqfstar: -root-uid invalid uid or unknown user name\n");
 			}
 			root_uid_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-gid") == 0) {
-			if(++i == dest_index) {
-				ERROR("sqfstar: -root-gid missing gid or group name\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -root-gid missing gid or group name\n");
 			res = get_gid_from_arg(argv[i], &root_gid);
 			if(res) {
 				if(res == -2)
-					ERROR("sqfstar: -root-gid gid out of range\n");
+					sqfstar_option_help(argv[i - 1], "sqfstar: -root-gid gid out of range\n");
 				else
-					ERROR("sqfstar: -root-gid invalid gid or "
-						"unknown group name\n");
-				sqfstar_option_help(argv[i - 1]);
+					sqfstar_option_help(argv[i - 1], "sqfstar: -root-gid invalid gid or unknown group name\n");
 			}
 			root_gid_opt = TRUE;
+		} else if(strcmp(argv[i], "-uid-gid-offset") == 0) {
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -uid-gid-offset missing offset\n");
+			res = get_uid_gid_offset_from_arg(argv[i], &uid_gid_offset);
+			if(res) {
+				if(res == -2)
+					sqfstar_option_help(argv[i - 1], "sqfstar: -uid-gid-offset out of range\n");
+				else
+					sqfstar_option_help(argv[i - 1], "sqfstar: -uid-gid-offset invalid number\n");
+			}
 		} else if(strcmp(argv[i], "-root-time") == 0) {
-			if((++i == argc) ||
-					(!parse_num_unsigned(argv[i], &root_time) &&
-					!exec_date(argv[i], &root_time))) {
-				ERROR("sqfstar: -root-time missing or invalid time\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-			root_time_opt = TRUE;
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -root-time missing time value\n");
+			else if(strcmp(argv[i], "inode") == 0)
+				root_inode_opt = TRUE;
+			else if(!parse_num_unsigned(argv[i], &root_time) &&
+					!exec_date(argv[i], &root_time))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -root-time invalid time value\n");
+			else
+				root_time_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-mode") == 0) {
-			if((++i == dest_index) || !parse_mode(argv[i], &default_mode)) {
-				ERROR("sqfstar: -default-mode missing or invalid mode,"
-					" symbolic mode or octal number expected\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+			if((++i == dest_index) || !parse_mode(argv[i], &default_mode))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -default-mode missing or invalid mode, symbolic mode or octal number expected\n");
 			root_mode = default_mode;
 			default_mode_opt = root_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-uid") == 0) {
-			if(++i == dest_index) {
-				ERROR("sqfstar: -default-uid missing uid or user name\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -default-uid missing uid or user name\n");
 			res = get_uid_from_arg(argv[i], &default_uid);
 			if(res) {
 				if(res == -2)
-					ERROR("sqfstar: -default-uid uid out of range\n");
+					sqfstar_option_help(argv[i - 1], "sqfstar: -default-uid uid out of range\n");
 				else
-					ERROR("sqfstar: -default-uid invalid uid or "
-						"unknown user name\n");
-				sqfstar_option_help(argv[i - 1]);
+					sqfstar_option_help(argv[i - 1], "sqfstar: -default-uid invalid uid or unknown user name\n");
 			}
 			root_uid = default_uid;
 			default_uid_opt = root_uid_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-gid") == 0) {
-			if(++i == dest_index) {
-				ERROR("sqfstar: -default-gid missing gid or group name\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -default-gid missing gid or group name\n");
 			res = get_gid_from_arg(argv[i], &default_gid);
 			if(res) {
 				if(res == -2)
-					ERROR("sqfstar: -default-gid gid out of range\n");
+					sqfstar_option_help(argv[i - 1], "sqfstar: -default-gid gid out of range\n");
 				else
-					ERROR("sqfstar: -default-gid invalid gid or "
-						"unknown group name\n");
-				sqfstar_option_help(argv[i - 1]);
+					sqfstar_option_help(argv[i - 1], "sqfstar: -default-gid invalid gid or unknown group name\n");
 			}
 			root_gid = default_gid;
 			default_gid_opt = root_gid_opt = TRUE;
@@ -6713,26 +6788,18 @@ static int sqfstar(int argc, char *argv[])
 			i += args;
 
 		} else if(strcmp(argv[i], "-pf") == 0) {
-			if(++i == dest_index) {
-				ERROR("sqfstar: -pf missing filename\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -pf missing filename\n");
 			if(read_pseudo_file(argv[i], argv[dest_index]) == FALSE)
 				exit(1);
 		} else if(strcmp(argv[i], "-p") == 0) {
-			if(++i == dest_index) {
-				ERROR("sqfstar: -p missing pseudo file definition\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -p missing pseudo file definition\n");
 			if(read_pseudo_definition(argv[i], argv[dest_index]) == FALSE)
 				exit(1);
 		} else if(strcmp(argv[i], "-pd") == 0 || strcmp(argv[i], "-pseudo-dir") == 0) {
-			if(++i == dest_index) {
-				ERROR("sqfstar: %s missing pseudo file definition\n",
-					argv[i-1]);
-				sqfstar_option_help(argv[i - 1]);
-			}
-
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: %s missing pseudo file definition\n", argv[i-1]);
 			pseudo_dir = read_pseudo_dir(argv[i]);
 			if(pseudo_dir == NULL)
 				exit(1);
@@ -6749,21 +6816,13 @@ static int sqfstar(int argc, char *argv[])
 		else if(strcmp(argv[i], "-offset") == 0 ||
 						strcmp(argv[i], "-o") == 0) {
 			if((++i == dest_index) ||
-				!parse_numberll(argv[i], &start_offset, 1)) {
-					ERROR("sqfstar: %s missing or invalid offset "
-						"size\n", argv[i - 1]);
-				sqfstar_option_help(argv[i - 1]);
-			}
+					!parse_numberll(argv[i], &start_offset, 1))
+				sqfstar_option_help(argv[i - 1], "sqfstar: %s missing or invalid offset size\n", argv[i - 1]);
 		} else if(strcmp(argv[i], "-processors") == 0) {
-			if((++i == dest_index) || !parse_num(argv[i], &processors)) {
-				ERROR("sqfstar: -processors missing or invalid "
-					"processor number\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-			if(processors < 1) {
-				ERROR("sqfstar: -processors should be 1 or larger\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+			if((++i == dest_index) || !parse_num(argv[i], &processors))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -processors missing or invalid processor number\n");
+			if(processors < 1)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -processors should be 1 or larger\n");
 		} else if(strcmp(argv[i], "-mem") == 0) {
 			long long number = 0;
 
@@ -6774,27 +6833,17 @@ static int sqfstar(int argc, char *argv[])
 			}
 
 			if((++i == dest_index) ||
-					!parse_numberll(argv[i], &number, 1)) {
-				ERROR("sqfstar: -mem missing or invalid mem size\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+					!parse_numberll(argv[i], &number, 1))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -mem missing or invalid mem size\n");
 
 			/*
 			 * convert from bytes to Mbytes, ensuring the value
 			 * does not overflow a signed int
 			 */
-			if(number >= (1LL << 51)) {
-				ERROR("sqfstar: -mem invalid mem size\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+			if(number >= (1LL << 51))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -mem invalid mem size\n");
 
 			total_mem = number / 1048576;
-			if(total_mem < (SQUASHFS_LOWMEM / SQUASHFS_TAKE)) {
-				ERROR("sqfstar: -mem should be %d Mbytes or "
-					"larger\n", SQUASHFS_LOWMEM /
-					SQUASHFS_TAKE);
-				sqfstar_option_help(argv[i - 1]);
-			}
 			calculate_queue_sizes(total_mem, &readq, &fragq,
 				&bwriteq, &fwriteq);
 		} else if(strcmp(argv[i], "-mem-percent") == 0) {
@@ -6813,11 +6862,8 @@ static int sqfstar(int argc, char *argv[])
 			 */
 			if((++i == dest_index) ||
 					!parse_number(argv[i], &percent, 2) ||
-					(percent < 1)) {
-				ERROR("sqfstar: -mem-percent missing or invalid "
-					"percentage: it should be 1 - 75%\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+					(percent < 1))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -mem-percent missing or invalid percentage: it should be 1 - 75%%\n");
 
 			phys_mem = get_physical_memory();
 
@@ -6827,44 +6873,26 @@ static int sqfstar(int argc, char *argv[])
 				exit(1);
 			}
 
-			if(multiply_overflow(phys_mem, percent)) {
-				ERROR("sqfstar: -mem-percent requested phys mem too "
-					"large\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+			if(multiply_overflow(phys_mem, percent))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -mem-percent requested phys mem too large\n");
 
 			total_mem = phys_mem * percent / 100;
 
-			if(total_mem < (SQUASHFS_LOWMEM / SQUASHFS_TAKE)) {
-				ERROR("sqfstar: -mem-percent mem too small, should "
-					"be %d Mbytes or larger\n",
-					SQUASHFS_LOWMEM / SQUASHFS_TAKE);
-				sqfstar_option_help(argv[i - 1]);
-			}
 			calculate_queue_sizes(total_mem, &readq, &fragq,
 				&bwriteq, &fwriteq);
 		} else if(strcmp(argv[i], "-mem-default") == 0) {
 			printf("%d\n", total_mem);
 			exit(0);
 		} else if(strcmp(argv[i], "-b") == 0) {
-			if(++i == dest_index) {
-				ERROR("sqfstar: -b missing block size\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-			if(!parse_number(argv[i], &block_size, 1)) {
-				ERROR("sqfstar: -b invalid block size\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-			if((block_log = slog(block_size)) == 0) {
-				ERROR("sqfstar: -b block size not power of two or "
-					"not between 4096 and 1Mbyte\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -b missing block size\n");
+			if(!parse_number(argv[i], &block_size, 1))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -b invalid block size\n");
+			if((block_log = slog(block_size)) == 0)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -b block size not power of two or not between 4096 and 1Mbyte\n");
 		} else if(strcmp(argv[i], "-ef") == 0) {
-			if(++i == dest_index) {
-				ERROR("sqfstar: -ef missing filename\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -ef missing filename\n");
 		} else if(strcmp(argv[i], "-no-duplicates") == 0)
 			duplicate_checking = FALSE;
 
@@ -6879,49 +6907,33 @@ static int sqfstar(int argc, char *argv[])
 			global_uid = global_gid = 0;
 			global_uid_opt = global_gid_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-file-mode") == 0) {
-			if((++i == argc) || !parse_mode(argv[i], &global_file_mode)) {
-				ERROR("sqfstar: -force-file-mode missing or invalid mode,"
-					" symbolic mode or octal number expected\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+			if((++i == argc) || !parse_mode(argv[i], &global_file_mode))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -force-file-mode missing or invalid mode, symbolic mode or octal number expected\n");
 			global_file_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-dir-mode") == 0) {
-			if((++i == argc) || !parse_mode(argv[i], &global_dir_mode)) {
-				ERROR("sqfstar: -force-dir-mode missing or invalid mode,"
-					" symbolic mode or octal number expected\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
+			if((++i == argc) || !parse_mode(argv[i], &global_dir_mode))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -force-dir-mode missing or invalid mode, symbolic mode or octal number expected\n");
 			global_dir_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-uid") == 0) {
-			if(++i == dest_index) {
-				ERROR("sqfstar: -force-uid missing uid or user name\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -force-uid missing uid or user name\n");
 			res = get_uid_from_arg(argv[i], &global_uid);
 			if(res) {
 				if(res == -2)
-					ERROR("sqfstar: -force-uid uid out of range\n");
+					sqfstar_option_help(argv[i - 1], "sqfstar: -force-uid uid out of range\n");
 				else
-					ERROR("sqfstar: -force-uid invalid uid or "
-						"unknown user name\n");
-				sqfstar_option_help(argv[i - 1]);
+					sqfstar_option_help(argv[i - 1], "sqfstar: -force-uid invalid uid or unknown user name\n");
 			}
 			global_uid_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-gid") == 0) {
-			if(++i == dest_index) {
-				ERROR("sqfstar: -force-gid missing gid or group name\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -force-gid missing gid or group name\n");
 			res = get_gid_from_arg(argv[i], &global_gid);
 			if(res) {
 				if(res == -2)
-					ERROR("sqfstar: -force-gid gid out of range\n");
+					sqfstar_option_help(argv[i - 1], "sqfstar: -force-gid gid out of range\n");
 				else
-					ERROR("sqfstar: -force-gid invalid gid or "
-						"unknown group name\n");
-				sqfstar_option_help(argv[i - 1]);
+					sqfstar_option_help(argv[i - 1], "sqfstar: -force-gid invalid gid or unknown group name\n");
 			}
 			global_gid_opt = TRUE;
 		} else if(strcmp(argv[i], "-pseudo-override") == 0)
@@ -6951,12 +6963,8 @@ static int sqfstar(int argc, char *argv[])
 
 		else if(strcmp(argv[i], "-no-xattrs") == 0) {
 			if(xattr_exclude_preg || xattr_include_preg ||
-							add_xattrs()) {
-				ERROR("sqfstar: -no-xattrs should not be used in "
-					"combination with -xattrs-* options\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-
+							add_xattrs())
+				sqfstar_option_help(argv[i - 1], "sqfstar: -no-xattrs should not be used in combination with -xattrs-* options\n");
 			no_xattrs = TRUE;
 
 		} else if(strcmp(argv[i], "-xattrs") == 0) {
@@ -6973,10 +6981,9 @@ static int sqfstar(int argc, char *argv[])
 				ERROR("sqfstar: xattrs are unsupported in "
 					"this build\n");
 				exit(1);
-			} else if(++i == dest_index) {
-				ERROR("sqfstar: -xattrs-exclude missing regex pattern\n");
-				sqfstar_option_help(argv[i - 1]);
-			} else {
+			} else if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -xattrs-exclude missing regex pattern\n");
+			else {
 				xattr_exclude_preg = xattr_regex(argv[i], "exclude");
 				no_xattrs = FALSE;
 			}
@@ -6985,10 +6992,9 @@ static int sqfstar(int argc, char *argv[])
 				ERROR("sqfstar: xattrs are unsupported in "
 					"this build\n");
 				exit(1);
-			} else if(++i == dest_index) {
-				ERROR("sqfstar: -xattrs-include missing regex pattern\n");
-				sqfstar_option_help(argv[i - 1]);
-			} else {
+			} else if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -xattrs-include missing regex pattern\n");
+			else {
 				xattr_include_preg = xattr_regex(argv[i], "include");
 				no_xattrs = FALSE;
 			}
@@ -6997,10 +7003,9 @@ static int sqfstar(int argc, char *argv[])
 				ERROR("sqfstar: xattrs are unsupported in "
 					"this build\n");
 				exit(1);
-			} else if(++i == dest_index) {
-				ERROR("sqfstar: -xattrs-add missing xattr argument\n");
-				sqfstar_option_help(argv[i - 1]);
-			} else {
+			} else if(++i == dest_index) 
+				sqfstar_option_help(argv[i - 1], "sqfstar: -xattrs-add missing xattr argument\n");
+			else {
 				xattrs_add(argv[i]);
 				no_xattrs = FALSE;
 			}
@@ -7012,11 +7017,8 @@ static int sqfstar(int argc, char *argv[])
 			display_info = TRUE;
 
 		else if(strcmp(argv[i], "-info-file") == 0) {
-			if(++i == dest_index) {
-				ERROR("sqfstar: -info-file missing filename\n");
-				sqfstar_option_help(argv[i - 1]);
-			}
-
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -info-file missing filename\n");
 			display_info = TRUE;
 			info_file = open_info_file(argv[i]);
 
@@ -7032,17 +7034,85 @@ static int sqfstar(int argc, char *argv[])
 		else if(strcmp(argv[i], "-percentage") == 0) {
 			progressbar_percentage();
 			percentage = TRUE;
+		} else if(strcmp(argv[i], "-overcommit") == 0) {
+			if((++i == dest_index) ||
+					!parse_number(argv[i], &overcommit, 2) ||
+					(overcommit > 100))
+				sqfstar_option_help(argv[i - 1], "sqfstar: -overcommit missing or invalid percentage: it should be 0 - 100%%\n");
 		} else
 			sqfstar_invalid_option(argv[i]);
 	}
 
-	if(i == argc) {
-		ERROR("sqfstar: fatal error: no output filesystem specified on command line\n\n");
-		sqfstar_help(TRUE);
-		exit(1);
-	}
+	if(i == argc && !streaming)
+		sqfstar_help("sqfstar: fatal error: no output filesystem specified on command line\n\n");
+
+	set_single_threaded();
 
 	check_source_date_epoch();
+
+	/*
+	 * Both mkfs-time <timestamp> and mkfs-time <inode> cannot have both
+	 * been specified.  Note the extra check for !clamping is to distinquish
+	 * between the environment variable SOURCE_DATE_EPOCH which sets
+	 * mkfs_time_opt and clamping.
+	 */
+	if(mkfs_time_opt && mkfs_inode_opt && !clamping)
+		BAD_ERROR("Cannot specify both mkfs-time <timestamp> and mkfs-time inode\n");
+
+	/*
+	 * Both inode-time <timestamp> and inode-time <inode> cannot have both
+	 * been specified.  Note the extra check for !clamping is to distinquish
+	 * between the environment variable SOURCE_DATE_EPOCH which sets
+	 * inode_time_opt and clamping.
+	 */
+	if(inode_time_opt && inode_inode_opt && !clamping)
+		BAD_ERROR("Cannot specify both inode-time <timestamp> and inode-time inode\n");
+
+	/*
+	 * Both root-time <timestamp> and root-time <inode> cannot have both
+	 * been specified.
+	 */
+	if(root_time_opt && root_inode_opt)
+		BAD_ERROR("Cannot specify both root-time <timestamp> and root-time inode\n");
+
+	/*
+	 * Both mkfs-time <timestamp> and -repro cannot have both been
+	 * specified.  Note the extra check for !clamping is to distinquish
+	 * between the environment variable SOURCE_DATE_EPOCH which sets
+	 * mkfs_time_opt and clamping.
+	 */
+	if(repro_opt) {
+		if(mkfs_time_opt && !clamping)
+			BAD_ERROR("Cannot specify both -repro and mkfs-time <timestamp>\n");
+		else
+			mkfs_inode_opt = TRUE;
+	}
+
+	/* -repro-time and -repro cannot have both been specified */
+	if(repro_time_opt && repro_opt)
+		BAD_ERROR("Cannot specify both -repro and -repro-time <timestamp>\n");
+
+	/* -repro-time cannot have been specified with -mkfs-time inode,
+	 * -inode-time inode or SOURCE_DATE_EPOCH */
+	if(repro_time_opt) {
+		if(mkfs_inode_opt)
+			BAD_ERROR("Cannot specify both -repro-time <timestamp> and -mkfs-time inode\n");
+
+		if(inode_inode_opt)
+			BAD_ERROR("Cannot specify both -repro-time <timestamp> and -inode-time inode\n");
+
+		if(mkfs_time_opt && clamping)
+			BAD_ERROR("Cannot specify both -repro-time <timestamp> and SOURCE_DATE_EPOCH\n");
+
+		if(mkfs_time_opt && mkfs_time != repro_time)
+			BAD_ERROR("Cannot specify different timestamp with -repro-time <timestamp> and mkfs-time <timestamp>\n");
+
+		if(inode_time_opt && inode_time != repro_time)
+			BAD_ERROR("Cannot specify different timestamp with -repro-time <timestamp> and inode-time <timestamp>\n");
+
+		mkfs_time_opt = inode_time_opt = TRUE;
+		mkfs_time = inode_time = repro_time;
+	}
 
 	/*
 	 * The -noI option implies -noId for backwards compatibility, so reset noId
@@ -7058,6 +7128,37 @@ static int sqfstar(int argc, char *argv[])
 	res = compressor_options_post(comp, block_size);
 	if(res)
 		EXIT_MKSQUASHFS();
+
+	/*
+	 * Streaming is incompatible with the progress bar, percentage output,
+	 * info output to stdout, and summary output
+	 *
+	 * Complain if -force-progress or -percentage have been used, as they
+	 * produce a conflict
+	 */
+	if(streaming) {
+		if(force_progress)
+			BAD_ERROR("-stream cannot be used with -force-progress\n");
+
+		if(percentage)
+			BAD_ERROR("-stream cannot be used wih -percentage\n");
+
+		/* -info cannot be used, unless it is to a file */
+		if(display_info && !info_file)
+			BAD_ERROR("-stream cannot be used with -info, use "
+				"-info-file instead\n");
+
+		/*
+		 * When streaming Mksquashfs cannot do duplicate checking as it
+		 * cannot read back the output filesystem.
+		 *
+		 * The progress bar and the summary output has to also be
+		 * disabled, as it is to stdout.
+		 */
+		duplicate_checking = FALSE;
+		progress = FALSE;
+		quiet = TRUE;
+	}
 
 	/*
 	 * Selecting both -no-progress and -percentage produces a conflict,
@@ -7106,8 +7207,11 @@ static int sqfstar(int argc, char *argv[])
 	progress = FALSE;
 #endif
 
-	destination_file =  argv[dest_index];
-	if(stat(destination_file, &buf) == -1) {
+	destination_file = !streaming ? argv[dest_index] : NULL;
+	if(streaming) {
+		appending = FALSE;
+		fd = STDOUT_FILENO;
+	} else if(stat(destination_file, &buf) == -1) {
 		if(errno == ENOENT) { /* Does not exist */
 			appending = FALSE;
 			fd = open(destination_file, O_CREAT | O_TRUNC | O_RDWR,
@@ -7186,20 +7290,14 @@ static int sqfstar(int argc, char *argv[])
 		add_exclude(argv[i]);
 
 	initialise_threads(readq, fragq, bwriteq, fwriteq, !appending,
-		destination_file, "Sqfstar");
+		destination_file, "Sqfstar", overcommit);
 
 	res = compressor_init(comp, &stream, SQUASHFS_METADATA_SIZE, 0);
 	if(res)
 		BAD_ERROR("compressor_init failed\n");
 
-	dupl_block = malloc(1048576 * sizeof(struct file_info *));
-	if(dupl_block == NULL)
-		MEM_ERROR();
-
-	dupl_frag = malloc(block_size * sizeof(struct file_info *));
-	if(dupl_frag == NULL)
-		MEM_ERROR();
-
+	dupl_block = MALLOC(1048576 * sizeof(struct file_info *));
+	dupl_frag = MALLOC(block_size * sizeof(struct file_info *));
 	memset(dupl_block, 0, 1048576 * sizeof(struct file_info *));
 	memset(dupl_frag, 0, block_size * sizeof(struct file_info *));
 
@@ -7209,6 +7307,16 @@ static int sqfstar(int argc, char *argv[])
 		printf("Creating %d.%d filesystem on %s, block size %d.\n",
 			SQUASHFS_MAJOR, SQUASHFS_MINOR,
 			destination_file, block_size);
+
+	if(streaming) {
+		struct squashfs_super_block sblk;
+
+		memset(&sblk, 0, sizeof(struct squashfs_super_block));
+		sblk.s_magic = SQUASHFS_MAGIC_STREAMED;
+		SQUASHFS_INSWAP_SUPER_BLOCK(sblk);
+		write_destination(fd, SQUASHFS_START,
+			sizeof(struct squashfs_super_block), &sblk);
+	}
 
 	/*
 	 * store any compressor specific options after the superblock,
@@ -7248,37 +7356,42 @@ static int sqfstar(int argc, char *argv[])
 	sBlk.flags = SQUASHFS_MKFLAGS(noI, noD, noF, noX, noId, no_fragments,
 		always_use_fragments, duplicate_checking, exportable,
 		no_xattrs, comp_opts);
-	sBlk.mkfs_time = mkfs_time_opt ? mkfs_time : time(NULL);
+	if(mkfs_time_opt)
+		sBlk.mkfs_time = mkfs_time;
+	else if(mkfs_inode_opt)
+		sBlk.mkfs_time = inode_time_latest;
+	else
+		sBlk.mkfs_time = time(NULL);
 
 	disable_info();
 
 	while((fragment = get_frag_action(fragment)))
 		write_fragment(*fragment);
-	if(!reproducible)
-		unlock_fragments();
-	pthread_cleanup_push((void *) pthread_mutex_unlock, &fragment_mutex);
-	pthread_mutex_lock(&fragment_mutex);
-	while(fragments_outstanding) {
-		pthread_mutex_unlock(&fragment_mutex);
-		pthread_testcancel();
-		sched_yield();
-		pthread_mutex_lock(&fragment_mutex);
-	}
-	pthread_cleanup_pop(1);
 
-	queue_put(to_writer, NULL);
-	if(queue_get(from_writer) != 0)
-		EXIT_MKSQUASHFS();
-
+	sync_writer_thread();
 	pthread_cancel(writer_thread);
 
-	set_progressbar_state(FALSE);
+	if(!check_id_table_offset())
+		BAD_ERROR("id entry out of range after applying -uid-gid-offset offset\n");
+
 	write_filesystem_tables(&sBlk);
 
-	if(!nopad && (i = get_pos() & (4096 - 1))) {
-		char temp[4096] = {0};
-		write_destination(fd, get_pos(), 4096 - i, temp);
+	progressbar_finish();
+
+	if(!block_device && !streaming) {
+		res = ftruncate(fd, start_offset + get_dpos());
+		if(res != 0)
+			BAD_ERROR("Failed to truncate dest file because %s\n",
+				strerror(errno));
 	}
+
+	if(!nopad && (i = get_dpos() & (4096 - 1))) {
+		long long block = get_and_inc_dpos(4096 - i);
+		char temp[4096] = {0};
+		write_destination(fd, block, 4096 - i, temp);
+	}
+
+	write_superblock(&sBlk);
 
 	res = close(fd);
 
@@ -7317,7 +7430,13 @@ int main(int argc, char *argv[])
 	int Xhelp = FALSE;
 	struct file_buffer **fragment = NULL;
 	char *command;
+	int single_threaded = FALSE;
+	int overcommit = OVERCOMMIT_DEFAULT;
+	int repro_opt = FALSE;
+	int repro_time_opt = FALSE;
+	unsigned int repro_time;
 
+	check_sqfs_cmdline(argc, argv);
 	check_pager();
 
 	/* skip leading path components in invocation command */
@@ -7332,48 +7451,54 @@ int main(int argc, char *argv[])
 	if(strcmp(command, "sqfstar") == 0)
 		return sqfstar(argc, argv);
 
-	if(argc > 1 && strcmp(argv[1], "-version") == 0) {
-		print_version("mksquashfs");
-		exit(0);
-	}
-
-	block_log = slog(block_size);
-	calculate_queue_sizes(total_mem, &readq, &fragq, &bwriteq, &fwriteq);
-
 	/* Find the first option */
         for(i = 1; i < argc && (argv[i][0] != '-' || strcmp(argv[i], "-") == 0);
 									i++);
 
+	/* Scan the command line for any -no-pager option.  This needs to be
+	 * parsed before any help options or help output on error which will by
+	 * default go to the pager */
+	for(j = i; j < argc; j++) {
+		if(strcmp(argv[j], "-no-pager") == 0)
+			no_pager = TRUE;
+		else if(strcmp(argv[j], "-cols") == 0) {
+			if((++j == argc) || !parse_num(argv[j], &user_cols))
+				mksquashfs_option_help(argv[j - 1], "mksquashfs: -cols missing or invalid column width\n");
+			if(user_cols < 0)
+				mksquashfs_option_help(argv[j - 1], "mksquashfs: -cols should be 0 or larger\n");
+		} else if(option_with_arg(argv[j], option_table))
+			j++;
+	}
+
 	/* Scan the command line for options that will immediately quit afterwards */
 	for(j = i; j < argc; j++) {
 		if(strcmp(argv[j], "-help") == 0 || strcmp(argv[j], "-h") == 0)
-			mksquashfs_help(FALSE);
+			mksquashfs_help(NULL);
 		else if(strcmp(argv[j], "-help-all") == 0 || strcmp(argv[j], "-ha") == 0)
 			mksquashfs_help_all();
 		else if(strcmp(argv[j], "-help-option") == 0 || strcmp(argv[j], "-ho") == 0) {
-			if(++j == argc) {
-				ERROR("mksquashfs: %s missing regex\n", argv[j - 1]);
-				mksquashfs_option_help(argv[j - 1]);
-			}
-
+			if(++j == argc)
+				mksquashfs_option_help(argv[j - 1], "mksquashfs: %s missing regex\n", argv[j - 1]);
 			mksquashfs_option(argv[j - 1], argv[j]);
 		} else if(strcmp(argv[j], "-help-section") == 0 || strcmp(argv[j], "-hs") == 0) {
-			if(++j == argc) {
-				ERROR("mksquashfs: %s missing section\n", argv[j - 1]);
-				mksquashfs_option_help(argv[j - 1]);
-			}
-
+			if(++j == argc)
+				mksquashfs_option_help(argv[j - 1], "mksquashfs: %s missing section\n", argv[j - 1]);
 			mksquashfs_section(argv[j - 1], argv[j]);
 		} else if(strcmp(argv[j], "-help-comp") == 0) {
-			if(++j == argc) {
-				ERROR("mksquashfs: -help-comp missing compressor name\n");
-				mksquashfs_option_help(argv[j - 1]);
-			}
-
+			if(++j == argc)
+				mksquashfs_option_help(argv[j - 1], "mksquashfs: -help-comp missing compressor name\n");
 			print_compressor_options(argv[j], "mksquashfs");
 			exit(0);
 		} else if(strcmp(argv[j], "-mem-default") == 0) {
 			printf("%d\n", total_mem);
+			exit(0);
+		} else if(strcmp(argv[j], "-fix") == 0) {
+			if(++j == argc)
+				mksquashfs_option_help(argv[j - 1], "mksquashfs: -fix missing filename\n");
+			fix_file(argv[j]);
+			exit(0);
+		} else if(strcmp(argv[j], "-version") == 0 || strcmp(argv[j], "--version") == 0) {
+			print_version("mksquashfs");
 			exit(0);
 		} else if(strcmp(argv[j], "-e") == 0)
 			break;
@@ -7392,10 +7517,8 @@ int main(int argc, char *argv[])
 		struct compressor *prev_comp = comp;
 		
 		if(strcmp(argv[j], "-comp") == 0) {
-			if(++j == argc) {
-				ERROR("mksquashfs: -comp missing compression type\n");
-				mksquashfs_option_help(argv[j - 1]);
-			}
+			if(++j == argc)
+				mksquashfs_option_help(argv[j - 1], "mksquashfs: -comp missing compression type\n");
 			comp = lookup_compressor(argv[j]);
 			if(!comp->supported) {
 				ERROR("mksquashfs: Compressor \"%s\" is not "
@@ -7421,6 +7544,9 @@ int main(int argc, char *argv[])
 			j++;
 	}
 
+	block_log = slog(block_size);
+	calculate_queue_sizes(total_mem, &readq, &fragq, &bwriteq, &fwriteq);
+
 	/*
 	 * if no -comp option specified lookup default compressor.  Note the
 	 * Makefile ensures the default compressor has been built, and so we
@@ -7435,11 +7561,13 @@ int main(int argc, char *argv[])
 	}
 
 	if(i < 3) {
-		if(i == 1)
-			ERROR("mksquashfs: fatal error: no source or output filesystem specified on command line\n\n");
-		else
-			ERROR("mksquashfs: fatal error: no output filesystem specified on command line\n\n");
-		mksquashfs_help(TRUE);
+		if(i == 1) {
+			if(argc == 1)
+				mksquashfs_help("mksquashfs: fatal error: no source or output filesystem specified on command line\n\n");
+			else
+				mksquashfs_help("mksquashfs: fatal error: options (e.g. -comp) should be specified after source and output filesystem\n\n");
+		} else
+			mksquashfs_help("mksquashfs: fatal error: no output filesystem specified on command line\n\n");
 	}
 
 	option_offset = i;
@@ -7466,11 +7594,10 @@ int main(int argc, char *argv[])
 		} else if(strcmp(argv[i], "-tar") == 0) {
 			tarfile = TRUE;
 			always_use_fragments = TRUE;
+			force_single_threaded = TRUE;
 		} else if(strcmp(argv[i], "-pf") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -pf missing filename\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -pf missing filename\n");
 			if(strcmp(argv[i], "-") == 0)
 				pseudo_stdin = TRUE;
 		} else if(strcmp(argv[i], "-e") == 0)
@@ -7491,17 +7618,21 @@ int main(int argc, char *argv[])
 				"reading from stdin can be specified\n");
 
 	for(i = option_offset; i < argc; i++) {
-		if(strcmp(argv[i], "-ignore-zeros") == 0)
+		if(strcmp(argv[i], "-no-pager") == 0)
+			; /* ignore, already parsed */
+		else if(strcmp(argv[i], "-stream") == 0)
+			streaming = TRUE;
+		else if(strcmp(argv[i], "-cols") == 0)
+			i++; /* already parsed */
+		else if(strcmp(argv[i], "-ignore-zeros") == 0)
 			ignore_zeros = TRUE;
 		else if(strcmp(argv[i], "-one-file-system") == 0)
 			one_file_system = TRUE;
 		else if(strcmp(argv[i], "-one-file-system-x") == 0)
 			one_file_system = one_file_system_x = TRUE;
 		else if(strcmp(argv[i], "-recovery-path") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -recovery-path missing pathname\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -recovery-path missing pathname\n");
 			recovery_pathname = argv[i];
 		} else if(strcmp(argv[i], "-no-hardlinks") == 0)
 			no_hardlinks = TRUE;
@@ -7509,224 +7640,202 @@ int main(int argc, char *argv[])
 					strcmp(argv[i], "-tarstyle") == 0)
 			tarstyle = TRUE;
 		else if(strcmp(argv[i], "-max-depth") == 0) {
-			if((++i == argc) || !parse_num_unsigned(argv[i], &max_depth)) {
-				ERROR("mksquashfs: -max-depth missing or invalid value\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if((++i == argc) || !parse_num_unsigned(argv[i], &max_depth))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -max-depth missing or invalid value\n");
 		} else if(strcmp(argv[i], "-throttle") == 0) {
-			if((++i == argc) || !parse_number(argv[i], &sleep_time, 2)) {
-				ERROR("mksquashfs: -throttle missing or invalid value\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-			if(sleep_time > 99) {
-				ERROR("mksquashfs: -throttle value should be between 0 and 99\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if((++i == argc) || !parse_number(argv[i], &res, 2))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -throttle missing or invalid value\n");
+			if(res > 99)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -throttle value should be between 0 and 99\n");
+			set_sleep_time(res);
 			readq = 4;
+			force_single_threaded = TRUE;
 		} else if(strcmp(argv[i], "-limit") == 0) {
-			if((++i == argc) || !parse_number(argv[i], &sleep_time, 2)) {
-				ERROR("mksquashfs: -limit missing or invalid value\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-			if(sleep_time < 1 || sleep_time > 100) {
-				ERROR("mksquashfs: -limit value should be between 1 and 100\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-			sleep_time = 100 - sleep_time;
+			if((++i == argc) || !parse_number(argv[i], &res, 2))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -limit missing or invalid value\n");
+			if(res < 1 || res > 100)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -limit value should be between 1 and 100\n");
+			set_sleep_time(100 - res);;
 			readq = 4;
+			force_single_threaded = TRUE;
 		} else if(strcmp(argv[i], "-mkfs-time") == 0 ||
 				strcmp(argv[i], "-fstime") == 0) {
-			if((++i == argc) ||
-				(!parse_num_unsigned(argv[i], &mkfs_time) &&
-				!exec_date(argv[i], &mkfs_time))) {
-					ERROR("mksquashfs: %s missing or invalid time "
-						"value\n", argv[i - 1]);
-				mksquashfs_option_help(argv[i - 1]);
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing time value\n", argv[i - 1]);
+			else if(strcmp(argv[i], "inode") == 0)
+				mkfs_inode_opt = TRUE;
+			else if(!parse_num_unsigned(argv[i], &mkfs_time) &&
+					!exec_date(argv[i], &mkfs_time))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s invalid time value\n", argv[i - 1]);
+			else {
+				mkfs_time_opt = TRUE;
+				clamping = FALSE;
 			}
-			mkfs_time_opt = TRUE;
-		} else if(strcmp(argv[i], "-all-time") == 0) {
-			if((++i == argc) ||
-				(!parse_num_unsigned(argv[i], &all_time) &&
-				!exec_date(argv[i], &all_time))) {
-					ERROR("mksquashfs: -all-time missing or invalid time "
-						"value\n");
-				mksquashfs_option_help(argv[i - 1]);
+		} else if(strcmp(argv[i], "-all-time") == 0 || strcmp(argv[i], "-inode-time") == 0) {
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing time value\n", argv[i - 1]);
+			else if(strcmp(argv[i], "inode") == 0)
+				inode_inode_opt = TRUE;
+			else if(!parse_num_unsigned(argv[i], &inode_time) &&
+					!exec_date(argv[i], &inode_time))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s invalid time value\n", argv[i - 1]);
+			else {
+				inode_time_opt = TRUE;
+				clamping = FALSE;
 			}
-			all_time_opt = TRUE;
-			clamping = FALSE;
-		} else if(strcmp(argv[i], "-reproducible") == 0)
-			reproducible = TRUE;
-		else if(strcmp(argv[i], "-not-reproducible") == 0)
-			reproducible = FALSE;
-		else if(strcmp(argv[i], "-root-mode") == 0) {
-			if((++i == argc) || !parse_mode(argv[i], &root_mode)) {
-				ERROR("mksquashfs: -root-mode missing or invalid mode,"
-					" symbolic mode or octal number expected\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+		} else if(strcmp(argv[i], "-reproducible") == 0);
+			/* obsolete option, ignored and retained for backwards
+			 * compatibility */
+		else if(strcmp(argv[i], "-not-reproducible") == 0);
+			/* obsolete option, ignored and retained for backwards
+			 * compatibility */
+		else if(strcmp(argv[i], "-repro") == 0)
+			repro_opt = TRUE;
+		else if(strcmp(argv[i], "-repro-time") == 0) {
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -repro-time missing time value\n");
+			else if(!parse_num_unsigned(argv[i], &repro_time) &&
+					!exec_date(argv[i], &repro_time))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -repro-time invalid time value\n");
+			else
+				repro_time_opt = TRUE;
+		} else if(strcmp(argv[i], "-root-mode") == 0) {
+			if((++i == argc) || !parse_mode(argv[i], &root_mode))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-mode missing or invalid mode, symbolic mode or octal number expected\n");
 			root_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-uid") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -root-uid missing uid or user name\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-uid missing uid or user name\n");
 			res = get_uid_from_arg(argv[i], &root_uid);
 			if(res) {
 				if(res == -2)
-					ERROR("mksquashfs: -root-uid uid out of range\n");
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-uid uid out of range\n");
 				else
-					ERROR("mksquashfs: -root-uid invalid uid or "
-						"unknown user name\n");
-				mksquashfs_option_help(argv[i - 1]);
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-uid invalid uid or unknown user name\n");
 			}
 			root_uid_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-gid") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -root-gid missing gid or group name\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-gid missing gid or group name\n");
 			res = get_gid_from_arg(argv[i], &root_gid);
 			if(res) {
 				if(res == -2)
-					ERROR("mksquashfs: -root-gid gid out of range\n");
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-gid gid out of range\n");
 				else
-					ERROR("mksquashfs: -root-gid invalid gid or "
-						"unknown group name\n");
-				mksquashfs_option_help(argv[i - 1]);
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-gid invalid gid or unknown group name\n");
 			}
 			root_gid_opt = TRUE;
+		} else if(strcmp(argv[i], "-uid-gid-offset") == 0) {
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -uid-gid-offset missing offset\n");
+			res = get_uid_gid_offset_from_arg(argv[i], &uid_gid_offset);
+			if(res) {
+				if(res == -2)
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -uid-gid-offset out of range\n");
+				else
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -uid-gid-offset invalid number\n");
+			}
 		} else if(strcmp(argv[i], "-root-time") == 0) {
-			if((++i == argc) ||
-					(!parse_num_unsigned(argv[i], &root_time) &&
-					!exec_date(argv[i], &root_time))) {
-				ERROR("mksquashfs: -root-time missing or invalid time\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-			root_time_opt = TRUE;
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-time missing time value\n");
+			else if(strcmp(argv[i], "inode") == 0)
+				root_inode_opt = TRUE;
+			else if(!parse_num_unsigned(argv[i], &root_time) &&
+					!exec_date(argv[i], &root_time))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-time invalid time value\n");
+			else
+				root_time_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-mode") == 0) {
-			if((++i == argc) || !parse_mode(argv[i], &default_mode)) {
-				ERROR("mksquashfs: -default-mode missing or invalid mode,"
-					" symbolic mode or octal number expected\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if((++i == argc) || !parse_mode(argv[i], &default_mode))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -default-mode missing or invalid mode, symbolic mode or octal number expected\n");
 			root_mode = default_mode;
 			default_mode_opt = root_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-uid") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -default-uid missing uid or user name\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -default-uid missing uid or user name\n");
 			res = get_uid_from_arg(argv[i], &default_uid);
 			if(res) {
 				if(res == -2)
-					ERROR("mksquashfs: -default-uid uid out of range\n");
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -default-uid uid out of range\n");
 				else
-					ERROR("mksquashfs: -default-uid invalid uid or "
-						"unknown user name\n");
-				mksquashfs_option_help(argv[i - 1]);
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -default-uid invalid uid or unknown user name\n");
 			}
 			root_uid = default_uid;
 			default_uid_opt = root_uid_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-gid") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -default-gid missing gid or group name\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -default-gid missing gid or group name\n");
 			res = get_gid_from_arg(argv[i], &default_gid);
 			if(res) {
 				if(res == -2)
-					ERROR("mksquashfs: -default-gid gid out of range\n");
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -default-gid gid out of range\n");
 				else
-					ERROR("mksquashfs: -default-gid invalid gid or "
-						"unknown group name\n");
-				mksquashfs_option_help(argv[i - 1]);
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -default-gid invalid gid or unknown group name\n");
 			}
 			root_gid = default_gid;
 			default_gid_opt = root_gid_opt = TRUE;
 		} else if(strcmp(argv[i], "-log") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -log missing log file\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -log missing log file\n");
 			open_log_file(argv[i]);
 
 		} else if(strcmp(argv[i], "-action") == 0 ||
 				strcmp(argv[i], "-a") ==0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: %s missing action\n", argv[i - 1]);
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing action\n", argv[i - 1]);
 			res = parse_action(argv[i], ACTION_LOG_NONE);
 			if(res == 0)
 				exit(1);
 
 		} else if(strcmp(argv[i], "-log-action") == 0 ||
 				strcmp(argv[i], "-va") ==0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: %s missing action\n", argv[i - 1]);
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing action\n", argv[i - 1]);
 			res = parse_action(argv[i], ACTION_LOG_VERBOSE);
 			if(res == 0)
 				exit(1);
 
 		} else if(strcmp(argv[i], "-true-action") == 0 ||
 				strcmp(argv[i], "-ta") ==0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: %s missing action\n", argv[i - 1]);
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing action\n", argv[i - 1]);
 			res = parse_action(argv[i], ACTION_LOG_TRUE);
 			if(res == 0)
 				exit(1);
 
 		} else if(strcmp(argv[i], "-false-action") == 0 ||
 				strcmp(argv[i], "-fa") ==0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: %s missing action\n", argv[i - 1]);
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing action\n", argv[i - 1]);
 			res = parse_action(argv[i], ACTION_LOG_FALSE);
 			if(res == 0)
 				exit(1);
 
 		} else if(strcmp(argv[i], "-action-file") == 0 ||
 				strcmp(argv[i], "-af") ==0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: %s missing filename\n", argv[i - 1]);
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing filename\n", argv[i - 1]);
 			if(read_action_file(argv[i], ACTION_LOG_NONE) == FALSE)
 				exit(1);
 
 		} else if(strcmp(argv[i], "-log-action-file") == 0 ||
 				strcmp(argv[i], "-vaf") ==0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: %s missing filename\n", argv[i - 1]);
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing filename\n", argv[i - 1]);
 			if(read_action_file(argv[i], ACTION_LOG_VERBOSE) == FALSE)
 				exit(1);
 
 		} else if(strcmp(argv[i], "-true-action-file") == 0 ||
 				strcmp(argv[i], "-taf") ==0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: %s missing filename\n", argv[i - 1]);
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing filename\n", argv[i - 1]);
 			if(read_action_file(argv[i], ACTION_LOG_TRUE) == FALSE)
 				exit(1);
 
 		} else if(strcmp(argv[i], "-false-action-file") == 0 ||
 				strcmp(argv[i], "-faf") ==0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: %s missing filename\n", argv[i - 1]);
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing filename\n", argv[i - 1]);
 			if(read_action_file(argv[i], ACTION_LOG_FALSE) == FALSE)
 				exit(1);
 
@@ -7750,27 +7859,19 @@ int main(int argc, char *argv[])
 			if(read_pseudo_file(argv[++i], destination_file) == FALSE)
 				exit(1);
 		} else if(strcmp(argv[i], "-p") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -p missing pseudo file definition\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -p missing pseudo file definition\n");
 			if(read_pseudo_definition(argv[i], destination_file) == FALSE)
 				exit(1);
 		} else if(strcmp(argv[i], "-pd") == 0 || strcmp(argv[i], "-pseudo-dir") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: %s missing pseudo file definition\n",
-					argv[i - 1]);
-				mksquashfs_option_help(argv[i - 1]);
-			}
-
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing pseudo file definition\n", argv[i - 1]);
 			pseudo_dir = read_pseudo_dir(argv[i]);
 			if(pseudo_dir == NULL)
 				exit(1);
 		} else if(strcmp(argv[i], "-recover") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -recover missing recovery file\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -recover missing recovery file\n");
 			read_recovery_data(argv[i], destination_file);
 		} else if(strcmp(argv[i], "-no-recovery") == 0)
 			recover = FALSE;
@@ -7793,21 +7894,13 @@ int main(int argc, char *argv[])
 		else if(strcmp(argv[i], "-offset") == 0 ||
 						strcmp(argv[i], "-o") == 0) {
 			if((++i == argc) ||
-				!parse_numberll(argv[i], &start_offset, 1)) {
-					ERROR("mksquashfs: %s missing or invalid offset "
-						"size\n", argv[i - 1]);
-				mksquashfs_option_help(argv[i - 1]);
-			}
+					!parse_numberll(argv[i], &start_offset, 1))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing or invalid offset size\n", argv[i - 1]);
 		} else if(strcmp(argv[i], "-processors") == 0) {
-			if((++i == argc) || !parse_num(argv[i], &processors)) {
-				ERROR("mksquashfs: -processors missing or invalid "
-					"processor number\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-			if(processors < 1) {
-				ERROR("mksquashfs: -processors should be 1 or larger\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if((++i == argc) || !parse_num(argv[i], &processors))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -processors missing or invalid processor number\n");
+			if(processors < 1)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -processors should be 1 or larger\n");
 		} else if(strcmp(argv[i], "-read-queue") == 0) {
 			if((++i == argc) || !parse_num(argv[i], &readq)) {
 				ERROR("mksquashfs: -read-queue missing or invalid "
@@ -7853,27 +7946,17 @@ int main(int argc, char *argv[])
 			}
 
 			if((++i == argc) ||
-					!parse_numberll(argv[i], &number, 1)) {
-				ERROR("mksquashfs: -mem missing or invalid mem size\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+					!parse_numberll(argv[i], &number, 1))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -mem missing or invalid mem size\n");
 
 			/*
 			 * convert from bytes to Mbytes, ensuring the value
 			 * does not overflow a signed int
 			 */
-			if(number >= (1LL << 51)) {
-				ERROR("mksquashfs: -mem invalid mem size\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(number >= (1LL << 51))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -mem invalid mem size\n");
 
 			total_mem = number / 1048576;
-			if(total_mem < (SQUASHFS_LOWMEM / SQUASHFS_TAKE)) {
-				ERROR("mksquashfs: -mem should be %d Mbytes or "
-					"larger\n",
-					SQUASHFS_LOWMEM / SQUASHFS_TAKE);
-				mksquashfs_option_help(argv[i - 1]);
-			}
 			calculate_queue_sizes(total_mem, &readq, &fragq,
 				&bwriteq, &fwriteq);
 		} else if(strcmp(argv[i], "-mem-percent") == 0) {
@@ -7891,11 +7974,8 @@ int main(int argc, char *argv[])
 			 */
 			if((++i == argc) ||
 					!parse_number(argv[i], &percent, 2) ||
-					(percent < 1)) {
-				ERROR("mksquashfs: -mem-percent missing or invalid "
-					"percentage: it should be 1 - 75%\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+					(percent < 1))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -mem-percent missing or invalid percentage: it should be 1 - 75%%\n");
 
 			phys_mem = get_physical_memory();
 
@@ -7905,42 +7985,23 @@ int main(int argc, char *argv[])
 				exit(1);
 			}
 
-			if(multiply_overflow(phys_mem, percent)) {
-				ERROR("mksquashfs: -mem-percent requested phys mem too "
-					"large\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(multiply_overflow(phys_mem, percent))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -mem-percent requested phys mem too large\n");
 
 			total_mem = phys_mem * percent / 100;
-
-			if(total_mem < (SQUASHFS_LOWMEM / SQUASHFS_TAKE)) {
-				ERROR("mksquashfs: -mem-percent mem too small, should "
-					"be %d Mbytes or larger\n",
-					SQUASHFS_LOWMEM / SQUASHFS_TAKE);
-				mksquashfs_option_help(argv[i - 1]);
-			}
 
 			calculate_queue_sizes(total_mem, &readq, &fragq,
 				&bwriteq, &fwriteq);
 		} else if(strcmp(argv[i], "-b") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -b missing block size\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-			if(!parse_number(argv[i], &block_size, 1)) {
-				ERROR("mksquashfs: -b invalid block size\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-			if((block_log = slog(block_size)) == 0) {
-				ERROR("mksquashfs: -b block size not power of two or "
-					"not between 4096 and 1Mbyte\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -b missing block size\n");
+			if(!parse_number(argv[i], &block_size, 1))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -b invalid block size\n");
+			if((block_log = slog(block_size)) == 0)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -b block size not power of two or not between 4096 and 1Mbyte\n");
 		} else if(strcmp(argv[i], "-ef") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -ef missing filename\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -ef missing filename\n");
 			exclude_option = TRUE;
 		} else if(strcmp(argv[i], "-no-duplicates") == 0)
 			duplicate_checking = FALSE;
@@ -7956,58 +8017,40 @@ int main(int argc, char *argv[])
 			always_use_fragments = FALSE;
 
 		else if(strcmp(argv[i], "-sort") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -sort missing filename\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -sort missing filename\n");
 		} else if(strcmp(argv[i], "-all-root") == 0 ||
 				strcmp(argv[i], "-root-owned") == 0) {
 			global_uid = global_gid = 0;
 			global_uid_opt = global_gid_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-file-mode") == 0) {
-			if((++i == argc) || !parse_mode(argv[i], &global_file_mode)) {
-				ERROR("mksquashfs: -force-file-mode missing or invalid mode,"
-					" symbolic mode or octal number expected\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if((++i == argc) || !parse_mode(argv[i], &global_file_mode))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -force-file-mode missing or invalid mode, symbolic mode or octal number expected\n");
 			global_file_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-dir-mode") == 0) {
-			if((++i == argc) || !parse_mode(argv[i], &global_dir_mode)) {
-				ERROR("mksquashfs: -force-dir-mode missing or invalid mode,"
-					" symbolic mode or octal number expected\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
+			if((++i == argc) || !parse_mode(argv[i], &global_dir_mode))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -force-dir-mode missing or invalid mode, symbolic mode or octal number expected\n");
 			global_dir_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-uid") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -force-uid missing uid or user name\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -force-uid missing uid or user name\n");
 			res = get_uid_from_arg(argv[i], &global_uid);
 			if(res) {
 				if(res == -2)
-					ERROR("mksquashfs: -force-uid uid out of range\n");
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -force-uid uid out of range\n");
 				else
-					ERROR("mksquashfs: -force-uid invalid uid or "
-						"unknown user name\n");
-				mksquashfs_option_help(argv[i - 1]);
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -force-uid invalid uid or unknown user name\n");
 			}
 			global_uid_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-gid") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -force-gid missing gid or group name\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -force-gid missing gid or group name\n");
 			res = get_gid_from_arg(argv[i], &global_gid);
 			if(res) {
 				if(res == -2)
-					ERROR("mksquashfs: -force-gid gid out of range\n");
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -force-gid gid out of range\n");
 				else
-					ERROR("mksquashfs: -force-gid invalid gid or "
-						"unknown group name\n");
-				mksquashfs_option_help(argv[i - 1]);
+					mksquashfs_option_help(argv[i - 1], "mksquashfs: -force-gid invalid gid or unknown group name\n");
 			}
 			global_gid_opt = TRUE;
 		} else if(strcmp(argv[i], "-pseudo-override") == 0)
@@ -8037,12 +8080,8 @@ int main(int argc, char *argv[])
 
 		else if(strcmp(argv[i], "-no-xattrs") == 0) {
 			if(xattr_exclude_preg || xattr_include_preg ||
-							add_xattrs()) {
-				ERROR("mksquashfs: -no-xattrs should not be used in "
-					"combination with -xattrs-* options\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-
+							add_xattrs())
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -no-xattrs should not be used in combination with -xattrs-* options\n");
 			no_xattrs = TRUE;
 
 		} else if(strcmp(argv[i], "-xattrs") == 0) {
@@ -8059,10 +8098,9 @@ int main(int argc, char *argv[])
 				ERROR("mksquashfs: xattrs are unsupported in "
 					"this build\n");
 				exit(1);
-			} else if(++i == argc) {
-				ERROR("mksquashfs: -xattrs-exclude missing regex pattern\n");
-				mksquashfs_option_help(argv[i - 1]);
-			} else {
+			} else if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -xattrs-exclude missing regex pattern\n");
+			else {
 				xattr_exclude_preg = xattr_regex(argv[i], "exclude");
 				no_xattrs = FALSE;
 			}
@@ -8072,10 +8110,9 @@ int main(int argc, char *argv[])
 				ERROR("mksquashfs: xattrs are unsupported in "
 					"this build\n");
 				exit(1);
-			} else if(++i == argc) {
-				ERROR("mksquashfs: -xattrs-include missing regex pattern\n");
-				mksquashfs_option_help(argv[i - 1]);
-			} else {
+			} else if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -xattrs-include missing regex pattern\n");
+			else {
 				xattr_include_preg = xattr_regex(argv[i], "include");
 				no_xattrs = FALSE;
 			}
@@ -8084,10 +8121,9 @@ int main(int argc, char *argv[])
 				ERROR("mksquashfs: xattrs are unsupported in "
 					"this build\n");
 				exit(1);
-			} else if(++i == argc) {
-				ERROR("mksquashfs: -xattrs-add missing xattr argument\n");
-				mksquashfs_option_help(argv[i - 1]);
-			} else {
+			} else if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -xattrs-add missing xattr argument\n");
+			else {
 				xattrs_add(argv[i]);
 				no_xattrs = FALSE;
 			}
@@ -8098,11 +8134,8 @@ int main(int argc, char *argv[])
 			display_info = TRUE;
 
 		else if(strcmp(argv[i], "-info-file") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -info-file missing filename\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}
-
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -info-file missing filename\n");
 			display_info = TRUE;
 			info_file = open_info_file(argv[i]);
 
@@ -8123,10 +8156,8 @@ int main(int argc, char *argv[])
 			exit_on_error = TRUE;
 
 		else if(strcmp(argv[i], "-root-becomes") == 0) {
-			if(++i == argc) {
-				ERROR("mksquashfs: -root-becomes: missing name\n");
-				mksquashfs_option_help(argv[i - 1]);
-			}	
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-becomes: missing name\n");
 			root_name = argv[i];
 		} else if(strcmp(argv[i], "-percentage") == 0) {
 			progressbar_percentage();
@@ -8140,11 +8171,112 @@ int main(int argc, char *argv[])
 		} else if(strcmp(argv[i], "-comp") == 0) {
 			/* parsed previously */
 			i++;
+		} else if(strcmp(argv[i], "-small-readers") == 0) {
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -small-readers missing thread count\n");
+			if(force_single_threaded)
+				ERROR("Warning: ignoring -small-readers option because you're reading a tar file, using an Unsquashfs pseudo file or throttling I/O\n");
+			else if(!parse_num(argv[i], &res) || res == 0)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -small-readers invalid thread count\n");
+			else if(res > MAX_READER_THREADS) {
+				ERROR("mksquashfs: -small-readers thread count too large, it should be between 1 and %d\n", MAX_READER_THREADS);
+				if(file_limit() != -1 && MAX_READER_THREADS * 2 > file_limit())
+					ERROR("Note total reader threads (small and block readers) above %d will exceed your open file limit (ulimit -n less margin of %d)\n",
+							file_limit(), OPEN_FILE_MARGIN);
+				exit(1);
+			}
+			set_read_frag_threads(res);
+		} else if(strcmp(argv[i], "-block-readers") == 0) {
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -block-readers missing thread count\n");
+			if(force_single_threaded)
+				ERROR("Warning: ignoring -block-readers option because you're reading a tar file, using an Unsquashfs pseudo file or throttling I/O\n");
+			else if(!parse_num(argv[i], &res) || res == 0)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -block-readers invalid thread count\n");
+			else if(res > MAX_READER_THREADS) {
+				ERROR("mksquashfs: -block-readers thread count too large, it should be between 1 and %d\n", MAX_READER_THREADS);
+				if(file_limit() != -1 && MAX_READER_THREADS * 2 > file_limit())
+					ERROR("Note total reader threads (small and block readers) above %d will exceed your open file limit (ulimit -n less margin of %d)\n",
+							file_limit(), OPEN_FILE_MARGIN);
+				exit(1);
+			}
+			set_read_block_threads(res);
+		} else if(strcmp(argv[i], "-single-reader") == 0)
+			single_threaded = TRUE;
+		else if(strcmp(argv[i], "-overcommit") == 0) {
+			if((++i == argc) ||
+					!parse_number(argv[i], &overcommit, 2) ||
+					(overcommit > 100))
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -overcommit missing or invalid percentage: it should be 0 - 100%%\n");
 		} else
 			mksquashfs_invalid_option(argv[i]);
 	}
 
 	check_source_date_epoch();
+
+	/*
+	 * Both mkfs-time <timestamp> and mkfs-time <inode> cannot have both
+	 * been specified.  Note the extra check for !clamping is to distinquish
+	 * between the environment variable SOURCE_DATE_EPOCH which sets
+	 * mkfs_time_opt and clamping.
+	 */
+	if(mkfs_time_opt && mkfs_inode_opt && !clamping)
+		BAD_ERROR("Cannot specify both mkfs-time <timestamp> and mkfs-time inode\n");
+
+	/*
+	 * Both inode-time <timestamp> and inode-time <inode> cannot have both
+	 * been specified.  Note the extra check for !clamping is to distinquish
+	 * between the environment variable SOURCE_DATE_EPOCH which sets
+	 * inode_time_opt and clamping.
+	 */
+	if(inode_time_opt && inode_inode_opt && !clamping)
+		BAD_ERROR("Cannot specify both inode-time <timestamp> and inode-time inode\n");
+
+	/*
+	 * Both root-time <timestamp> and root-time <inode> cannot have both
+	 * been specified.
+	 */
+	if(root_time_opt && root_inode_opt)
+		BAD_ERROR("Cannot specify both root-time <timestamp> and root-time inode\n");
+
+	/*
+	 * Both mkfs-time <timestamp> and -repro cannot have both been
+	 * specified.  Note the extra check for !clamping is to distinquish
+	 * between the environment variable SOURCE_DATE_EPOCH which sets
+	 * mkfs_time_opt and clamping.
+	 */
+	if(repro_opt) {
+		if(mkfs_time_opt && !clamping)
+			BAD_ERROR("Cannot specify both -repro and mkfs-time <timestamp>\n");
+		else
+			mkfs_inode_opt = TRUE;
+	}
+
+	/* -repro-time and -repro cannot have both been specified */
+	if(repro_time_opt && repro_opt)
+		BAD_ERROR("Cannot specify both -repro and -repro-time <timestamp>\n");
+
+	/* -repro-time cannot have been specified with -mkfs-time inode,
+	 * -inode-time inode or SOURCE_DATE_EPOCH */
+	if(repro_time_opt) {
+		if(mkfs_inode_opt)
+			BAD_ERROR("Cannot specify both -repro-time <timestamp> and -mkfs-time inode\n");
+
+		if(inode_inode_opt)
+			BAD_ERROR("Cannot specify both -repro-time <timestamp> and -inode-time inode\n");
+
+		if(mkfs_time_opt && clamping)
+			BAD_ERROR("Cannot specify both -repro-time <timestamp> and SOURCE_DATE_EPOCH\n");
+
+		if(mkfs_time_opt && mkfs_time != repro_time)
+			BAD_ERROR("Cannot specify different timestamp with -repro-time <timestamp> and mkfs-time <timestamp>\n");
+
+		if(inode_time_opt && inode_time != repro_time)
+			BAD_ERROR("Cannot specify different timestamp with -repro-time <timestamp> and inode-time <timestamp>\n");
+
+		mkfs_time_opt = inode_time_opt = TRUE;
+		mkfs_time = inode_time = repro_time;
+	}
 
 	/* If cpiostyle is set, then file names  will be read-in
 	 * from standard in.  We do not expect to have any sources
@@ -8189,444 +8321,499 @@ int main(int argc, char *argv[])
 		EXIT_MKSQUASHFS();
 
 	/*
+	 * Streaming is incompatible with the progress bar, percentage output,
+	 * info output to stdout, and summary output
+	 *
+	 * Complain if -force-progress or -percentage have been used, as they
+	 * produce a conflict
+	 */
+	if(streaming) {
+		if(force_progress)
+			BAD_ERROR("-stream cannot be used with -force-progress\n");
+
+		if(percentage)
+			BAD_ERROR("-stream cannot be used wih -percentage\n");
+
+		/* -info cannot be used, unless it is to a file */
+		if(display_info && !info_file)
+			BAD_ERROR("-stream cannot be used with -info, use "
+				"-info-file instead\n");
+
+		/*
+		 * When streaming Mksquashfs cannot do duplicate checking as it
+		 * cannot read back the output filesystem.
+		 *
+		 * The progress bar and the summary output has to also be
+		 * disabled, as it is to stdout.
+		 */
+		duplicate_checking = FALSE;
+		progress = FALSE;
+		quiet = TRUE;
+	}
+
+	/*
 	 * Selecting both -no-progress and -percentage produces a conflict,
 	 * and so reject such command lines
 	 */
 	if(!progress && percentage)
-		BAD_ERROR("Only one of -no-progress and -percentage can be "
-			"specified.  Both causes a conflict.\n");
+			BAD_ERROR("Only one of -no-progress and -percentage can be "
+				"specified.  Both causes a conflict.\n");
 
-	/*
-	 * Selecting both -no-progress and -progress produces a conflict,
-	 * and so reject such command lines
-	 */
-	if(!progress && force_progress)
-		BAD_ERROR("Only one of -no-progress and -progress can be "
-			"specified.  Both causes a conflict.\n");
+		/*
+		 * Selecting both -no-progress and -progress produces a conflict,
+		 * and so reject such command lines
+		 */
+		if(!progress && force_progress)
+			BAD_ERROR("Only one of -no-progress and -progress can be "
+				"specified.  Both causes a conflict.\n");
 
-	/*
-	 * If the -info option has been selected then disable the
-	 * progress bar unless it has been explicitly enabled with
-	 * the -progress option
-	 */
-	if(display_info && !info_file)
-		progress = force_progress;
-		
-	/*
-	 * Sort all the xattr-add options now they're all processed
-	 */
-	sort_xattr_add_list();
+		/*
+		 * If the -info option has been selected then disable the
+		 * progress bar unless it has been explicitly enabled with
+		 * the -progress option
+		 */
+		if(display_info && !info_file)
+			progress = force_progress;
+			
+		/*
+		 * Sort all the xattr-add options now they're all processed
+		 */
+		sort_xattr_add_list();
 
-	/*
-	 * If -pseudo-override option has been specified and there are
-	 * no pseudo files then reset option.  -pseudo-override relies
-	 * on dir_scan2() being run, which won't be if there's no
-	 * actions or pseudo files
-	 */
-	if(pseudo_override && !get_pseudo())
-		pseudo_override = FALSE;
+		/*
+		 * If -pseudo-override option has been specified and there are
+		 * no pseudo files then reset option.  -pseudo-override relies
+		 * on dir_scan2() being run, which won't be if there's no
+		 * actions or pseudo files
+		 */
+		if(pseudo_override && !get_pseudo())
+			pseudo_override = FALSE;
 
 #ifdef SQUASHFS_TRACE
-	/*
-	 * Disable progress bar if full debug tracing is enabled.
-	 * The progress bar in this case just gets in the way of the
-	 * debug trace output
-	 */
-	progress = FALSE;
+		/*
+		 * Disable progress bar if full debug tracing is enabled.
+		 * The progress bar in this case just gets in the way of the
+		 * debug trace output
+		 */
+		progress = FALSE;
 #endif
 
-	if(one_file_system && source > 1) {
-		source_dev = malloc(source * sizeof(dev_t));
-		if(source_dev == NULL)
-			MEM_ERROR();
-	}
 
-	for(i = 0; i < source; i++) {
-		if(lstat(source_path[i], &source_buf) == -1) {
-			fprintf(stderr, "Cannot stat source directory \"%s\" "
-				"because %s\n", source_path[i],
-				strerror(errno));
-			EXIT_MKSQUASHFS();
-		}
+		if(!readers_sane())
+			BAD_ERROR("Changing from single reader default requires both -small-readers and -block-readers options to be specified\n");
 
-		if(one_file_system) {
-			if(source > 1)
-				source_dev[i] = source_buf.st_dev;
-			else
-				cur_dev = source_buf.st_dev;
-		}
-	}
+		/*
+		 * Some options only make sense with a single reader thread and
+		 * so override the default
+		 * */
+		if(single_threaded || force_single_threaded)
+			set_single_threaded();
 
-	if(stat(destination_file, &buf) == -1) {
-		if(errno == ENOENT) { /* Does not exist */
-			appending = FALSE;
-			fd = open(destination_file, O_CREAT | O_TRUNC | O_RDWR,
-				S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-			if(fd == -1) {
-				perror("Could not create destination file");
-				exit(1);
+		/*
+		 * Ensure the specified (or default) number of reader threads doesn't
+		 * exceed the maximum open file limit
+		 */
+		if(file_limit() != -1 && get_reader_num() > file_limit())
+			BAD_ERROR("Reader threads exceed open file limit. Please "
+				"increase open file limit with ulimit or decrease "
+				"number of reader threads (ulimit -n must be %d "
+				"more than number of reader threads)\n",
+				OPEN_FILE_MARGIN);
+
+		if(one_file_system && source > 1)
+			source_dev = MALLOC(source * sizeof(dev_t));
+
+		for(i = 0; i < source; i++) {
+			if(lstat(source_path[i], &source_buf) == -1) {
+				fprintf(stderr, "Cannot stat source directory \"%s\" "
+					"because %s\n", source_path[i],
+					strerror(errno));
+				EXIT_MKSQUASHFS();
 			}
 
-			/* ensure Mksquashfs doesn't try to read
-			 * the destination file as input, which
-			 * will result in an I/O loop */
-			if(stat(destination_file, &buf) == -1) {
-				/* disappered after creating? */
+			if(one_file_system) {
+				if(source > 1)
+					source_dev[i] = source_buf.st_dev;
+				else
+					cur_dev = source_buf.st_dev;
+			}
+		}
+
+		if(streaming) {
+			appending = FALSE;
+			fd = STDOUT_FILENO;
+		} else if(stat(destination_file, &buf) == -1) {
+			if(errno == ENOENT) { /* Does not exist */
+				appending = FALSE;
+				fd = open(destination_file, O_CREAT | O_TRUNC | O_RDWR,
+					S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+				if(fd == -1) {
+					perror("Could not create destination file");
+					exit(1);
+				}
+
+				/* ensure Mksquashfs doesn't try to read
+				 * the destination file as input, which
+				 * will result in an I/O loop */
+				if(stat(destination_file, &buf) == -1) {
+					/* disappered after creating? */
+					perror("Could not stat destination file");
+					exit(1);
+				}
+				ADD_ENTRY(buf);
+			} else {
 				perror("Could not stat destination file");
 				exit(1);
 			}
-			ADD_ENTRY(buf);
-		} else {
-			perror("Could not stat destination file");
-			exit(1);
-		}
-
-	} else {
-		if(!S_ISBLK(buf.st_mode) && !S_ISREG(buf.st_mode)) {
-			ERROR("Destination not block device or regular file\n");
-			exit(1);
-		}
-
-		if(tarfile && appending) {
-			ERROR("Appending is not supported reading tar files\n");
-			ERROR("To force Mksquashfs to write to this %s "
-				"use -noappend\n", S_ISBLK(buf.st_mode) ?
-				"block device" : "file");
-			EXIT_MKSQUASHFS();
-		}
-
-		if(S_ISBLK(buf.st_mode)) {
-			if((fd = open(destination_file, O_RDWR)) == -1) {
-				perror("Could not open block device as "
-					"destination");
-				exit(1);
-			}
-			block_device = 1;
 
 		} else {
-			fd = open(destination_file, (!appending ? O_TRUNC : 0) |
-				O_RDWR);
-			if(fd == -1) {
-				perror("Could not open regular file for "
-					"writing as destination");
+			if(!S_ISBLK(buf.st_mode) && !S_ISREG(buf.st_mode)) {
+				ERROR("Destination not block device or regular file\n");
 				exit(1);
 			}
-			/* ensure Mksquashfs doesn't try to read
-			 * the destination file as input, which
-			 * will result in an I/O loop */
-			ADD_ENTRY(buf);
-		}
-	}
 
-	/*
-	 * process the exclude files - must be done afer destination file has
-	 * been possibly created
-	 */
-	for(i = option_offset; i < argc; i++)
-		if(strcmp(argv[i], "-ef") == 0)
+			if(tarfile && appending) {
+				ERROR("Appending is not supported reading tar files\n");
+				ERROR("To force Mksquashfs to write to this %s "
+					"use -noappend\n", S_ISBLK(buf.st_mode) ?
+					"block device" : "file");
+				EXIT_MKSQUASHFS();
+			}
+
+			if(S_ISBLK(buf.st_mode)) {
+				if((fd = open(destination_file, O_RDWR)) == -1) {
+					perror("Could not open block device as "
+						"destination");
+					exit(1);
+				}
+				block_device = 1;
+
+			} else {
+				fd = open(destination_file, (!appending ? O_TRUNC : 0) |
+					O_RDWR);
+				if(fd == -1) {
+					perror("Could not open regular file for "
+						"writing as destination");
+					exit(1);
+				}
+				/* ensure Mksquashfs doesn't try to read
+				 * the destination file as input, which
+				 * will result in an I/O loop */
+				ADD_ENTRY(buf);
+			}
+		}
+
+		/*
+		 * process the exclude files - must be done afer destination file has
+		 * been possibly created
+		 */
+		for(i = option_offset; i < argc; i++)
+			if(strcmp(argv[i], "-ef") == 0)
+				/*
+				 * Note presence of filename arg has already
+				 * been checked
+				 */
+				process_exclude_file(argv[++i]);
+			else if(strcmp(argv[i], "-e") == 0)
+				break;
+			else if(option_with_arg(argv[i], option_table))
+				i++;
+
+		if(i != argc) {
+			if(++i == argc) {
+				ERROR("mksquashfs: -e missing arguments\n");
+				EXIT_MKSQUASHFS();
+			}
+			while(i < argc)
+				if(old_exclude)
+					old_add_exclude(argv[i++]);
+				else
+					add_exclude(argv[i++]);
+		}
+
+		/* process the sort files - must be done afer the exclude files  */
+		for(i = option_offset; i < argc; i++)
+			if(strcmp(argv[i], "-sort") == 0) {
+				if(tarfile)
+					BAD_ERROR("Sorting files is unsupported when "
+						"reading tar files\n");
+
+				res = read_sort_file(argv[++i], source, source_path);
+				if(res == FALSE)
+					BAD_ERROR("Failed to read sort file\n");
+				sorted ++;
+			} else if(strcmp(argv[i], "-e") == 0)
+				break;
+			else if(option_with_arg(argv[i], option_table))
+				i++;
+
+		if(appending) {
+			comp = read_super(fd, &sBlk, destination_file);
+			if(comp == NULL) {
+				ERROR("Failed to read existing filesystem - will not "
+					"overwrite - ABORTING!\n");
+				ERROR("To force Mksquashfs to write to this %s "
+					"use -noappend\n", block_device ?
+					"block device" : "file");
+				EXIT_MKSQUASHFS();
+			}
+
+			block_log = slog(block_size = sBlk.block_size);
+			noI = SQUASHFS_UNCOMPRESSED_INODES(sBlk.flags);
+			noD = SQUASHFS_UNCOMPRESSED_DATA(sBlk.flags);
+			noF = SQUASHFS_UNCOMPRESSED_FRAGMENTS(sBlk.flags);
+			noX = SQUASHFS_UNCOMPRESSED_XATTRS(sBlk.flags);
+			noId = SQUASHFS_UNCOMPRESSED_IDS(sBlk.flags);
+			no_fragments = SQUASHFS_NO_FRAGMENTS(sBlk.flags);
+			always_use_fragments = SQUASHFS_ALWAYS_FRAGMENTS(sBlk.flags);
+			duplicate_checking = SQUASHFS_DUPLICATES(sBlk.flags);
+			exportable = SQUASHFS_EXPORTABLE(sBlk.flags);
+			no_xattrs = SQUASHFS_NO_XATTRS(sBlk.flags);
+			comp_opts = SQUASHFS_COMP_OPTS(sBlk.flags);
+		}
+
+		initialise_threads(readq, fragq, bwriteq, fwriteq, !appending,
+			destination_file, "Mksquashfs", overcommit);
+
+		res = compressor_init(comp, &stream, SQUASHFS_METADATA_SIZE, 0);
+		if(res)
+			BAD_ERROR("compressor_init failed\n");
+
+		dupl_block = MALLOC(1048576 * sizeof(struct file_info *));
+		dupl_frag = MALLOC(block_size * sizeof(struct file_info *));
+		memset(dupl_block, 0, 1048576 * sizeof(struct file_info *));
+		memset(dupl_frag, 0, block_size * sizeof(struct file_info *));
+
+		if(!appending) {
+			int size;
+			void *comp_data = compressor_dump_options(comp, block_size,
+				&size);
+
+			if(!quiet)
+				printf("Creating %d.%d filesystem on %s, block size %d.\n",
+					SQUASHFS_MAJOR, SQUASHFS_MINOR,
+					destination_file, block_size);
+
+
+			if(streaming) {
+				struct squashfs_super_block sblk;
+
+				memset(&sblk, 0, sizeof(struct squashfs_super_block));
+				sblk.s_magic = SQUASHFS_MAGIC_STREAMED;
+				SQUASHFS_INSWAP_SUPER_BLOCK(sblk);
+				write_destination(fd, SQUASHFS_START,
+					sizeof(struct squashfs_super_block), &sblk);
+			}
+
 			/*
-			 * Note presence of filename arg has already
-			 * been checked
+			 * store any compressor specific options after the superblock,
+			 * and set the COMP_OPT flag to show that the filesystem has
+			 * compressor specfic options
 			 */
-			process_exclude_file(argv[++i]);
-		else if(strcmp(argv[i], "-e") == 0)
-			break;
-		else if(option_with_arg(argv[i], option_table))
-			i++;
-
-	if(i != argc) {
-		if(++i == argc) {
-			ERROR("mksquashfs: -e missing arguments\n");
-			EXIT_MKSQUASHFS();
-		}
-		while(i < argc)
-			if(old_exclude)
-				old_add_exclude(argv[i++]);
-			else
-				add_exclude(argv[i++]);
-	}
-
-	/* process the sort files - must be done afer the exclude files  */
-	for(i = option_offset; i < argc; i++)
-		if(strcmp(argv[i], "-sort") == 0) {
-			if(tarfile)
-				BAD_ERROR("Sorting files is unsupported when "
-					"reading tar files\n");
-
-			res = read_sort_file(argv[++i], source, source_path);
-			if(res == FALSE)
-				BAD_ERROR("Failed to read sort file\n");
-			sorted ++;
-		} else if(strcmp(argv[i], "-e") == 0)
-			break;
-		else if(option_with_arg(argv[i], option_table))
-			i++;
-
-	if(appending) {
-	        comp = read_super(fd, &sBlk, destination_file);
-	        if(comp == NULL) {
-			ERROR("Failed to read existing filesystem - will not "
-				"overwrite - ABORTING!\n");
-			ERROR("To force Mksquashfs to write to this %s "
-				"use -noappend\n", block_device ?
-				"block device" : "file");
-			EXIT_MKSQUASHFS();
-		}
-
-		block_log = slog(block_size = sBlk.block_size);
-		noI = SQUASHFS_UNCOMPRESSED_INODES(sBlk.flags);
-		noD = SQUASHFS_UNCOMPRESSED_DATA(sBlk.flags);
-		noF = SQUASHFS_UNCOMPRESSED_FRAGMENTS(sBlk.flags);
-		noX = SQUASHFS_UNCOMPRESSED_XATTRS(sBlk.flags);
-		noId = SQUASHFS_UNCOMPRESSED_IDS(sBlk.flags);
-		no_fragments = SQUASHFS_NO_FRAGMENTS(sBlk.flags);
-		always_use_fragments = SQUASHFS_ALWAYS_FRAGMENTS(sBlk.flags);
-		duplicate_checking = SQUASHFS_DUPLICATES(sBlk.flags);
-		exportable = SQUASHFS_EXPORTABLE(sBlk.flags);
-		no_xattrs = SQUASHFS_NO_XATTRS(sBlk.flags);
-		comp_opts = SQUASHFS_COMP_OPTS(sBlk.flags);
-	}
-
-	initialise_threads(readq, fragq, bwriteq, fwriteq, !appending,
-		destination_file, "Mksquashfs");
-
-	res = compressor_init(comp, &stream, SQUASHFS_METADATA_SIZE, 0);
-	if(res)
-		BAD_ERROR("compressor_init failed\n");
-
-	dupl_block = malloc(1048576 * sizeof(struct file_info *));
-	if(dupl_block == NULL)
-		MEM_ERROR();
-
-	dupl_frag = malloc(block_size * sizeof(struct file_info *));
-	if(dupl_frag == NULL)
-		MEM_ERROR();
-
-	memset(dupl_block, 0, 1048576 * sizeof(struct file_info *));
-	memset(dupl_frag, 0, block_size * sizeof(struct file_info *));
-
-	if(!appending) {
-		int size;
-		void *comp_data = compressor_dump_options(comp, block_size,
-			&size);
-
-		if(!quiet)
-			printf("Creating %d.%d filesystem on %s, block size %d.\n",
-				SQUASHFS_MAJOR, SQUASHFS_MINOR,
-				destination_file, block_size);
-
-		/*
-		 * store any compressor specific options after the superblock,
-		 * and set the COMP_OPT flag to show that the filesystem has
-		 * compressor specfic options
-		 */
-		if(comp_data) {
-			unsigned short c_byte = size | SQUASHFS_COMPRESSED_BIT;
-	
-			SQUASHFS_INSWAP_SHORTS(&c_byte, 1);
-			write_destination(fd, sizeof(struct squashfs_super_block),
-				sizeof(c_byte), &c_byte);
-			write_destination(fd, sizeof(struct squashfs_super_block) +
-				sizeof(c_byte), size, comp_data);
-			set_pos(sizeof(struct squashfs_super_block) + sizeof(c_byte) + size);
-			comp_opts = TRUE;
-		} else			
-			set_pos(sizeof(struct squashfs_super_block));
-	} else {
-		unsigned int last_directory_block, inode_dir_file_size,
-			root_inode_size, inode_dir_start_block,
-			compressed_data, inode_dir_inode_number,
-			inode_dir_parent_inode;
-		unsigned int root_inode_start =
-			SQUASHFS_INODE_BLK(sBlk.root_inode),
-			root_inode_offset =
-			SQUASHFS_INODE_OFFSET(sBlk.root_inode);
-		int inode_dir_offset, uncompressed_data;
-		long long bytes = read_filesystem(root_name, fd, &sBlk, &inode_table,
-				&data_cache, &directory_table,
-				&directory_data_cache, &last_directory_block,
-				&inode_dir_offset, &inode_dir_file_size,
-				&root_inode_size, &inode_dir_start_block,
-				&file_count, &sym_count, &dev_count, &dir_count,
-				&fifo_count, &sock_count, &total_bytes,
-				&total_inode_bytes, &total_directory_bytes,
-				&inode_dir_inode_number,
-				&inode_dir_parent_inode, add_old_root_entry,
-				&fragment_table, &inode_lookup_table);
-
-		if(bytes == 0) {
-			ERROR("Failed to read existing filesystem - will not "
-				"overwrite - ABORTING!\n");
-			ERROR("To force Mksquashfs to write to this block "
-				"device or file use -noappend\n");
-			EXIT_MKSQUASHFS();
-		}
-
-		set_pos(bytes);
-
-		if((fragments = sBlk.fragments)) {
-			fragment_table = realloc((char *) fragment_table,
-				((fragments + FRAG_SIZE - 1) & ~(FRAG_SIZE - 1))
-				 * sizeof(struct squashfs_fragment_entry)); 
-			if(fragment_table == NULL)
-				BAD_ERROR("Out of memory in save filesystem state\n");
-		}
-
-		if(!quiet) {
-			printf("Appending to existing %d.%d filesystem on "
-				"%s, block size %d\n", SQUASHFS_MAJOR,
-				SQUASHFS_MINOR, destination_file, block_size);
-			printf("All -b, -noI, -noD, -noF, -noX, -noId, "
-				"-no-duplicates, -no-fragments,\n"
-				"-always-use-fragments, -exportable and "
-				"-comp options ignored\n");
-			printf("\nIf appending is not wanted, please re-run "
-				"with -noappend specified!\n\n");
-		}
-
-		compressed_data = ((long long) inode_dir_offset +
-			inode_dir_file_size) & ~(SQUASHFS_METADATA_SIZE - 1);
-		uncompressed_data = ((long long) inode_dir_offset +
-			inode_dir_file_size) & (SQUASHFS_METADATA_SIZE - 1);
+			if(comp_data) {
+				unsigned short c_byte = size | SQUASHFS_COMPRESSED_BIT;
 		
-		/* save original filesystem state for restoring ... */
-		sfragments = fragments;
-		sbytes = bytes;
-		sinode_count = sBlk.inodes;
-		scache_bytes = root_inode_offset + root_inode_size;
-		sdirectory_cache_bytes = uncompressed_data;
-		sdata_cache = malloc(scache_bytes);
-		if(sdata_cache == NULL)
-			BAD_ERROR("Out of memory in save filesystem state\n");
-		sdirectory_data_cache = malloc(sdirectory_cache_bytes);
-		if(sdirectory_data_cache == NULL)
-			BAD_ERROR("Out of memory in save filesystem state\n");
-		memcpy(sdata_cache, data_cache, scache_bytes);
-		memcpy(sdirectory_data_cache, directory_data_cache +
-			compressed_data, sdirectory_cache_bytes);
-		sinode_bytes = root_inode_start;
-		stotal_bytes = total_bytes;
-		stotal_inode_bytes = total_inode_bytes;
-		stotal_directory_bytes = total_directory_bytes +
-			compressed_data;
-		sfile_count = file_count;
-		ssym_count = sym_count;
-		sdev_count = dev_count;
-		sdir_count = dir_count + 1;
-		sfifo_count = fifo_count;
-		ssock_count = sock_count;
-		sdup_files = dup_files;
-		sid_count = id_count;
-		write_recovery_data(&sBlk);
-		save_xattrs();
-
-		/*
-		 * set the filesystem state up to be able to append to the
-		 * original filesystem.  The filesystem state differs depending
-		 * on whether we're appending to the original root directory, or
-		 * if the original root directory becomes a sub-directory
-		 * (root-becomes specified on command line, here root_name !=
-		 * NULL)
-		 */
-		inode_bytes = inode_size = root_inode_start;
-		directory_size = last_directory_block;
-		cache_size = root_inode_offset + root_inode_size;
-		directory_cache_size = inode_dir_offset + inode_dir_file_size;
-		if(root_name) {
-			sdirectory_bytes = last_directory_block;
-			sdirectory_compressed_bytes = 0;
-			root_inode_number = inode_dir_parent_inode;
-			inode_no = sBlk.inodes + 2;
-			directory_bytes = last_directory_block;
-			directory_cache_bytes = uncompressed_data;
-			memmove(directory_data_cache, directory_data_cache +
-				compressed_data, uncompressed_data);
-			cache_bytes = root_inode_offset + root_inode_size;
-			add_old_root_entry(root_name, sBlk.root_inode,
-				inode_dir_inode_number, SQUASHFS_DIR_TYPE);
-			total_directory_bytes += compressed_data;
-			dir_count ++;
+				SQUASHFS_INSWAP_SHORTS(&c_byte, 1);
+				write_destination(fd, sizeof(struct squashfs_super_block),
+					sizeof(c_byte), &c_byte);
+				write_destination(fd, sizeof(struct squashfs_super_block) +
+					sizeof(c_byte), size, comp_data);
+				set_pos(sizeof(struct squashfs_super_block) + sizeof(c_byte) + size);
+				comp_opts = TRUE;
+			} else			
+				set_pos(sizeof(struct squashfs_super_block));
 		} else {
-			sdirectory_compressed_bytes = last_directory_block -
-				inode_dir_start_block;
-			sdirectory_compressed =
-				malloc(sdirectory_compressed_bytes);
-			if(sdirectory_compressed == NULL)
-				BAD_ERROR("Out of memory in save filesystem "
-					"state\n");
-			memcpy(sdirectory_compressed, directory_table +
-				inode_dir_start_block,
-				sdirectory_compressed_bytes); 
-			sdirectory_bytes = inode_dir_start_block;
-			root_inode_number = inode_dir_inode_number;
-			inode_no = sBlk.inodes + 1;
-			directory_bytes = inode_dir_start_block;
-			directory_cache_bytes = inode_dir_offset;
-			cache_bytes = root_inode_offset;
+			unsigned int last_directory_block, inode_dir_file_size,
+				root_inode_size, inode_dir_start_block,
+				compressed_data, inode_dir_inode_number,
+				inode_dir_parent_inode;
+			unsigned int root_inode_start =
+				SQUASHFS_INODE_BLK(sBlk.root_inode),
+				root_inode_offset =
+				SQUASHFS_INODE_OFFSET(sBlk.root_inode);
+			int inode_dir_offset, uncompressed_data;
+			long long bytes = read_filesystem(root_name, fd, &sBlk, &inode_table,
+					&data_cache, &directory_table,
+					&directory_data_cache, &last_directory_block,
+					&inode_dir_offset, &inode_dir_file_size,
+					&root_inode_size, &inode_dir_start_block,
+					&file_count, &sym_count, &dev_count, &dir_count,
+					&fifo_count, &sock_count, &total_bytes,
+					&total_inode_bytes, &total_directory_bytes,
+					&inode_dir_inode_number,
+					&inode_dir_parent_inode, add_old_root_entry,
+					&fragment_table, &inode_lookup_table);
+
+			if(bytes == 0) {
+				ERROR("Failed to read existing filesystem - will not "
+					"overwrite - ABORTING!\n");
+				ERROR("To force Mksquashfs to write to this block "
+					"device or file use -noappend\n");
+				EXIT_MKSQUASHFS();
+			}
+
+			set_pos(bytes);
+
+			if((fragments = sBlk.fragments))
+				fragment_table = REALLOC((char *) fragment_table,
+					((fragments + FRAG_SIZE - 1) & ~(FRAG_SIZE - 1))
+					 * sizeof(struct squashfs_fragment_entry)); 
+
+			if(!quiet) {
+				printf("Appending to existing %d.%d filesystem on "
+					"%s, block size %d\n", SQUASHFS_MAJOR,
+					SQUASHFS_MINOR, destination_file, block_size);
+				printf("All -b, -noI, -noD, -noF, -noX, -noId, "
+					"-no-duplicates, -no-fragments,\n"
+					"-always-use-fragments, -exportable and "
+					"-comp options ignored\n");
+				printf("\nIf appending is not wanted, please re-run "
+					"with -noappend specified!\n\n");
+			}
+
+			compressed_data = ((long long) inode_dir_offset +
+				inode_dir_file_size) & ~(SQUASHFS_METADATA_SIZE - 1);
+			uncompressed_data = ((long long) inode_dir_offset +
+				inode_dir_file_size) & (SQUASHFS_METADATA_SIZE - 1);
+			
+			/* save original filesystem state for restoring ... */
+			sfragments = fragments;
+			sbytes = bytes;
+			sinode_count = sBlk.inodes;
+			scache_bytes = root_inode_offset + root_inode_size;
+			sdirectory_cache_bytes = uncompressed_data;
+			sdata_cache = MALLOC(scache_bytes);
+			sdirectory_data_cache = MALLOC(sdirectory_cache_bytes);
+			memcpy(sdata_cache, data_cache, scache_bytes);
+			memcpy(sdirectory_data_cache, directory_data_cache +
+				compressed_data, sdirectory_cache_bytes);
+			sinode_bytes = root_inode_start;
+			stotal_bytes = total_bytes;
+			stotal_inode_bytes = total_inode_bytes;
+			stotal_directory_bytes = total_directory_bytes +
+				compressed_data;
+			sfile_count = file_count;
+			ssym_count = sym_count;
+			sdev_count = dev_count;
+			sdir_count = dir_count + 1;
+			sfifo_count = fifo_count;
+			ssock_count = sock_count;
+			sdup_files = dup_files;
+			sid_count = id_count;
+			write_recovery_data(&sBlk);
+			save_xattrs();
+
+			/*
+			 * set the filesystem state up to be able to append to the
+			 * original filesystem.  The filesystem state differs depending
+			 * on whether we're appending to the original root directory, or
+			 * if the original root directory becomes a sub-directory
+			 * (root-becomes specified on command line, here root_name !=
+			 * NULL)
+			 */
+			inode_bytes = inode_size = root_inode_start;
+			directory_size = last_directory_block;
+			cache_size = root_inode_offset + root_inode_size;
+			directory_cache_size = inode_dir_offset + inode_dir_file_size;
+			if(root_name) {
+				sdirectory_bytes = last_directory_block;
+				sdirectory_compressed_bytes = 0;
+				root_inode_number = inode_dir_parent_inode;
+				inode_no = sBlk.inodes + 2;
+				inode_start_no = sBlk.inodes + 1;
+				directory_bytes = last_directory_block;
+				directory_cache_bytes = uncompressed_data;
+				memmove(directory_data_cache, directory_data_cache +
+					compressed_data, uncompressed_data);
+				cache_bytes = root_inode_offset + root_inode_size;
+				add_old_root_entry(root_name, sBlk.root_inode,
+					inode_dir_inode_number, SQUASHFS_DIR_TYPE);
+				total_directory_bytes += compressed_data;
+				dir_count ++;
+			} else {
+				sdirectory_compressed_bytes = last_directory_block -
+					inode_dir_start_block;
+				sdirectory_compressed =
+					MALLOC(sdirectory_compressed_bytes);
+				memcpy(sdirectory_compressed, directory_table +
+					inode_dir_start_block,
+					sdirectory_compressed_bytes); 
+				sdirectory_bytes = inode_dir_start_block;
+				root_inode_number = inode_dir_inode_number;
+				inode_no = sBlk.inodes + 1;
+				inode_start_no = sBlk.inodes;
+				directory_bytes = inode_dir_start_block;
+				directory_cache_bytes = inode_dir_offset;
+				cache_bytes = root_inode_offset;
+			}
+
+			inode_count = file_count + dir_count + sym_count + dev_count +
+				fifo_count + sock_count;
 		}
 
-		inode_count = file_count + dir_count + sym_count + dev_count +
-			fifo_count + sock_count;
-	}
+		if(path)
+			paths = add_subdir(paths, path);
 
-	if(path)
-		paths = add_subdir(paths, path);
+		dump_actions(); 
+		dump_pseudos();
 
-	dump_actions(); 
-	dump_pseudos();
+		set_progressbar_state(progress);
 
-	set_progressbar_state(progress);
+		if(tarfile)
+			inode = process_tar_file(progress);
+		else if(tarstyle || cpiostyle)
+			inode = process_source(progress);
+		else if(!source)
+			inode = no_sources(progress);
+		else
+			inode = dir_scan(S_ISDIR(source_buf.st_mode), progress);
 
-	if(tarfile)
-		inode = process_tar_file(progress);
-	else if(tarstyle || cpiostyle)
-		inode = process_source(progress);
-	else if(!source)
-		inode = no_sources(progress);
-	else
-		inode = dir_scan(S_ISDIR(source_buf.st_mode), progress);
+		sBlk.root_inode = inode;
+		sBlk.inodes = inode_count;
+		sBlk.s_magic = SQUASHFS_MAGIC;
+		sBlk.s_major = SQUASHFS_MAJOR;
+		sBlk.s_minor = SQUASHFS_MINOR;
+		sBlk.block_size = block_size;
+		sBlk.block_log = block_log;
+		sBlk.flags = SQUASHFS_MKFLAGS(noI, noD, noF, noX, noId, no_fragments,
+			always_use_fragments, duplicate_checking, exportable,
+			no_xattrs, comp_opts);
+		if(mkfs_time_opt)
+			sBlk.mkfs_time = mkfs_time;
+		else if(mkfs_inode_opt)
+			sBlk.mkfs_time = inode_time_latest;
+		else
+			sBlk.mkfs_time = time(NULL);
 
-	sBlk.root_inode = inode;
-	sBlk.inodes = inode_count;
-	sBlk.s_magic = SQUASHFS_MAGIC;
-	sBlk.s_major = SQUASHFS_MAJOR;
-	sBlk.s_minor = SQUASHFS_MINOR;
-	sBlk.block_size = block_size;
-	sBlk.block_log = block_log;
-	sBlk.flags = SQUASHFS_MKFLAGS(noI, noD, noF, noX, noId, no_fragments,
-		always_use_fragments, duplicate_checking, exportable,
-		no_xattrs, comp_opts);
-	sBlk.mkfs_time = mkfs_time_opt ? mkfs_time : time(NULL);
-
-	disable_info();
+		disable_info();
 
 	while((fragment = get_frag_action(fragment)))
 		write_fragment(*fragment);
-	if(!reproducible)
-		unlock_fragments();
-	pthread_cleanup_push((void *) pthread_mutex_unlock, &fragment_mutex);
-	pthread_mutex_lock(&fragment_mutex);
-	while(fragments_outstanding) {
-		pthread_mutex_unlock(&fragment_mutex);
-		pthread_testcancel();
-		sched_yield();
-		pthread_mutex_lock(&fragment_mutex);
-	}
-	pthread_cleanup_pop(1);
 
-	queue_put(to_writer, NULL);
-	if(queue_get(from_writer) != 0)
-		EXIT_MKSQUASHFS();
-
+	sync_writer_thread();
 	pthread_cancel(writer_thread);
 
-	set_progressbar_state(FALSE);
+	if(!check_id_table_offset())
+		BAD_ERROR("id entry out of range after applying -uid-gid-offset offset\n");
+
 	write_filesystem_tables(&sBlk);
 
-	if(!nopad && (i = get_pos() & (4096 - 1))) {
-		char temp[4096] = {0};
-		write_destination(fd, get_pos(), 4096 - i, temp);
+	progressbar_finish();
+
+	if(!block_device && !streaming) {
+		res = ftruncate(fd, start_offset + get_dpos());
+		if(res != 0)
+			BAD_ERROR("Failed to truncate dest file because %s\n",
+				strerror(errno));
 	}
+
+	if(!nopad && (i = get_dpos() & (4096 - 1))) {
+		long long block = get_and_inc_dpos(4096 - i);
+		char temp[4096] = {0};
+		write_destination(fd, block, 4096 - i, temp);
+	}
+
+	write_superblock(&sBlk);
 
 	res = close(fd);
 

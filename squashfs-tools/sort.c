@@ -3,7 +3,7 @@
  * filesystem.
  *
  * Copyright (c) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2012,
- * 2013, 2014, 2021, 2022, 2024
+ * 2013, 2014, 2021, 2022, 2024, 2025
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -43,6 +43,7 @@
 #include "sort.h"
 #include "mksquashfs_error.h"
 #include "progressbar.h"
+#include "alloc.h"
 
 static int mkisofs_style = -1;
 
@@ -58,11 +59,8 @@ static void add_priority_list(struct dir_ent *dir, int priority)
 	struct priority_entry *new_priority_entry;
 
 	priority += 32768;
-	new_priority_entry = malloc(sizeof(struct priority_entry));
-	if(new_priority_entry == NULL)
-		MEM_ERROR();
-
-	new_priority_entry->dir = dir;;
+	new_priority_entry = MALLOC(sizeof(struct priority_entry));
+	new_priority_entry->dir = dir;
 	new_priority_entry->next = priority_list[priority];
 	priority_list[priority] = new_priority_entry;
 }
@@ -86,9 +84,7 @@ static int get_priority(char *filename, struct stat *buf, int priority)
 
 #define ADD_ENTRY(buf, priority) {\
 	int hash = buf.st_ino & 0xffff;\
-	struct sort_info *s;\
-	if((s = malloc(sizeof(struct sort_info))) == NULL) \
-		MEM_ERROR(); \
+	struct sort_info *s = MALLOC(sizeof(struct sort_info)); \
 	s->st_dev = buf.st_dev;\
 	s->st_ino = buf.st_ino;\
 	s->priority = priority;\
@@ -119,9 +115,9 @@ re_read:
 
 	for(i = 0, n = 0; i < source; i++) {
 		char *filename;
-		int res = asprintf(&filename, "%s/%s", source_path[i], path);
-		if(res == -1)
-			BAD_ERROR("asprintf failed in add_sort_list\n");
+		int res;
+
+		ASPRINTF(&filename, "%s/%s", source_path[i], path);
 		res = lstat(filename, &buf);
 		free(filename);
 		if(res == -1) {
@@ -287,7 +283,7 @@ int read_sort_file(char *filename, int source, char *source_path[])
 		} else if((errno == ERANGE) ||
 				(priority < -32768 || priority > 32767)) {
 			ERROR("Sort file \"%s\", entry \"%s\" has priority "
-				"outside range of -32767:32768.\n", filename,
+				"outside range of -32768:32767.\n", filename,
 				line_buffer);
 			goto failed;
 		}
@@ -329,33 +325,19 @@ void sort_files_and_write(struct dir_info *dir)
 {
 	int i;
 	struct priority_entry *entry;
-	squashfs_inode inode;
 	int duplicate_file;
-	struct file_info *file;
 
 	for(i = 65535; i >= 0; i--)
 		for(entry = priority_list[i]; entry; entry = entry->next) {
 			TRACE("%d: %s\n", i - 32768, pathname(entry->dir));
-			if(entry->dir->inode->inode == SQUASHFS_INVALID_BLK) {
-				file = write_file(entry->dir, &duplicate_file);
-				inode = create_inode(NULL, entry->dir,
-					SQUASHFS_FILE_TYPE, file->file_size,
-					file->start, file->blocks,
-					file->block_list,
-					file->fragment, NULL,
-					file->sparse);
-				if(duplicate_checking == FALSE) {
-					free_fragment(file->fragment);
-					free(file->block_list);
-				}
+			if(entry->dir->inode->read == FALSE) {
+				entry->dir->inode->file = write_file(entry->dir, &duplicate_file);
+				entry->dir->inode->read = TRUE;
 				INFO("file %s, uncompressed size %lld bytes %s"
 					"\n", pathname(entry->dir),
 					(long long)
 					entry->dir->inode->buf.st_size,
 					duplicate_file ? "DUPLICATE" : "");
-				entry->dir->inode->inode = inode;
-				entry->dir->inode->type = SQUASHFS_FILE_TYPE;
-				hardlnk_count --;
 			} else
 				INFO("file %s, uncompressed size %lld bytes "
 					"LINK\n", pathname(entry->dir),

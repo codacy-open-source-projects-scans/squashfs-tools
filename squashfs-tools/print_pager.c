@@ -1,7 +1,7 @@
 /*
  * Squashfs
  *
- * Copyright (c) 2024
+ * Copyright (c) 2024, 2025
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -34,12 +34,15 @@
 
 #include "error.h"
 #include "print_pager.h"
+#include "alloc.h"
 
 extern long long read_bytes(int, void *, long long);
 
-static char *pager_command = "/usr/bin/pager";
-static char *pager_name = "pager";
+static char **pager_argv = NULL;
+static char *pager_command = NULL;
 static int pager_from_env_var = FALSE;
+int no_pager = FALSE;
+int user_cols = -1;
 
 static char *get_base(char *pathname)
 {
@@ -74,75 +77,191 @@ static char *get_base(char *pathname)
 }
 
 
-int check_and_set_pager(char *pager)
+static inline int quoted_bs_char(char cur)
 {
-	int i, length = strlen(pager);
-	char *base;
-
-	/* Check string :-
-	 * 1. Isn't empty,
-	 * 2. Doesn't contain spaces, tabs, pipes, command separators or file
-	 *    redirects.
+	/*
+	 * Within double quoted strings Bash allows the characters $, `, ",\ and
+	 * newline to be backslashed.  Backslashes that are followed by one of
+	 * those characters are removed.  Backslashes preceeding other
+	 * characters are left unmodified.
 	 *
-	 * Note: this isn't an exhaustive check of what can't be in the
-	 *	 pager name, as the execlp() will do this.  It is more
-	 *	 intended to check for common shell metacharacters and
-	 *	 warn users this isn't supported in a friendlier way.
+	 * Following the principle of least surprise copy this behaviour.
 	 */
-	if(length == 0) {
-		ERROR("PAGER environment variable is empty!\n");
-		return FALSE;
-	}
+	return cur == '$' || cur == '`' || cur == '"' || cur == '\\' || cur == '\n';
+}
 
-	base = get_base(pager);
-	if(base == NULL) {
-		ERROR("PAGER doesn't have a name in it or has trailing '/', '.' or '..' characters!\n");
-		return FALSE;
-	}
 
-	for(i = 0; i < length; i ++) {
-		if(pager[i] == ' ' || pager[i] == '\t') {
-			ERROR("PAGER cannot have spaces or tabs!\n");
-			goto failed;
-		} else if(pager[i] == '|' || pager[i] == ';') {
-			ERROR("PAGER cannot have pipes or command separators!\n");
-			goto failed;
-		} else if(pager[i] == '<' || pager[i] == '>' || pager[i] == '&') {
-			ERROR("PAGER cannot have file redirections!\n");
-			goto failed;
+int next_arg_count(char *cur)
+{
+	int count = 0;
+	char sq = FALSE, dq = FALSE;
+
+	/* skip whitespace */
+	while(*cur == '\t' || *cur == ' ')
+		cur ++;
+
+	if(*cur == '\0')
+		return -1;
+
+	for(; *cur != '\0'; cur ++) {
+		if(!sq && !dq) {
+			/* Check string doesn't contain pipes, command separators or file
+			 * redirects.
+			 *
+			 * Note: this isn't an exhaustive check of what can't be in the
+			 *	 pager name, as the execlp() will do this.  It is more
+			 *	 intended to check for common shell metacharacters and
+			 *	 warn users this isn't supported in a friendlier way.
+			 */
+			if(*cur == '|' || *cur == ';')
+				return -2;
+			else if(*cur == '<' || *cur == '>' || *cur == '&')
+				return -3;
+			else if(*cur == '\'')
+				sq = TRUE;
+			else if(*cur == '"')
+				dq = TRUE;
+			else if(*cur == '\t' || *cur == ' ')
+			       break;
+			else if(*cur == '\\' && *(cur + 1) != '\0') {
+				count ++;
+				cur ++;
+			} else
+				count ++;
+		} else if(dq) {
+			if(*cur == '"')
+				dq = FALSE;
+			else if(*cur == '\\' && quoted_bs_char(*(cur + 1))) {
+				count ++;
+				cur ++;
+			} else
+				count ++;
+		} else if(sq) {
+			if(*cur == '\'')
+				sq = FALSE;
+			else
+				count ++;
 		}
 	}
 
-	pager_command = pager;
-	pager_name = base;
+	return (sq || dq) ? -4 : count;
+}
+
+
+char *next_arg_copy(char **pos, int count)
+{
+	char sq = FALSE, dq = FALSE;
+	char *arg = MALLOC(count + 1), *copy = arg;
+	char *cur = *pos;
+
+	/* skip whitespace */
+	while(*cur == '\t' || *cur == ' ')
+		cur ++;
+
+	for(; *cur != '\0'; cur ++) {
+		if(!sq && !dq) {
+			if(*cur == '\'')
+				sq = TRUE;
+			else if(*cur == '"')
+				dq = TRUE;
+			else if(*cur == '\t' || *cur == ' ')
+			       break;
+			else if(*cur == '\\' && *(cur + 1) != '\0')
+				*copy ++ = *++ cur;
+			else
+				*copy ++ = *cur;
+		} else if(dq) {
+			if(*cur == '"')
+				dq = FALSE;
+			else if(*cur == '\\' && quoted_bs_char(*(cur + 1)))
+				*copy ++ = *++ cur;
+			else
+				*copy ++ = *cur;
+		} else if(sq) {
+			if(*cur == '\'')
+				sq = FALSE;
+			else
+				*copy ++ = *cur;
+		}
+	}
+
+	*copy = '\0';
+	*pos = cur;
+	return arg;
+}
+
+
+char *next_arg(char **pos, int *result)
+{
+	*result = next_arg_count(*pos);
+
+	return (*result < 0) ? NULL : next_arg_copy(pos, *result);
+}
+
+
+int check_and_set_pager(char *pager)
+{
+	int args = 0, result;
+	char *base, *cur = pager;
+
+	 /* split PAGER into arguments */
+	while(*cur != '\0') {
+		char *arg = next_arg(&cur, &result);
+
+		if(result == -1)
+			break;
+		else if(result == -2) {
+			ERROR("PAGER cannot have shell special characters '|' or ';'!  Quote or backslash them to pass to pager command\n");
+			goto failed;
+		} else if(result == -3) {
+			ERROR("PAGER cannot have shell special characters '<', '>' or '&'!  Quote or backslash them to pass to pager command\n");
+			goto failed;
+		} else if(result == -4) {
+			ERROR("PAGER has unterminated single or double quoted string\n");
+			goto failed;
+		} else {
+			pager_argv = REALLOC(pager_argv, (args + 2) * sizeof(char *));
+			pager_argv[args++] = arg;
+		}
+	}
+
+	if(args == 0) {
+		no_pager = TRUE;
+		return TRUE;
+	}
+
+	base = get_base(pager_argv[0]);
+	if(base == NULL) {
+		ERROR("PAGER doesn't have a command name in it or it has trailing '/', '.' or '..' characters!\n");
+		goto failed;
+	}
+
+	pager_command = pager_argv[0];
+	pager_argv[0] = base;
 	pager_from_env_var = TRUE;
 	return TRUE;
 
 failed:
-	ERROR("If you want to do this, please use a wrapper script!\n");
+	for(int i = 0; i < args; i++)
+		free(pager_argv[i]);
+	free(pager_argv);
 	return FALSE;
 }
 
 
-static int determine_pager(void)
+static int determine_pager(char *name, char *path1, char *path2)
 {
 	int bytes, status, res, pipefd[2];
 	pid_t child;
 	char buffer[1024];
 
 	res = pipe(pipefd);
-	if(res == -1) {
-		ERROR("Error determining pager, pipe failed\n");
-		return UNKNOWN_PAGER;
-	}
+	if(res == -1)
+		BAD_ERROR("Error determining pager, pipe failed\n");
 
 	child = fork();
-	if(child == -1) {
-		ERROR("Error determining pager, fork failed\n");
-		close(pipefd[0]);
-		close(pipefd[1]);
-		return UNKNOWN_PAGER;
-	}
+	if(child == -1)
+		BAD_ERROR("Error determining pager, fork failed\n");
 
 	if(child == 0) { /* child */
 		close(pipefd[0]);
@@ -151,7 +270,9 @@ static int determine_pager(void)
 		if(res == -1)
 			exit(EXIT_FAILURE);
 
-		execlp(pager_command, pager_name, "--version", (char *) NULL);
+		execlp(path1, name, "--version", (char *) NULL);
+		if(path2)
+			execl(path2, name, "--version", (char *) NULL);
 		close(pipefd[1]);
 		exit(EXIT_FAILURE);
 	}
@@ -161,27 +282,18 @@ static int determine_pager(void)
 
 	bytes = read_bytes(pipefd[0], buffer, 1024);
 
-	if(bytes == -1) {
-		ERROR("Error determining pager\n");
-		close(pipefd[0]);
-		return UNKNOWN_PAGER;
-	}
+	if(bytes == -1)
+		BAD_ERROR("Error determining pager, read failed\n");
 
-	if(res == 1024) {
-		ERROR("Pager returned unexpectedly large amount of data for --version\n");
-		close(pipefd[0]);
-		return UNKNOWN_PAGER;
-	}
+	if(res == 1024)
+		BAD_ERROR("Pager (%s) returned unexpectedly large amount of data for --version\n", pager_command);
 
 	while(1) {
 		res = waitpid(child, &status, 0);
 		if(res != -1)
 			break;
-		else if(errno != EINTR) {
-			ERROR("Error determining pager, waitpid failed\n");
-			close(pipefd[0]);
-			return UNKNOWN_PAGER;
-		}
+		else if(errno != EINTR)
+			BAD_ERROR("Error determining pager, waitpid failed\n");
 	}
 
 	close(pipefd[0]);
@@ -201,7 +313,7 @@ static int determine_pager(void)
 }
 
 
-void wait_to_die(pid_t process)
+static void wait_to_die(pid_t process)
 {
 	int res, status;
 
@@ -215,30 +327,55 @@ void wait_to_die(pid_t process)
 		}
 	}
 
-	if(!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+	if(!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
 		ERROR("Pager failed to run or failed with an error status\n");
+		ERROR("Set PAGER to empty or use -no-pager to not use a pager\n");
+	}
 }
 
 
-FILE *exec_pager(pid_t *process)
+static void run_cmd(char *name, char *path1, char*path2, int no_arg)
+{
+	int pager = determine_pager(name, path1, path2);
+
+	if(pager == LESS_PAGER) {
+		execlp(path1, name, "--quit-if-one-screen", (char *) NULL);
+		if(path2)
+			execl(path2, name, "--quit-if-one-screen", (char *) NULL);
+	} else if(pager == MORE_PAGER) {
+		execlp(path1, name, "--exit-on-eof", (char *) NULL);
+		if(path2)
+			execl(path2, name, "--exit-on-eof", (char *) NULL);
+	} else if(no_arg) {
+		execlp(path1, name, (char *) NULL);
+		if(path2)
+			execl(path2, name, (char *) NULL);
+	}
+}
+
+
+void simple_cat()
+{
+	int c;
+
+	while((c = getchar()) != EOF)
+		putchar(c);
+}
+
+
+static FILE *exec_pager(pid_t *process)
 {
 	FILE *file;
-	int res, pipefd[2], pager = determine_pager();
+	int res, pipefd[2];
 	pid_t child;
 
 	res = pipe(pipefd);
-	if(res == -1) {
-		ERROR("Error executing pager, pipe failed\n");
-		return NULL;
-	}
+	if(res == -1)
+		BAD_ERROR("Error executing pager, pipe failed\n");
 
 	child = fork();
-	if(child == -1) {
-		ERROR("Error executing pager, fork failed\n");
-		close(pipefd[0]);
-		close(pipefd[1]);
-		return NULL;
-	}
+	if(child == -1)
+		BAD_ERROR("Error executing pager, fork failed\n");
 
 	if(child == 0) { /* child */
 		close(pipefd[1]);
@@ -247,41 +384,65 @@ FILE *exec_pager(pid_t *process)
 		if(res == -1)
 			exit(EXIT_FAILURE);
 
-		if(pager == LESS_PAGER)
-			execlp(pager_command, pager_name, "--quit-if-one-screen", (char *) NULL);
-		else if(pager == MORE_PAGER)
-			execlp(pager_command, pager_name, "--exit-on-eof", (char *) NULL);
-		else
-			execlp(pager_command, pager_name,  (char *) NULL);
+		if(pager_from_env_var) {
+			if(pager_argv[1] == NULL)
+				run_cmd(pager_argv[0], pager_command, NULL, TRUE);
+			else {
+				execvp(pager_command, pager_argv);
+				execv(pager_command, pager_argv);
+			}
+		} else
+			run_cmd("pager", "pager", "/usr/bin/pager", TRUE);
 
-		if(pager_from_env_var == FALSE) {
-			execl("/usr/bin/less", "less", "--quit-if-one-screen", (char *) NULL);
-			execl("/usr/bin/more", "more", "--exit-on-eof", (char *) NULL);
-			execl("/usr/bin/cat", "cat", (char *) NULL);
-		}
+		run_cmd("less", "less", "/usr/bin/less", FALSE);
+		run_cmd("more", "more", "/usr/bin/more", FALSE);
+		execlp("less", "less",  (char *) NULL);
+		execl("/usr/bin/less", "less", (char *) NULL);
+		execlp("more", "more",  (char *) NULL);
+		execl("/usr/bin/more", "more", (char *) NULL);
+		execlp("cat", "cat", (char *) NULL);
+		execl("/usr/bin/cat", "cat", (char *) NULL);
+		simple_cat();
 
 		close(pipefd[0]);
-		exit(EXIT_FAILURE);
+		exit(0);
 	}
 
 	/* parent */
 	close(pipefd[0]);
 
 	file = fdopen(pipefd[1], "w");
-	if(file == NULL) {
-		ERROR("Error executing pager, fdopen failed\n");
-		goto failed;
-	}
+	if(file == NULL)
+		BAD_ERROR("Error executing pager, fdopen failed\n");
 
 	*process = child;
 	return file;
+}
 
-failed:
-	res = kill(child, SIGKILL);
-	if(res == -1)
-	ERROR("Error executing pager, kill failed\n");
-	close(pipefd[1]);
-	return NULL;
+
+FILE *launch_pager(pid_t *process, int *cols)
+{
+	if(no_pager) {
+		*cols = get_column_width();
+		*process = 0;
+		return stdout;
+	} else if(isatty(STDOUT_FILENO)) {
+		*cols = get_column_width();
+		return exec_pager(process);
+	} else {
+		*cols = user_cols != -1 ? user_cols : 80;
+		*process = 0;
+		return stdout;
+	}
+}
+
+
+void delete_pager(FILE *pager, pid_t process)
+{
+	if(pager != stdout) {
+		fclose(pager);
+		wait_to_die(process);
+	}
 }
 
 
@@ -289,7 +450,9 @@ int get_column_width()
 {
 	struct winsize winsize;
 
-	if(ioctl(1, TIOCGWINSZ, &winsize) == -1) {
+	if(user_cols != -1)
+		return user_cols;
+	else if(ioctl(1, TIOCGWINSZ, &winsize) == -1) {
 		if(isatty(STDOUT_FILENO))
 			ERROR("TIOCGWINSZ ioctl failed, defaulting to 80 "
 				"columns\n");
@@ -302,18 +465,19 @@ int get_column_width()
 void autowrap_print(FILE *stream, char *text, int maxl)
 {
 	char *cur = text;
-	int first_line = TRUE, tab_out = 0, length = 0;
+	int tab_out = 0, length;
 
 	while(*cur != '\0') {
 		char *sol = cur, *lw = NULL, *eow = NULL;
 		int wrapped = FALSE;
 
-		while(length <= maxl && *cur != '\n' && *cur != '\0') {
-			if(*cur == '\t') {
-				length = (length + 8) & ~7;
-				if(first_line)
-					tab_out = length;
-			} else
+		for(length = 0; length < tab_out; length += 8)
+			fputc('\t', stream);
+
+		while((!maxl || length <= maxl) && *cur != '\n' && *cur != '\0') {
+			if(*cur == '\t')
+				tab_out = length = (length + 8) & ~7;
+			else
 				length ++;
 
 			if(*cur == '\t' || *cur == ' ')
@@ -321,11 +485,9 @@ void autowrap_print(FILE *stream, char *text, int maxl)
 			else
 				lw = cur;
 
-			if(length <= maxl)
+			if(!maxl || length <= maxl)
 				cur ++;
 		}
-
-		first_line = FALSE;
 
 		if(*cur == '\n')
 			cur ++;
@@ -335,7 +497,7 @@ void autowrap_print(FILE *stream, char *text, int maxl)
 			else if(cur - sol == 0)
 				cur ++;
 
-			if(tab_out >= maxl)
+			if(maxl && tab_out >= maxl)
 				tab_out = 0;
 
 			wrapped = TRUE;
@@ -347,13 +509,9 @@ void autowrap_print(FILE *stream, char *text, int maxl)
 		if(wrapped) {
 			fputc('\n', stream);
 
-			for(length = 0; length < tab_out; length += 8)
-				fputc('\t', stream);
-
 			while(*cur == ' ')
 				cur ++;
-		} else
-			length = 0;
+		}
 	}
 }
 
@@ -362,16 +520,10 @@ void autowrap_printf(FILE *stream, int maxl, char *fmt, ...)
 {
 	va_list ap;
 	char *text;
-	int res;
 
 	va_start(ap, fmt);
-	res = vasprintf(&text, fmt, ap);
+	VASPRINTF(&text, fmt, ap);
 	va_end(ap);
-
-	if(res == -1) {
-		ERROR("Vasprintf failed in autowrap_printf\n");
-		exit(1);
-	}
 
 	autowrap_print(stream, text, maxl);
 	free(text);

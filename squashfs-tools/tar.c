@@ -1,7 +1,7 @@
 /*
  * Squashfs
  *
- * Copyright (c) 2021, 2022, 2024
+ * Copyright (c) 2021, 2022, 2023, 2024, 2025
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -21,8 +21,10 @@
  * tar.c
  */
 
+#include <limits.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
@@ -35,13 +37,15 @@
 
 #include "squashfs_fs.h"
 #include "mksquashfs.h"
-#include "caches-queues-lists.h"
 #include "mksquashfs_error.h"
 #include "xattr.h"
 #include "tar.h"
 #include "progressbar.h"
 #include "info.h"
 #include "symbolic_mode.h"
+#include "reader.h"
+#include "caches-queues-lists.h"
+#include "alloc.h"
 
 #define TRUE 1
 #define FALSE 0
@@ -53,6 +57,9 @@ int default_gid_opt = FALSE;
 unsigned int default_gid;
 int default_mode_opt = FALSE;
 struct mode_data *default_mode;
+
+static long long sequence = 0;
+static struct reader *reader;
 
 static long long read_octal(char *s, int size)
 {
@@ -73,7 +80,7 @@ static long long read_octal(char *s, int size)
 }
 
 
-static long long read_binary(char *src, int size)
+static inline long long read_binary(char *src, int size)
 {
 	unsigned char *s = (unsigned char *) src;
 	long long res = 0;
@@ -85,12 +92,111 @@ static long long read_binary(char *src, int size)
 }
 
 
+static long long read_binary11(char *src)
+{
+
+	if(src[0] == 0 && src[1] == 0 && src[2] == 0) {
+		long long res = read_binary(src + 3, 8);
+
+		if(res >= 0)
+			return res;
+	}
+
+	return -1;
+}
+
+
+static int read_binary_neg(char *src, long long *res)
+{
+	unsigned char *s = (unsigned char *) src;
+
+	if(s[0] == 255 && s[1] == 255 && s[2] == 255) {
+		*res = read_binary(src + 3, 8);
+		return *res < 0;
+	} else
+		return FALSE;
+}
+
+
+static int read_number_neg(char *s, long long *res)
+{
+	if(*((unsigned char *) s) == 255)
+		return read_binary_neg(s + 1, res);
+	else if(*((signed char *) s) == -128)
+		*res = read_binary11(s + 1);
+	else
+		*res = read_octal(s, 12);
+
+	return *res != -1;
+}
+
+
 static long long read_number(char *s, int size)
 {
-	if(*((signed char *) s) == -128)
-		return read_binary(s + 1, size - 1);
-	else
+	if(*((signed char *) s) == -128) {
+		if(size == 8)
+			return read_binary(s + 1, 7);
+		else
+			return read_binary11(s + 1);
+	} else
 		return read_octal(s, size);
+}
+
+
+static long long read_pax_number(char **src, char expected)
+{
+	char *s = *src;
+	long long res = 0;
+
+	for(; *s >= '0' && *s <= '9'; s++) {
+		int digit = *s - '0';
+		if(res > LLONG_MAX / 10 || res * 10 > LLONG_MAX - digit)
+			return -1;
+		res = (res * 10) + digit;
+	}
+
+	if(*s != expected)
+		return -1;
+
+	*src = s + 1;
+	return res;
+}
+
+
+static long long read_pax_number_ext(char *s, int *bytes)
+{
+	long long res = 0;
+
+	*bytes = 0;
+	for(; *s >= '0' && *s <= '9'; s++) {
+		int digit = *s - '0';
+		if(res > LLONG_MAX / 10 || res * 10 > LLONG_MAX - digit)
+			return -1;
+		res = (res * 10) + digit;
+		*bytes += 1;
+	}
+	return res;
+}
+
+
+static int read_pax_number_neg(char *s, int *bytes, long long *res)
+{
+
+	if(*s != '-') {
+		*res = read_pax_number_ext(s, bytes);
+		return *res != -1;
+	} else {
+		*res = 0;
+		*bytes = 1;
+		for(s++; *s >= '0' && *s <= '9'; s++) {
+			int digit = *s - '0';
+			if(*res < LLONG_MIN / 10 || *res * 10 < LLONG_MIN + digit)
+				return FALSE;
+			*res = (*res * 10) - digit;
+			*bytes += 1;
+		}
+		return TRUE;
+	}
 }
 
 
@@ -119,11 +225,8 @@ static long long read_decimal(char *s, int maxsize, int *bytes)
 static char *read_long_string(int size, int skip)
 {
 	char buffer[512];
-	char *name = malloc(size + 1);
+	char *name = MALLOC(size + 1);
 	int i, res, length = size;
-
-	if(name == NULL)
-		MEM_ERROR();
 
 	for(i = 0; size > 0; i++) {
 		int expected = size > 512 ? 512 : size;
@@ -166,9 +269,7 @@ static char *read_long_string(int size, int skip)
 			}
 
 			memmove(name, filename, length + 1);
-			name = realloc(name, length + 1);
-			if(name == NULL)
-				MEM_ERROR();
+			name = REALLOC(name, length + 1);
 		}
 	}
 
@@ -227,7 +328,7 @@ static char *get_component(char *target, char **targname)
 	while(*target != '/' && *target != '\0')
 		target ++;
 
-	*targname = strndup(start, target - start);
+	*targname = STRNDUP(start, target - start);
 
 	while(*target == '/')
 		target ++;
@@ -238,15 +339,31 @@ static char *get_component(char *target, char **targname)
 
 static struct inode_info *new_inode(struct tar_file *tar_file)
 {
+	static int warned = FALSE;
 	struct inode_info *inode;
 	int bytes = tar_file->link ? strlen(tar_file->link) + 1 : 0;
 
-	inode = malloc(sizeof(struct inode_info) + bytes);
-	if(inode == NULL)
-		MEM_ERROR();
+	inode = MALLOC(sizeof(struct inode_info) + bytes);
 
 	if(bytes)
 		memcpy(&inode->symlink, tar_file->link, bytes);
+
+	if(tar_file->buf.st_mtime < 0) {
+		/* Squashfs cannot store timestamps before the epoch
+		 * (1970-01-01), and so round up to zero.  But warn
+		 * the first time this happens
+		 */
+		if(!warned) {
+			ERROR("\nWARNING: File has timestamp before the epoch of "
+				"1970-01-01, this cannot be\nstored in "
+				"Squashfs.  Rounding to 1970-01-01.\nFurther "
+				"messages are supressed.\n\n");
+			warned = TRUE;
+		}
+
+		tar_file->buf.st_mtime = 0;
+	}
+
 	memcpy(&inode->buf, &tar_file->buf, sizeof(struct stat));
 	inode->read = FALSE;
 	inode->root_entry = FALSE;
@@ -282,10 +399,7 @@ static struct inode_info *copy_inode(struct inode_info *source)
 	struct inode_info *inode;
 	int bytes = S_ISLNK(source->buf.st_mode) ? strlen(source->symlink) + 1 : 0;
 
-	inode = malloc(sizeof(struct inode_info) + bytes);
-	if(inode == NULL)
-		MEM_ERROR();
-
+	inode = MALLOC(sizeof(struct inode_info) + bytes);
 	memcpy(inode, source, sizeof(struct inode_info) + bytes);
 
 	return inode;
@@ -314,10 +428,9 @@ static void fixup_tree(struct dir_info *dir)
 				buf.st_gid = default_gid;
 			else
 				buf.st_gid = getgid();
-			buf.st_mtime = time(NULL);
 			buf.st_dev = 0;
 			buf.st_ino = 0;
-			entry->inode = lookup_inode(&buf);
+			entry->inode = lookup_inode_flag(&buf, FALSE);
 			entry->inode->tar_file = NULL;
 			entry->inode->tarfile = TRUE;
 		}
@@ -513,9 +626,9 @@ static void put_file_buffer(struct file_buffer *file_buffer)
 	 * - fragments go to the process fragment threads,
 	 */
 	if(file_buffer->fragment)
-		queue_put(to_process_frag, file_buffer);
+		read_queue_put(to_process_frag, 0, file_buffer);
 	else
-		queue_put(to_deflate, file_buffer);
+		queue_cache_put(to_deflate, 0, file_buffer);
 }
 
 
@@ -606,7 +719,7 @@ static void skip_file(struct tar_file *tar_file)
 	int blocks = (tar_file->buf.st_size + block_size - 1) >> block_log, i;
 
 	for(i = 0; i < blocks; i++)
-		cache_block_put(seq_queue_get(to_main));
+		gen_cache_block_put(main_queue_get(to_main));
 
 	progress_bar_size(-blocks);
 }
@@ -623,12 +736,16 @@ static void read_tar_data(struct tar_file *tar_file)
 	blocks = (read_size + block_size - 1) >> block_log;
 
 	do {
-		file_buffer = cache_get_nohash(reader_buffer);
+		file_buffer = cache_get_nohash(reader[0].buffer);
 		file_buffer->file_size = read_size;
 		file_buffer->tar_file = tar_file;
-		file_buffer->sequence = sequence_count ++;
+		file_buffer->file_count = sequence ++;
+		file_buffer->block = 0;
+		file_buffer->version = 0;
 		file_buffer->noD = noD;
 		file_buffer->error = FALSE;
+		file_buffer->next_state = NEXT_FILE;
+		file_buffer->alignment = 0;
 
 		if((block + 1) < blocks) {
 			/* non-tail block should be exactly block_size */
@@ -684,20 +801,18 @@ static char *skip_components(char *filename, int size, int *sizep)
 
 static int read_sparse_value(struct tar_file *file, char *value, int map_entries)
 {
-	int bytes, res, i = 0;
+	int bytes, i = 0;
 	long long number;
 
 	while(1) {
-		res = sscanf(value, "%lld %n", &number, &bytes);
-		if(res < 1 || value[bytes] != ',')
+		number = read_pax_number(&value, ',');
+		if(number == -1)
 			goto failed;
 
 		file->map[i].offset = number;
 
-		value += bytes + 1;
-
-		res = sscanf(value, "%lld %n", &number, &bytes);
-		if(res < 1 || (value[bytes] != ',' && value[bytes] != '\0'))
+		number = read_pax_number_ext(value, &bytes);
+		if(number == -1 || (value[bytes] != ',' && value[bytes] != '\0'))
 			goto failed;
 
 		file->map[i++].number = number;
@@ -718,18 +833,20 @@ failed:
 static int read_pax_header(struct tar_file *file, long long st_size)
 {
 	long long size = (st_size + 511) & ~511;
-	char *data, *ptr, *end, *keyword, *value;
-	int res, length, bytes, vsize;
-	long long number;
+	char *data, *ptr, *keyword, *value;
+	int res, bytes, vsize;
+	long long length, number;
 	long long major = -1, minor = -1, realsize = -1;
 	int old_gnu_pax = FALSE, old_gnu_ver = -1;
 	int map_entries = 0, cur_entry = 0;
 	char *name = NULL;
 
-	data = malloc(size);
-	if(data == NULL)
-		MEM_ERROR();
+	if(size > INT_MAX) {
+		ERROR("The pax header of tarfile is too large\n");
+		return FALSE;
+	}
 
+	data = MALLOC(size + 1);
 	res = read_bytes(STDIN_FILENO, data, size);
 	if(res < size) {
 		if(res != -1)
@@ -737,22 +854,27 @@ static int read_pax_header(struct tar_file *file, long long st_size)
 		free(data);
 		return FALSE;
 	}
+	data[size] = '\0';
 
-	for(ptr = data, end = data + st_size; ptr < end;) {
+	for(ptr = data; st_size;) {
 		/*
 		 * What follows should be <length> <keyword>=<value>,
 		 * where <length> is the full length, including the
 		 * <length> field and newline
 		 */
-		res = sscanf(ptr, "%d%n", &length, &bytes);
-		if(res < 1 || length <= bytes || length > st_size)
+		length = read_pax_number_ext(ptr, &bytes);
+		if(length == -1 || length <= bytes || length > st_size)
 			goto failed;
 
+		st_size -= length;
 		length -= bytes;
 		ptr += bytes;
 
-		/* Skip whitespace */
-		for(; length && *ptr == ' '; length--, ptr++);
+		/* Skip mandatory whitespace */
+		if(*ptr != ' ')
+			goto failed;
+		ptr++;
+		length --;
 
 		/* Store and parse keyword */
 		for(keyword = ptr; length && *ptr != '='; length--, ptr++);
@@ -782,80 +904,84 @@ static int read_pax_header(struct tar_file *file, long long st_size)
 
 		/* Evaluate keyword */
 		if(strcmp(keyword, "size") == 0) {
-			res = sscanf(value, "%lld %n", &number, &bytes);
-			if(res < 1 || value[bytes] != '\0')
+			number = read_pax_number(&value, '\0');
+			if(number == -1)
 				goto failed;
 			file->buf.st_size = number;
 			file->have_size = TRUE;
 		} else if(strcmp(keyword, "uid") == 0) {
-			res = sscanf(value, "%lld %n", &number, &bytes);
-			if(res < 1 || value[bytes] != '\0')
+			number = read_pax_number(&value, '\0');
+			if(number == -1)
 				goto failed;
 			file->buf.st_uid = number;
+			if(file->buf.st_uid != number)
+				goto failed;
 			file->have_uid = TRUE;
 		} else if(strcmp(keyword, "gid") == 0) {
-			res = sscanf(value, "%lld %n", &number, &bytes);
-			if(res < 1 || value[bytes] != '\0')
+			number = read_pax_number(&value, '\0');
+			if(number == -1)
 				goto failed;
 			file->buf.st_gid = number;
+			if(file->buf.st_gid != number)
+				goto failed;
 			file->have_gid = TRUE;
 		} else if(strcmp(keyword, "mtime") == 0) {
-			res = sscanf(value, "%lld %n", &number, &bytes);
-			if(res < 1 || value[bytes] != '.')
+			int ok = read_pax_number_neg(value, &bytes, &number);
+			if(!ok || (value[bytes] != '.' && value[bytes] != '\0'))
 				goto failed;
 			file->buf.st_mtime = number;
+			if(file->buf.st_mtime != number)
+				goto failed;
 			file->have_mtime = TRUE;
 		} else if(strcmp(keyword, "uname") == 0)
-			file->uname = strdup(value);
+			file->uname = STRDUP(value);
 		else if(strcmp(keyword, "gname") == 0)
-			file->gname = strdup(value);
+			file->gname = STRDUP(value);
 		else if(strcmp(keyword, "path") == 0)
-			file->pathname = strdup(skip_components(value, vsize, NULL));
+			file->pathname = STRDUP(skip_components(value, vsize, NULL));
 		else if(strcmp(keyword, "linkpath") == 0)
-			file->link = strdup(value);
+			file->link = STRDUP(value);
 		else if(strcmp(keyword, "GNU.sparse.major") == 0) {
-			res = sscanf(value, "%lld %n", &number, &bytes);
-			if(res < 1 || value[bytes] != '\0')
+			number = read_pax_number(&value, '\0');
+			if(number == -1)
 				goto failed;
 			major = number;
 		} else if(strcmp(keyword, "GNU.sparse.minor") == 0) {
-			res = sscanf(value, "%lld %n", &number, &bytes);
-			if(res < 1 || value[bytes] != '\0')
+			number = read_pax_number(&value, '\0');
+			if(number == -1)
 				goto failed;
 			minor = number;
 		} else if(strcmp(keyword, "GNU.sparse.realsize") == 0) {
-			res = sscanf(value, "%lld %n", &number, &bytes);
-			if(res < 1 || value[bytes] != '\0')
+			number = read_pax_number(&value, '\0');
+			if(number == -1)
 				goto failed;
 			realsize = number;
 		} else if(strcmp(keyword, "GNU.sparse.name") == 0)
-			name = strdup(value);
+			name = STRDUP(value);
 		else if(strcmp(keyword, "GNU.sparse.size") == 0) {
-			res = sscanf(value, "%lld %n", &number, &bytes);
-			if(res < 1 || value[bytes] != '\0')
+			number = read_pax_number(&value, '\0');
+			if(number == -1)
 				goto failed;
 			realsize = number;
 			old_gnu_pax = 1;
 		} else if(strcmp(keyword, "GNU.sparse.numblocks") == 0 && old_gnu_pax == 1) {
-			res = sscanf(value, "%lld %n", &number, &bytes);
-			if(res < 1 || value[bytes] != '\0')
+			number = read_pax_number(&value, '\0');
+			if(number == -1 || number > SIZE_MAX / sizeof(struct file_map))
 				goto failed;
-			file->map = malloc(number * sizeof(struct file_map));
-			if(file->map == NULL)
-				MEM_ERROR();
+			file->map = MALLOC(number * sizeof(struct file_map));
 			map_entries = number;
 			cur_entry = 0;
 			old_gnu_pax = 2;
 		} else if(strcmp(keyword, "GNU.sparse.offset") == 0 && old_gnu_pax == 2 && old_gnu_ver != 1) {
-			res = sscanf(value, "%lld %n", &number, &bytes);
-			if(res < 1 || value[bytes] != '\0')
+			number = read_pax_number(&value, '\0');
+			if(number == -1)
 				goto failed;
 			if(cur_entry < map_entries)
 				file->map[cur_entry].offset = number;
 			old_gnu_ver = 0;
 		} else if(strcmp(keyword, "GNU.sparse.numbytes") == 0 && old_gnu_pax == 2 && old_gnu_ver != 1) {
-			res = sscanf(value, "%lld %n", &number, &bytes);
-			if(res < 1 || value[bytes] != '\0')
+			number = read_pax_number(&value, '\0');
+			if(number == -1)
 				goto failed;
 			if(cur_entry < map_entries)
 				file->map[cur_entry++].number = number;
@@ -943,9 +1069,7 @@ static struct file_map *read_sparse_headers(struct tar_file *file, struct short_
 		goto failed;
 	}
 
-	map = malloc(4 * sizeof(struct file_map));
-	if(map == NULL)
-		MEM_ERROR();
+	map = MALLOC(4 * sizeof(struct file_map));
 
 	/* There should always be at least one sparse entry */
 	map[0].offset = read_number(short_header->sparse[0].offset, 12);
@@ -981,7 +1105,7 @@ static struct file_map *read_sparse_headers(struct tar_file *file, struct short_
 
 	/* If we've read two or less entries, then we expect the isextended
 	 * entry to be FALSE */
-	isextended = read_number(&short_header->isextended, 1);
+	isextended = short_header->isextended;
 	if(i < 3 && isextended) {
 		ERROR("Invalid sparse header\n");
 		goto failed;
@@ -997,9 +1121,7 @@ static struct file_map *read_sparse_headers(struct tar_file *file, struct short_
 			goto failed;
 		}
 
-		map = realloc(map, (map_entries + 21) * sizeof(struct file_map));
-		if(map == NULL)
-			MEM_ERROR();
+		map = REALLOC(map, (map_entries + 21) * sizeof(struct file_map));
 
 		/* There may be up to 21 sparse entries in this long header.
 		 * An offset of 0 means unused */
@@ -1022,7 +1144,7 @@ static struct file_map *read_sparse_headers(struct tar_file *file, struct short_
 
 		/* If we've read less than 21 entries, then we expect the isextended
 		 * entry to be FALSE */
-		isextended = read_number(&long_header.isextended, 1);
+		isextended = long_header.isextended;
 		if(i < (map_entries + 21) && isextended) {
 			ERROR("Invalid sparse header\n");
 			goto failed;
@@ -1111,11 +1233,8 @@ static struct file_map *read_sparse_map(struct tar_file *file, int *entries)
 		else {
 			number = res;
 
-			if(i % 50 == 0) {
-				map = realloc(map, (i + 50) * sizeof(struct file_map));
-				if(map == NULL)
-					MEM_ERROR();
-			}
+			if(i % 50 == 0)
+				map = REALLOC(map, (i + 50) * sizeof(struct file_map));
 
 			map[i].offset = offset;
 			map[i++].number = number;
@@ -1137,13 +1256,13 @@ static void copy_tar_header(struct tar_file *dest, struct tar_file *source)
 {
 	memcpy(dest, source, sizeof(struct tar_file));
 	if(source->pathname)
-		dest->pathname = strdup(source->pathname);
+		dest->pathname = STRDUP(source->pathname);
 	if(source->link)
-		dest->link = strdup(source->link);
+		dest->link = STRDUP(source->link);
 	if(source->uname)
-		dest->uname = strdup(source->uname);
+		dest->uname = STRDUP(source->uname);
 	if(source->gname)
-		dest->gname = strdup(source->gname);
+		dest->gname = STRDUP(source->gname);
 }
 
 
@@ -1185,9 +1304,7 @@ static struct tar_file *read_tar_header(int *status)
 	char *filename, *user, *group;
 	static struct tar_file *global = NULL;
 
-	file = malloc(sizeof(struct tar_file));
-	if(file == NULL)
-		MEM_ERROR();
+	file = MALLOC(sizeof(struct tar_file));
 
 	if(global)
 		copy_tar_header(file, global);
@@ -1267,9 +1384,7 @@ again:
 			goto again;
 		case TAR_GXHDR:
 			if(global == NULL) {
-				global = malloc(sizeof(struct tar_file));
-				if(global == NULL)
-					MEM_ERROR();
+				global = MALLOC(sizeof(struct tar_file));
 				memset(global, 0, sizeof(struct tar_file));
 			}
 			res = read_pax_header(global, file->buf.st_size);
@@ -1311,17 +1426,14 @@ again:
 		filename = skip_components(header.prefix, 155, &size);
 		length1 = strnlen(filename, size);
 		length2 = strnlen(header.name, 100);
-		file->pathname = malloc(length1 + length2 + 2);
-		if(file->pathname == NULL)
-			MEM_ERROR();
-
+		file->pathname = MALLOC(length1 + length2 + 2);
 		memcpy(file->pathname, filename, length1);
 		file->pathname[length1] = '/';
 		memcpy(file->pathname + length1 + 1, header.name, length2);
 		file->pathname[length1 + length2 + 1] = '\0';
 	} else if (file->pathname == NULL) {
 		filename = skip_components(header.name, 100, &size);
-		file->pathname = strndup(filename, size);
+		file->pathname = STRNDUP(filename, size);
 	}
 
 	/* Ignore empty filenames */
@@ -1332,12 +1444,16 @@ again:
 
 	/* Read mtime */
 	if(file->have_mtime == FALSE) {
-		res = read_number(header.mtime, 12);
-		if(res == -1) {
+		int ok = read_number_neg(header.mtime, &res);
+		if(!ok) {
 			ERROR("Failed to read file mtime from tar header\n");
 			goto failed;
 		}
 		file->buf.st_mtime = res;
+		if(file->buf.st_mtime != res) {
+			ERROR("Failed to read file mtime from tar header\n");
+			goto failed;
+		}
 	}
 
 	/* Read mode and file type */
@@ -1366,7 +1482,7 @@ again:
 	if(file->uname)
 		user = file->uname;
 	else
-		user = strndup(header.user, 32);
+		user = STRNDUP(header.user, 32);
 
 	if(strlen(user)) {
 		struct passwd *pwuid = getpwnam(user);
@@ -1397,7 +1513,7 @@ again:
 	if(file->gname)
 		group = file->gname;
 	else
-		group = strndup(header.group, 32);
+		group = STRNDUP(header.group, 32);
 
 	if(strlen(group)) {
 		struct group *grgid = getgrnam(group);
@@ -1421,20 +1537,29 @@ again:
 
 	/* Read major and minor for device files */
 	if(type == S_IFCHR || type == S_IFBLK) {
-		int major, minor;
+		long long res, rdev;
+		unsigned long long major, minor;
 
-		major = read_number(header.major, 8);
-		if(major == -1) {
+		res = read_number(header.major, 8);
+		if(res == -1) {
 			ERROR("Failed to read device major tar header\n");
 			goto failed;
 		}
+		major = res;
 
-		minor = read_number(header.minor, 8);
-		if(minor == -1) {
+		res = read_number(header.minor, 8);
+		if(res == -1) {
 			ERROR("Failed to read device minor from tar header\n");
 			goto failed;
 		}
-		file->buf.st_rdev = (major << 8) | (minor & 0xff) | ((minor & ~0xff) << 12);
+		minor = res;
+
+		rdev = (major << 8) | (minor & 0xff) | ((minor & ~0xff) << 12);
+		file->buf.st_rdev = rdev;
+		if(file->buf.st_rdev != rdev) {
+			ERROR("Failed to read device major/minor from tar header\n");
+			goto failed;
+		}
 	}
 
 	/* Handle symbolic links */
@@ -1443,7 +1568,7 @@ again:
 		file->buf.st_mode = 0777 | S_IFLNK;
 
 		if(file->link == FALSE)
-			file->link = strndup(header.link, 100);
+			file->link = STRNDUP(header.link, 100);
 	}
 
 	/* Handle hard links */
@@ -1454,12 +1579,12 @@ again:
 			if(link != file->link) {
 				char *old = file->link;
 
-				file->link = strdup(link);
+				file->link = STRDUP(link);
 				free(old);
 			}
 		} else {
 			filename = skip_components(header.link, 100, &size);
-			file->link = strndup(filename, size);
+			file->link = STRNDUP(filename, size);
 		}
 	}
 
@@ -1503,17 +1628,17 @@ eof:
 }
 
 
-void read_tar_file()
+long long read_tar_file()
 {
 	struct tar_file *tar_file;
 	int status, res;
        
+	reader = get_readers(&res);
+
 	while(1) {
 		struct file_buffer *file_buffer;
 
-		file_buffer = malloc(sizeof(struct file_buffer));
-		if(file_buffer == NULL)
-			MEM_ERROR();
+		file_buffer = MALLOC(sizeof(struct file_buffer));
 
 		while(1) {
 			tar_file = read_tar_header(&status);
@@ -1546,8 +1671,12 @@ void read_tar_file()
 		file_buffer->cache = NULL;
 		file_buffer->fragment = FALSE;
 		file_buffer->tar_file = tar_file;
-		file_buffer->sequence = sequence_count ++;
-		seq_queue_put(to_main, file_buffer);
+		file_buffer->file_count = sequence ++;
+		file_buffer->block = 0;
+		file_buffer->version = 0;
+		file_buffer->error = FALSE;
+		file_buffer->next_state = NEXT_FILE;
+		main_queue_put(to_main, file_buffer);
 
 		if(status == TAR_EOF)
 			break;
@@ -1555,6 +1684,8 @@ void read_tar_file()
 		if(S_ISREG(tar_file->buf.st_mode))
 			read_tar_data(tar_file);
 	}
+
+	return sequence;
 }
 
 
@@ -1572,7 +1703,7 @@ squashfs_inode process_tar_file(int progress)
 	while(1) {
 		struct inode_info *link = NULL;
 
-		file_buffer = seq_queue_get(to_main);
+		file_buffer = main_queue_get(to_main);
 		if(file_buffer->tar_file == NULL)
 			break;
 
@@ -1663,8 +1794,6 @@ squashfs_inode process_tar_file(int progress)
 		buf.st_gid = getgid();
 	if(root_time_opt)
 		buf.st_mtime = root_time;
-	else
-		buf.st_mtime = time(NULL);
 	if(pseudo_override && global_uid_opt)
 		buf.st_uid = global_uid;
 
@@ -1672,7 +1801,7 @@ squashfs_inode process_tar_file(int progress)
 		buf.st_gid = global_gid;
 	buf.st_dev = 0;
 	buf.st_ino = 0;
-	dir_ent->inode = lookup_inode(&buf);
+	dir_ent->inode = lookup_inode_flag(&buf, root_time_opt);
 	dir_ent->inode->dummy_root_dir = TRUE;
 	dir_ent->dir = root_dir;
 	root_dir->dir_ent = dir_ent;

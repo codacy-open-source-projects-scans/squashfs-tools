@@ -2,7 +2,7 @@
  * Create a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2013, 2014, 2019, 2021, 2022, 2023, 2024
+ * Copyright (c) 2013, 2014, 2019, 2021, 2022, 2023, 2024, 2025
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -36,6 +36,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <limits.h>
 
 #include "squashfs_fs.h"
 #include "mksquashfs.h"
@@ -43,6 +44,8 @@
 #include "progressbar.h"
 #include "caches-queues-lists.h"
 #include "signals.h"
+#include "reader.h"
+#include "thread.h"
 
 static struct dir_ent *ent = NULL;
 
@@ -69,25 +72,28 @@ static void print_filename()
 		return;
 
 	if(dir_ent->our_dir->subpath[0] != '\0')
-		INFO("%s/%s\n", dir_ent->our_dir->subpath, dir_ent->name);
+		progressbar_info("%s/%s\n", dir_ent->our_dir->subpath, dir_ent->name);
 	else
-		INFO("/%s\n", dir_ent->name);
+		progressbar_info("/%s\n", dir_ent->name);
 }
 
 
 static void dump_state()
 {
+	int i, reader_threads;
+	struct reader *reader;
+
 	disable_progress_bar();
 
-	printf("Queue and Cache status dump\n");
-	printf("===========================\n");
+	printf("Queues, caches and threads status dump\n");
+	printf("======================================\n");
 
 	printf("file buffer queue (reader thread -> deflate thread(s))\n");
-	dump_queue(to_deflate);
+	dump_block_read_queue(to_deflate);
 
 	printf("uncompressed fragment queue (reader thread -> fragment"
 						" thread(s))\n");
-	dump_queue(to_process_frag);
+	dump_read_queue(to_process_frag);
 
 	printf("processed fragment queue (fragment thread(s) -> main"
 						" thread)\n");
@@ -100,31 +106,23 @@ static void dump_state()
 						" deflate thread(s))\n");
 	dump_queue(to_frag);
 
-	if(!reproducible) {
-		printf("locked frag queue (compressed frags waiting while multi-block"
-							" file is written)\n");
-		dump_queue(locked_fragment);
+	printf("compressed fragment queue (fragment deflate threads(s) ->"
+					"fragment order thread)\n");
 
-		printf("compressed block queue (main & fragment deflate threads(s) ->"
-						" writer thread)\n");
-		dump_queue(to_writer);
-	} else {
-		printf("compressed fragment queue (fragment deflate threads(s) ->"
-						"fragment order thread)\n");
+	dump_seq_queue(to_order, 0);
 
-		dump_seq_queue(to_order, 0);
+	printf("compressed block queue (main & fragment order threads ->"
+					" writer thread)\n");
+	dump_queue(to_writer);
 
-		printf("compressed block queue (main & fragment order threads ->"
-						" writer thread)\n");
-		dump_queue(to_writer);
+	reader = get_readers(&reader_threads);
+	for(i = 0; i < reader_threads; i++) {
+		printf("%s read cache %d (uncompressed blocks read by reader thread %d)\n", reader[i].type, i + 1, i + 1);
+		dump_cache(reader[i].buffer);
 	}
 
-	printf("read cache (uncompressed blocks read by reader thread)\n");
-	dump_cache(reader_buffer);
+	dump_write_cache(bwriter_buffer);
 
-	printf("block write cache (compressed blocks waiting for the writer"
-						" thread)\n");
-	dump_cache(bwriter_buffer);
 	printf("fragment write cache (compressed fragments waiting for the"
 						" writer thread)\n");
 	dump_cache(fwriter_buffer);
@@ -136,6 +134,8 @@ static void dump_state()
 	printf("fragment reserve cache (avoids pipeline stall if frag cache"
 						" full in dup check)\n");
 	dump_cache(reserve_cache);
+
+	dump_threads();
 
 	enable_progress_bar();
 }

@@ -2,7 +2,8 @@
  * Create a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2008, 2009, 2010, 2012, 2014, 2019, 2021, 2022, 2023, 2024
+ * Copyright (c) 2008, 2009, 2010, 2012, 2013, 2014, 2019, 2021, 2022, 2023,
+ * 2024, 2025
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -37,6 +38,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <regex.h>
+#include <limits.h>
 
 #include "squashfs_fs.h"
 #include "squashfs_swap.h"
@@ -49,6 +51,9 @@
 #include "tar.h"
 #include "action.h"
 #include "merge_sort.h"
+#include "alloc.h"
+#include "caches-queues-lists.h"
+#include "virt_disk_pos.h"
 
 /* compressed xattr table */
 static char *xattr_table = NULL;
@@ -95,7 +100,6 @@ extern void write_destination(int, long long, long long, void *);
 extern long long generic_write_table(long long, void *, int, void *, int);
 extern int mangle(char *, char *, int, int, int, int);
 extern char *pathname(struct dir_ent *);
-extern long long get_and_inc_pos(long long value);
 
 /* helper functions and definitions from read_xattrs.c */
 extern unsigned int read_xattrs_from_disk(int, struct squashfs_super_block *, int, long long *);
@@ -119,7 +123,7 @@ static int xattr_get_type(char *name)
 
 static void xattr_copy_prefix(struct xattr_list *xattr, int t, char *name)
 {
-	xattr->full_name = strdup(name);
+	xattr->full_name = STRDUP(name);
 	xattr->name = xattr->full_name + strlen(prefix_table[t].prefix);
 	xattr->size = strlen(xattr->name);
 }
@@ -154,6 +158,7 @@ static void *get_xattr_space(unsigned int req_size, long long *disk)
 {
 	int data_space;
 	unsigned short c_byte;
+	char *cur = data_cache;
 
 	/*
 	 * Move and compress cached uncompressed data into xattr table.
@@ -161,23 +166,22 @@ static void *get_xattr_space(unsigned int req_size, long long *disk)
 	while(cache_bytes >= SQUASHFS_METADATA_SIZE) {
 		if((xattr_size - xattr_bytes) <
 				((SQUASHFS_METADATA_SIZE << 1)) + 2) {
-			xattr_table = realloc(xattr_table, xattr_size +
+			xattr_table = REALLOC(xattr_table, xattr_size +
 				(SQUASHFS_METADATA_SIZE << 1) + 2);
-			if(xattr_table == NULL)
-				MEM_ERROR();
 			xattr_size += (SQUASHFS_METADATA_SIZE << 1) + 2;
 		}
 
-		c_byte = mangle(xattr_table + xattr_bytes + BLOCK_OFFSET,
-			data_cache, SQUASHFS_METADATA_SIZE,
-			SQUASHFS_METADATA_SIZE, noX, 0);
+		c_byte = mangle(xattr_table + xattr_bytes + BLOCK_OFFSET, cur,
+			SQUASHFS_METADATA_SIZE, SQUASHFS_METADATA_SIZE, noX, 0);
 		TRACE("Xattr block @ 0x%x, size %d\n", xattr_bytes, c_byte);
 		SQUASHFS_SWAP_SHORTS(&c_byte, xattr_table + xattr_bytes, 1);
 		xattr_bytes += SQUASHFS_COMPRESSED_SIZE(c_byte) + BLOCK_OFFSET;
-		memmove(data_cache, data_cache + SQUASHFS_METADATA_SIZE,
-			cache_bytes - SQUASHFS_METADATA_SIZE);
+		cur += SQUASHFS_METADATA_SIZE;
 		cache_bytes -= SQUASHFS_METADATA_SIZE;
 	}
+
+	if(cache_bytes && cur != data_cache)
+		memcpy(data_cache, cur, cache_bytes);
 
 	/*
 	 * Ensure there's enough space in the uncompressed data cache
@@ -185,10 +189,8 @@ static void *get_xattr_space(unsigned int req_size, long long *disk)
 	data_space = cache_size - cache_bytes;
 	if(data_space < req_size) {
 			int realloc_size = req_size - data_space;
-			data_cache = realloc(data_cache, cache_size +
+			data_cache = REALLOC(data_cache, cache_size +
 				realloc_size);
-			if(data_cache == NULL)
-				MEM_ERROR();
 			cache_size += realloc_size;
 	}
 
@@ -239,9 +241,7 @@ static struct dupl_id *check_id_dupl(struct xattr_list *xattr_list, int xattrs)
 
 	if(entry == NULL) {
 		/* no duplicate exists */
-		entry = malloc(sizeof(*entry));
-		if(entry == NULL)
-			MEM_ERROR();
+		entry = MALLOC(sizeof(*entry));
 		entry->xattrs = xattrs;
 		entry->xattr_list = xattr_list;
 		entry->xattr_id = SQUASHFS_INVALID_XATTR;
@@ -301,10 +301,8 @@ static int get_xattr_id(int xattrs, struct xattr_list *xattr_list,
 	int i, size = 0;
 	struct squashfs_xattr_id *xattr_id;
 
-	xattr_id_table = realloc(xattr_id_table, (xattr_ids + 1) *
+	xattr_id_table = REALLOC(xattr_id_table, (xattr_ids + 1) *
 		sizeof(struct squashfs_xattr_id));
-	if(xattr_id_table == NULL)
-		MEM_ERROR();
 
 	/* get total uncompressed size of xattr data, needed for stat */
 	for(i = 0; i < xattrs; i++)
@@ -344,10 +342,8 @@ long long write_xattrs()
 	while(cache_bytes) {
 		if((xattr_size - xattr_bytes) <
 				((SQUASHFS_METADATA_SIZE << 1)) + 2) {
-			xattr_table = realloc(xattr_table, xattr_size +
+			xattr_table = REALLOC(xattr_table, xattr_size +
 				(SQUASHFS_METADATA_SIZE << 1) + 2);
-			if(xattr_table == NULL)
-				MEM_ERROR();
 			xattr_size += (SQUASHFS_METADATA_SIZE << 1) + 2;
 		}
 
@@ -365,7 +361,7 @@ long long write_xattrs()
 	/*
 	 * Write compressed xattr table to file system
 	 */
-	start_bytes = get_and_inc_pos(xattr_bytes);
+	start_bytes = get_and_inc_dpos(xattr_bytes);
 	write_destination(fd, start_bytes, xattr_bytes, xattr_table);
 
 	/*
@@ -586,7 +582,6 @@ int read_xattrs(void *d, int type)
 	}
 
 	while(l1 || l2 || l3) {
-		struct xattr_list *x;
 		struct xattr_add *entry;
 
 		if(l1 && l2 && l3) {
@@ -651,18 +646,11 @@ int read_xattrs(void *d, int type)
 				 type != SQUASHFS_DIR_TYPE))
 			continue;
 
-		x = realloc(xattr_list, (i + 1) * sizeof(struct xattr_list));
-		if(x == NULL)
-			MEM_ERROR();
-		xattr_list = x;
-
+		xattr_list = REALLOC(xattr_list, (i + 1) * sizeof(struct xattr_list));
 		xattr_list[i].type = entry->type;
 		xattr_copy_prefix(&xattr_list[i], entry->type, entry->name);
 
-		xattr_list[i].value = malloc(entry->vsize);
-		if(xattr_list[i].value == NULL)
-			MEM_ERROR();
-
+		xattr_list[i].value = MALLOC(entry->vsize);
 		memcpy(xattr_list[i].value, entry->value, entry->vsize);
 		xattr_list[i].vsize = entry->vsize;
 
@@ -762,10 +750,7 @@ void save_xattrs()
 	 * Note we have to save the contents of the data cache because future
 	 * operations will delete the current contents
 	 */
-	sdata_cache = malloc(cache_bytes);
-	if(sdata_cache == NULL)
-		MEM_ERROR();
-
+	sdata_cache = MALLOC(cache_bytes);
 	memcpy(sdata_cache, data_cache, cache_bytes);
 	scache_bytes = cache_bytes;
 
@@ -795,10 +780,7 @@ void restore_xattrs()
 regex_t *xattr_regex(char *pattern, char *option)
 {
 	int error;
-	regex_t *preg = malloc(sizeof(regex_t));
-
-	if(preg == NULL)
-		MEM_ERROR();
+	regex_t *preg = MALLOC(sizeof(regex_t));
 
 	error = regcomp(preg, pattern, REG_EXTENDED|REG_NOSUB);
 
@@ -833,7 +815,7 @@ char *base64_decode(char *source, int size, int *bytes)
 	/* Calculate number of bytes the base64 encoding represents */
 	count = size * 3 / 4;
 
-	dest = malloc(count);
+	dest = MALLOC(count);
 
 	for(dest_ptr = (unsigned char *) dest; size; size --, source_ptr ++) {
 		int value = *source_ptr;
@@ -896,9 +878,7 @@ static char *hex_decode(char *source, int size, int *bytes)
 	if(size % 2 != 0)
 		return NULL;
 
-	dest = malloc(size >> 2);
-	if(dest == NULL)
-		MEM_ERROR();
+	dest = MALLOC(size >> 2);
 
 	for(dest_ptr = (unsigned char *) dest ; size; size --) {
 		int digit = *source_ptr ++;
@@ -959,10 +939,7 @@ static char *text_decode(char *source, int *bytes)
 		}
 	}
 
-	dest = malloc(size);
-	if(dest == NULL)
-		MEM_ERROR();
-
+	dest = MALLOC(size);
 	*bytes = size;
 
 	for(ptr = (unsigned char *) source, dest_ptr = dest; size; size --) {
@@ -1014,11 +991,8 @@ struct xattr_add *xattr_parse(char *str, char *pre, char *option)
 		goto failed;
 	}
 
-	entry = malloc(sizeof(struct xattr_add));
-	if(entry == NULL)
-		MEM_ERROR();
-
-	entry->name = strndup(str, value++ - str);
+	entry = MALLOC(sizeof(struct xattr_add));
+	entry->name = STRNDUP(str, value++ - str);
 	entry->type = xattr_get_type(entry->name);
 
 	if(entry->type == -1) {
@@ -1113,11 +1087,7 @@ struct xattr_add *xattr_parse(char *str, char *pre, char *option)
 		/* fall through */
 	default:
 		entry->vsize = strlen(value);
-		entry->value = malloc(entry->vsize);
-
-		if(entry->value == NULL)
-			MEM_ERROR();
-
+		entry->value = MALLOC(entry->vsize);
 		memcpy(entry->value, value, entry->vsize);
 	}
 

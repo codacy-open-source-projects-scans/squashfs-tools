@@ -2,7 +2,7 @@
  * Create a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2011, 2012, 2013, 2014, 2021, 2022
+ * Copyright (c) 2011, 2012, 2013, 2014, 2021, 2022, 2023, 2024, 2025
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -38,6 +38,7 @@
 #include <limits.h>
 #include <errno.h>
 #include <ctype.h>
+#include <strings.h>
 
 #include "squashfs_fs.h"
 #include "mksquashfs.h"
@@ -46,6 +47,7 @@
 #include "fnmatch_compat.h"
 #include "xattr.h"
 #include "symbolic_mode.h"
+#include "alloc.h"
 
 #define TRUE 1
 #define FALSE 0
@@ -99,6 +101,8 @@ static struct action_entry action_table[];
 
 static struct expr *parse_expr(int subexp);
 
+static int parse_number(char *start, long long *size, int *range, char **error);
+
 extern char *pathname(struct dir_ent *);
 
 /*
@@ -128,11 +132,8 @@ static int read_file(char *filename, char *type, int (parse_line)(char *))
 		while(1) {
 			int len;
 
-			if(total + (MAX_LINE + 1) > size) {
-				line = realloc(line, size += (MAX_LINE + 1));
-				if(line == NULL)
-					MEM_ERROR();
-			}
+			if(total + (MAX_LINE + 1) > size)
+				line = REALLOC(line, size += (MAX_LINE + 1));
 
 			err = fgets(line + total, MAX_LINE + 1, fd);
 			if(err == NULL)
@@ -248,9 +249,7 @@ static int get_token(char **string)
 
 	/* string */
 	if(str == NULL) {
-		str = malloc(STR_SIZE);
-		if(str == NULL)
-			MEM_ERROR();
+		str = MALLOC(STR_SIZE);
 		size = STR_SIZE;
 	}
 
@@ -289,17 +288,11 @@ static int get_token(char **string)
 		}
 
 		if(cur_size + 2 > size) {
-			char *tmp;
 			int offset = str_ptr - str;
 
 			size = (cur_size + 1  + STR_SIZE) & ~(STR_SIZE - 1);
-
-			tmp = realloc(str, size);
-			if(tmp == NULL)
-				MEM_ERROR();
-
-			str_ptr = tmp + offset;
-			str = tmp;
+			str = REALLOC(str, size);
+			str_ptr = str + offset;
 		}
 
 		*str_ptr ++ = *cur_ptr ++;
@@ -355,10 +348,7 @@ static struct expr *create_expr(struct expr *lhs, int op, struct expr *rhs)
 		return NULL;
 	}
 
-	expr = malloc(sizeof(*expr));
-	if (expr == NULL)
-		MEM_ERROR();
-
+	expr = MALLOC(sizeof(*expr));
 	expr->type = OP_TYPE;
 	expr->expr_op.lhs = lhs;
 	expr->expr_op.rhs = rhs;
@@ -375,10 +365,7 @@ static struct expr *create_unary_op(struct expr *lhs, int op)
 	if (lhs == NULL)
 		return NULL;
 
-	expr = malloc(sizeof(*expr));
-	if (expr == NULL)
-		MEM_ERROR();
-
+	expr = MALLOC(sizeof(*expr));
 	expr->type = UNARY_TYPE;
 	expr->unary_op.expr = lhs;
 	expr->unary_op.op = op;
@@ -414,10 +401,7 @@ static struct expr *parse_test(char *name)
 		return NULL;
 	}
 
-	expr = malloc(sizeof(*expr));
-	if (expr == NULL)
-		MEM_ERROR();
-
+	expr = MALLOC(sizeof(*expr));
 	expr->type = ATOM_TYPE;
 
 	expr->atom.test = test;
@@ -450,11 +434,8 @@ static struct expr *parse_test(char *name)
 			goto failed;
 		}
 
-		argv = realloc(argv, (args + 1) * sizeof(char *));
-		if (argv == NULL)
-			MEM_ERROR();
-
-		argv[args ++ ] = strdup(string);
+		argv = REALLOC(argv, (args + 1) * sizeof(char *));
+		argv[args ++ ] = STRDUP(string);
 
 		token = get_token(&string);
 
@@ -621,11 +602,8 @@ int parse_action(char *s, int verbose)
 			goto failed;
 		}
 
-		argv = realloc(argv, (args + 1) * sizeof(char *));
-		if (argv == NULL)
-			MEM_ERROR();
-
-		argv[args ++] = strdup(string);
+		argv = REALLOC(argv, (args + 1) * sizeof(char *));
+		argv[args ++] = STRDUP(string);
 
 		token = get_token(&string);
 
@@ -713,10 +691,8 @@ skip_args:
 		spec_list = &other_spec;
 	}
 	
-	*spec_list = realloc(*spec_list, (spec_count + 1) *
+	*spec_list = REALLOC(*spec_list, (spec_count + 1) *
 					sizeof(struct action));
-	if (*spec_list == NULL)
-		MEM_ERROR();
 
 	(*spec_list)[spec_count].type = action->type;
 	(*spec_list)[spec_count].action = action;
@@ -753,7 +729,7 @@ static char *_expr_log(char *string, int cmnd)
 
 	switch(cmnd) {
 	case LOG_ENABLE:
-		expr_msg = malloc(ALLOC_SZ);
+		expr_msg = MALLOC(ALLOC_SZ);
 		alloc_size = ALLOC_SZ;
 		cur_size = 0;
 		return expr_msg;
@@ -776,9 +752,7 @@ static char *_expr_log(char *string, int cmnd)
 		/* buffer too small, expand */
 		alloc_size = (cur_size + size + ALLOC_SZ - 1) & ~(ALLOC_SZ - 1);
 
-		expr_msg = realloc(expr_msg, alloc_size);
-		if(expr_msg == NULL)
-			MEM_ERROR();
+		expr_msg = REALLOC(expr_msg, alloc_size);
 	}
 
 	memcpy(expr_msg + cur_size, string, size);
@@ -1024,8 +998,8 @@ void eval_actions(struct dir_info *root, struct dir_ent *dir_ent)
 	int st_mode = dir_ent->inode->buf.st_mode;
 
 	action_data.name = dir_ent->name;
-	action_data.pathname = strdup(pathname(dir_ent));
-	action_data.subpath = strdup(subpathname(dir_ent));
+	action_data.pathname = STRDUP(pathname(dir_ent));
+	action_data.subpath = STRDUP(subpathname(dir_ent));
 	action_data.buf = &dir_ent->inode->buf;
 	action_data.depth = dir_ent->our_dir->depth;
 	action_data.dir_ent = dir_ent;
@@ -1058,8 +1032,8 @@ void *eval_frag_actions(struct dir_info *root, struct dir_ent *dir_ent, int tail
 	struct action_data action_data;
 
 	action_data.name = dir_ent->name;
-	action_data.pathname = strdup(pathname(dir_ent));
-	action_data.subpath = strdup(subpathname(dir_ent));
+	action_data.pathname = STRDUP(pathname(dir_ent));
+	action_data.subpath = STRDUP(subpathname(dir_ent));
 	action_data.buf = &dir_ent->inode->buf;
 	action_data.depth = dir_ent->our_dir->depth;
 	action_data.dir_ent = dir_ent;
@@ -1250,10 +1224,7 @@ static int parse_uid_args(struct action_entry *action, int args, char **argv,
 	if (uid == -1)
 		return 0;
 
-	uid_info = malloc(sizeof(struct uid_info));
-	if (uid_info == NULL)
-		MEM_ERROR();
-
+	uid_info = MALLOC(sizeof(struct uid_info));
 	uid_info->uid = uid;
 	*data = uid_info;
 
@@ -1271,10 +1242,7 @@ static int parse_gid_args(struct action_entry *action, int args, char **argv,
 	if (gid == -1)
 		return 0;
 
-	gid_info = malloc(sizeof(struct gid_info));
-	if (gid_info == NULL)
-		MEM_ERROR();
-
+	gid_info = MALLOC(sizeof(struct gid_info));
 	gid_info->gid = gid;
 	*data = gid_info;
 
@@ -1296,10 +1264,7 @@ static int parse_guid_args(struct action_entry *action, int args, char **argv,
 	if (gid == -1)
 		return 0;
 
-	guid_info = malloc(sizeof(struct guid_info));
-	if (guid_info == NULL)
-		MEM_ERROR();
-
+	guid_info = MALLOC(sizeof(struct guid_info));
 	guid_info->uid = uid;
 	guid_info->gid = gid;
 	*data = guid_info;
@@ -1390,10 +1355,7 @@ static int parse_empty_args(struct action_entry *action, int args,
 		return 0;
 	}
 
-	empty_data = malloc(sizeof(*empty_data));
-	if (empty_data == NULL)
-		MEM_ERROR();
-
+	empty_data = MALLOC(sizeof(*empty_data));
 	empty_data->val = val;
 	*data = empty_data;
 
@@ -1415,8 +1377,8 @@ int eval_empty_actions(struct dir_info *root, struct dir_ent *dir_ent)
 		return 0;
 
 	action_data.name = dir_ent->name;
-	action_data.pathname = strdup(pathname(dir_ent));
-	action_data.subpath = strdup(subpathname(dir_ent));
+	action_data.pathname = STRDUP(pathname(dir_ent));
+	action_data.subpath = STRDUP(subpathname(dir_ent));
 	action_data.buf = &dir_ent->inode->buf;
 	action_data.depth = dir_ent->our_dir->depth;
 	action_data.dir_ent = dir_ent;
@@ -1469,7 +1431,6 @@ static char *move_pathname(struct move_ent *move)
 {
 	struct dir_info *dest;
 	char *name, *pathname;
-	int res;
 
 	dest = (move->ops & ACTION_MOVE_MOVE) ?
 		move->dest : move->dir_ent->our_dir;
@@ -1477,12 +1438,9 @@ static char *move_pathname(struct move_ent *move)
 		move->name : move->dir_ent->name;
 
 	if(dest->subpath[0] != '\0')
-		res = asprintf(&pathname, "%s/%s", dest->subpath, name);
+		ASPRINTF(&pathname, "%s/%s", dest->subpath, name);
 	else
-		res = asprintf(&pathname, "/%s", name);
-
-	if(res == -1)
-		BAD_ERROR("asprintf failed in move_pathname\n");
+		ASPRINTF(&pathname, "/%s", name);
 
 	return pathname;
 }
@@ -1503,7 +1461,7 @@ static char *get_comp(char **pathname)
 		path ++;
 
 	*pathname = path;
-	return strndup(start, path - start);
+	return STRNDUP(start, path - start);
 }
 
 
@@ -1659,8 +1617,8 @@ void eval_move_actions(struct dir_info *root, struct dir_ent *dir_ent)
 	struct move_ent *move = NULL;
 
 	action_data.name = dir_ent->name;
-	action_data.pathname = strdup(pathname(dir_ent));
-	action_data.subpath = strdup(subpathname(dir_ent));
+	action_data.pathname = STRDUP(pathname(dir_ent));
+	action_data.subpath = STRDUP(subpathname(dir_ent));
 	action_data.buf = &dir_ent->inode->buf;
 	action_data.depth = dir_ent->our_dir->depth;
 	action_data.dir_ent = dir_ent;
@@ -1681,10 +1639,7 @@ void eval_move_actions(struct dir_info *root, struct dir_ent *dir_ent)
 
 		if(match) {
 			if(move == NULL) {
-				move = malloc(sizeof(*move));
-				if(move == NULL)
-					MEM_ERROR();
-
+				move = MALLOC(sizeof(*move));
 				move->ops = 0;
 				move->dir_ent = dir_ent;
 			}
@@ -1752,7 +1707,7 @@ static void move_dir(struct dir_ent *dir_ent)
 
 	/* update our directory's subpath name */
 	free(dir->subpath);
-	dir->subpath = strdup(subpathname(dir_ent));
+	dir->subpath = STRDUP(subpathname(dir_ent));
 
 	/* recursively update the subpaths of any sub-directories */
 	for(comp_ent = dir->list; comp_ent; comp_ent = comp_ent->next)
@@ -1811,7 +1766,7 @@ static void move_file(struct move_ent *move_ent)
 		 * parent directory's pathname to calculate the pathname
 		 */
 		if(dir_ent->nonstandard_pathname == NULL) {
-			dir_ent->nonstandard_pathname = strdup(filename);
+			dir_ent->nonstandard_pathname = STRDUP(filename);
 			if(dir_ent->source_name) {
 				free(dir_ent->source_name);
 				dir_ent->source_name = NULL;
@@ -1883,8 +1838,8 @@ int eval_prune_actions(struct dir_info *root, struct dir_ent *dir_ent)
 	struct action_data action_data;
 
 	action_data.name = dir_ent->name;
-	action_data.pathname = strdup(pathname(dir_ent));
-	action_data.subpath = strdup(subpathname(dir_ent));
+	action_data.pathname = STRDUP(pathname(dir_ent));
+	action_data.subpath = STRDUP(subpathname(dir_ent));
 	action_data.buf = &dir_ent->inode->buf;
 	action_data.depth = dir_ent->our_dir->depth;
 	action_data.dir_ent = dir_ent;
@@ -1909,9 +1864,7 @@ static int parse_xattr_args(struct action_entry *action, int args,
 	struct xattr_data *xattr_data;
 	int error;
 
-	xattr_data = malloc(sizeof(*xattr_data));
-	if (xattr_data == NULL)
-		MEM_ERROR();
+	xattr_data = MALLOC(sizeof(*xattr_data));
 
 	error = regcomp(&xattr_data->preg, argv[0], REG_EXTENDED|REG_NOSUB);
 	if(error) {
@@ -1940,8 +1893,8 @@ static struct xattr_data *eval_xattr_actions (struct action *spec,
 		return NULL;
 
 	action_data.name = dir_ent->name;
-	action_data.pathname = strdup(pathname(dir_ent));
-	action_data.subpath = strdup(subpathname(dir_ent));
+	action_data.pathname = STRDUP(pathname(dir_ent));
+	action_data.subpath = STRDUP(subpathname(dir_ent));
 	action_data.buf = &dir_ent->inode->buf;
 	action_data.depth = dir_ent->our_dir->depth;
 	action_data.dir_ent = dir_ent;
@@ -2044,8 +1997,8 @@ struct xattr_add *eval_xattr_add_actions(struct dir_info *root,
 	}
 
 	action_data.name = dir_ent->name;
-	action_data.pathname = strdup(pathname(dir_ent));
-	action_data.subpath = strdup(subpathname(dir_ent));
+	action_data.pathname = STRDUP(pathname(dir_ent));
+	action_data.subpath = STRDUP(subpathname(dir_ent));
 	action_data.buf = &dir_ent->inode->buf;
 	action_data.depth = dir_ent->our_dir->depth;
 	action_data.dir_ent = dir_ent;
@@ -2073,6 +2026,58 @@ struct xattr_add *eval_xattr_add_actions(struct dir_info *root,
 int xattr_add_actions()
 {
 	return xattr_add_count;
+}
+
+/*
+ * Align specific action code
+ */
+static int parse_align_arg(struct action_entry *action, int args, char **argv, void **data)
+{
+	struct align_data *align_data;
+	int bit, range;
+	char *error;
+	long long number, res = parse_number(argv[0], &number, &range, &error);
+
+	if(!res) {
+		SYNTAX_ERROR("Invalid alignment value because %s\n", error);
+		return 0;
+	}
+
+	if(range != NUM_EQ) {
+		SYNTAX_ERROR("Unexpected integer comparison operator in alignment value\n");
+		return 0;
+	}
+
+	if(number == 0) {
+		SYNTAX_ERROR("Alignment value cannot be zero\n");
+		return 0;
+	}
+
+	if(number > MAX_ALIGN) {
+		SYNTAX_ERROR("Alignment value too large\n");
+		return 0;
+	}
+
+	bit = ffs(number) - 1;
+	if(number & ~(1 << bit)) {
+		SYNTAX_ERROR("Alignment value not a pure power of 2\n");
+		return 0;
+	}
+
+	align_data = MALLOC(sizeof(struct align_data));
+	align_data->alignment = bit;
+	*data = align_data;
+
+	return 1;
+}
+
+
+static void align_action(struct action *action, struct dir_ent *dir_ent)
+{
+	struct inode_info *inode = dir_ent->inode;
+	struct align_data *data = action->data;
+
+	inode->alignment = data->alignment;
 }
 
 
@@ -2105,7 +2110,13 @@ static int parse_number(char *start, long long *size, int *range, char **error)
 	char *end;
 	long long number;
 
-	if (*start == '>' || *start == '+') {
+	if (*start == '>' && *(start + 1) == '=') {
+		*range = NUM_GREATER_EQ;
+		start += 2;
+	} else if (*start == '<' && *(start + 1) == '=') {
+		*range = NUM_LESS_EQ;
+		start += 2;
+	} else if (*start == '>' || *start == '+') {
 		*range = NUM_GREATER;
 		start ++;
 	} else if (*start == '<' || *start == '-') {
@@ -2179,10 +2190,7 @@ static int parse_number_arg(struct test_entry *test, struct atom *atom)
 		return 0;
 	}
 
-	number = malloc(sizeof(*number));
-	if (number == NULL)
-		MEM_ERROR();
-
+	number = MALLOC(sizeof(*number));
 	number->range = range;
 	number->size = size;
 
@@ -2224,10 +2232,7 @@ static int parse_range_args(struct test_entry *test, struct atom *atom)
 		return 0;
 	}
  
-	range = malloc(sizeof(*range));
-	if (range == NULL)
-		MEM_ERROR();
-
+	range = MALLOC(sizeof(*range));
 	range->start = start;
 	range->end = end;
 
@@ -2268,6 +2273,12 @@ static int NAME##_fn(struct atom *atom, struct action_data *action_data) \
 	case NUM_GREATER: \
 		match = VAR > number->size; \
 		break; \
+	case NUM_GREATER_EQ: \
+		match = VAR >= number->size; \
+		break; \
+	case NUM_LESS_EQ: \
+		match = VAR <= number->size; \
+		break; \
 	} \
 	\
 	return match; \
@@ -2295,14 +2306,10 @@ static int NAME##_fn(struct atom *atom, struct action_data *action_data) \
  */
 static int check_pathname(struct test_entry *test, struct atom *atom)
 {
-	int res;
 	char *name;
 
 	if(atom->argv[0][0] != '/') {
-		res = asprintf(&name, "/%s", atom->argv[0]);
-		if(res == -1)
-			BAD_ERROR("asprintf failed in check_pathname\n");
-
+		ASPRINTF(&name, "/%s", atom->argv[0]);
 		free(atom->argv[0]);
 		atom->argv[0] = name;
 	}
@@ -2358,7 +2365,7 @@ static char *get_start(char *s, int n)
 
 static int subpathname_fn(struct atom *atom, struct action_data *data)
 {
-	char *s = get_start(strdup(data->subpath), count_components(atom->argv[0]));
+	char *s = get_start(STRDUP(data->subpath), count_components(atom->argv[0]));
 	int res = fnmatch(atom->argv[0], s, FNM_PATHNAME|FNM_EXTMATCH);
 
 	free(s);
@@ -2448,10 +2455,7 @@ static int parse_user_arg(struct test_entry *test, struct atom *atom)
 		return 0;
 	}
 
-	number = malloc(sizeof(*number));
-	if(number == NULL)
-		MEM_ERROR();
-
+	number = MALLOC(sizeof(*number));
 	number->range = NUM_EQ;
 	number->size = size;
 
@@ -2479,10 +2483,7 @@ static int parse_group_arg(struct test_entry *test, struct atom *atom)
 		return 0;
 	}
 
-	number = malloc(sizeof(*number));
-	if(number == NULL)
-		MEM_ERROR();
-
+	number = MALLOC(sizeof(*number));
 	number->range = NUM_EQ;
 	number->size= size;
 
@@ -2562,10 +2563,7 @@ static int false_fn(struct atom *atom, struct action_data *action_data)
 static int parse_file_arg(struct test_entry *test, struct atom *atom)
 {
 	int res;
-	regex_t *preg = malloc(sizeof(regex_t));
-
-	if (preg == NULL)
-		MEM_ERROR();
+	regex_t *preg = MALLOC(sizeof(regex_t));
 
 	res = regcomp(preg, atom->argv[0], REG_EXTENDED);
 	if (res) {
@@ -2620,10 +2618,7 @@ static int file_fn(struct atom *atom, struct action_data *action_data)
 	close(pipefd[1]);
 
 	do {
-		buffer = realloc(buffer, size + 512);
-		if (buffer == NULL)
-			MEM_ERROR();
-
+		buffer = REALLOC(buffer, size + 512);
 		res = read_bytes(pipefd[0], buffer + size, 512);
 
 		if (res == -1)
@@ -2979,8 +2974,8 @@ static int readlink_fn(struct atom *atom, struct action_data *action_data)
 		goto finish;
 
 	eval_action.name = dir_ent->name;
-	eval_action.pathname = strdup(pathname(dir_ent));
-	eval_action.subpath = strdup(subpathname(dir_ent));
+	eval_action.pathname = STRDUP(pathname(dir_ent));
+	eval_action.subpath = STRDUP(subpathname(dir_ent));
 	eval_action.buf = &dir_ent->inode->buf;
 	eval_action.depth = dir_ent->our_dir->depth;
 	eval_action.dir_ent = dir_ent;
@@ -3081,8 +3076,8 @@ static int eval_fn(struct atom *atom, struct action_data *action_data)
 	}
 
 	eval_action.name = dir_ent->name;
-	eval_action.pathname = strdup(pathname(dir_ent));
-	eval_action.subpath = strdup(subpathname(dir_ent));
+	eval_action.pathname = STRDUP(pathname(dir_ent));
+	eval_action.subpath = STRDUP(subpathname(dir_ent));
 	eval_action.buf = &dir_ent->inode->buf;
 	eval_action.depth = dir_ent->our_dir->depth;
 	eval_action.dir_ent = dir_ent;
@@ -3151,10 +3146,7 @@ static int parse_perm_args(struct test_entry *test, struct atom *atom)
 	 */
 	mode = mode_execute(head, 0);
 
-	perm_data = malloc(sizeof(struct perm_data));
-	if (perm_data == NULL)
-		MEM_ERROR();
-
+	perm_data = MALLOC(sizeof(struct perm_data));
 	perm_data->op = op;
 	perm_data->mode = mode;
 
@@ -3331,6 +3323,7 @@ static struct action_entry action_table[] = {
 	{ "xattrs-exclude", XATTR_EXC_ACTION, 1, ACTION_ALL, parse_xattr_args, NULL},
 	{ "xattrs-include", XATTR_INC_ACTION, 1, ACTION_ALL, parse_xattr_args, NULL},
 	{ "xattrs-add", XATTR_ADD_ACTION, 1, ACTION_ALL, parse_xattr_add_args, NULL},
+	{ "align", ALIGN_ACTION, 1, ACTION_REG, parse_align_arg, align_action },
 	{ "noop", NOOP_ACTION, 0, ACTION_ALL, NULL, noop_action },
 	{ "", 0, -1, 0, NULL, NULL}
 };

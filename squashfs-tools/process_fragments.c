@@ -2,7 +2,7 @@
  * Create a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2014, 2021, 2022
+ * Copyright (c) 2014, 2019, 2021, 2022, 2024, 2025
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -37,8 +37,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <limits.h>
 
-#include "caches-queues-lists.h"
 #include "squashfs_fs.h"
 #include "mksquashfs.h"
 #include "mksquashfs_error.h"
@@ -46,11 +46,13 @@
 #include "info.h"
 #include "compressor.h"
 #include "process_fragments.h"
+#include "caches-queues-lists.h"
+#include "alloc.h"
 
 #define FALSE 0
 #define TRUE 1
 
-extern struct queue *to_process_frag;
+extern struct read_queue *to_process_frag;
 extern struct seq_queue *to_main;
 extern int sparse_files;
 extern long long start_offset;
@@ -262,18 +264,18 @@ void *frag_thrd(void *destination_file)
 	sigaddset(&sigmask, SIGUSR1);
 	pthread_sigmask(SIG_BLOCK, &sigmask, &old_mask);
 
-	fd = open(destination_file, O_RDONLY);
-	if(fd == -1)
-		BAD_ERROR("frag_thrd: can't open destination for reading\n");
+	if(duplicate_checking) {
+		fd = open(destination_file, O_RDONLY);
+		if(fd == -1)
+			BAD_ERROR("frag_thrd: can't open destination for reading\n");
 
-	data_buffer = malloc(SQUASHFS_FILE_MAX_SIZE);
-	if(data_buffer == NULL)
-		MEM_ERROR();
+		data_buffer = MALLOC(SQUASHFS_FILE_MAX_SIZE);
+	}
 
 	pthread_cleanup_push((void *) pthread_mutex_unlock, &dup_mutex);
 
 	while(1) {
-		struct file_buffer *file_buffer = queue_get(to_process_frag);
+		struct file_buffer *file_buffer = read_queue_get(to_process_frag);
 		struct file_buffer *buffer;
 		int sparse = checksum_sparse(file_buffer);
 		struct file_info *dupl_ptr;
@@ -303,8 +305,8 @@ void *frag_thrd(void *destination_file)
 		 * interested in the "low hanging fruit" of files which
 		 * consist of only a fragment
 		 */
-		if(file_buffer->file_size != file_buffer->size) {
-			seq_queue_put(to_main, file_buffer);
+		if(!duplicate_checking || file_buffer->file_size != file_buffer->size) {
+			main_queue_put(to_main, file_buffer);
 			continue;
 		}
 
@@ -352,9 +354,7 @@ void *frag_thrd(void *destination_file)
 				dupl_ptr->fragment->offset, file_size);
 			cache_block_put(buffer);
 			if(res == 0) {
-				struct file_buffer *dup = malloc(sizeof(*dup));
-				if(dup == NULL)
-					MEM_ERROR();
+				struct file_buffer *dup = MALLOC(sizeof(*dup));
 				memcpy(dup, file_buffer, sizeof(*dup));
 				cache_block_put(file_buffer);
 				dup->dupl_start = dupl_ptr;
@@ -365,7 +365,7 @@ void *frag_thrd(void *destination_file)
 			}
 		}
 
-		seq_queue_put(to_main, file_buffer);
+		main_queue_put(to_main, file_buffer);
 	}
 
 	pthread_cleanup_pop(0);
