@@ -1176,13 +1176,18 @@ static long long parse_uid(char *arg) {
 			return -1;
 		}
 	} else {
-		struct passwd *passwd = getpwnam(arg);
+		struct passwd *passwd;
 
-		if (passwd)
-			uid = passwd->pw_uid;
-		else {
-			SYNTAX_ERROR("Invalid uid or unknown user\n");
-			return -1;
+		for(;;) {
+			errno = 0;
+			passwd = getpwnam(arg);
+			if(passwd) {
+				uid = passwd->pw_uid;
+				break;
+			} else if(errno != EINTR) {
+				SYNTAX_ERROR("Invalid uid or unknown user\n");
+				return -1;
+			}
 		}
 	}
 
@@ -1200,13 +1205,18 @@ static long long parse_gid(char *arg) {
 			return -1;
 		}
 	} else {
-		struct group *group = getgrnam(arg);
+		struct group *group;
 
-		if (group)
-			gid = group->gr_gid;
-		else {
-			SYNTAX_ERROR("Invalid gid or unknown group\n");
-			return -1;
+		for(;;) {
+			errno = 0;
+			group = getgrnam(arg);
+			if (group) {
+				gid = group->gr_gid;
+				break;
+			} else if(errno != EINTR) {
+				SYNTAX_ERROR("Invalid gid or unknown group\n");
+				return -1;
+			}
 		}
 	}
 
@@ -2446,13 +2456,18 @@ static int parse_user_arg(struct test_entry *test, struct atom *atom)
 {
 	struct test_number_arg *number;
 	long long size;
-	struct passwd *uid = getpwnam(atom->argv[0]);
+	struct passwd *uid;
 
-	if(uid)
-		size = uid->pw_uid;
-	else {
-		TEST_SYNTAX_ERROR(test, 1, "Unknown user\n");
-		return 0;
+	for(;;) {
+		errno = 0;
+		uid = getpwnam(atom->argv[0]);
+		if(uid) {
+			size = uid->pw_uid;
+			break;
+		} else if(errno != EINTR) {
+			TEST_SYNTAX_ERROR(test, 1, "Unknown user\n");
+			return 0;
+		}
 	}
 
 	number = MALLOC(sizeof(*number));
@@ -2474,13 +2489,18 @@ static int parse_group_arg(struct test_entry *test, struct atom *atom)
 {
 	struct test_number_arg *number;
 	long long size;
-	struct group *gid = getgrnam(atom->argv[0]);
+	struct group *gid;
 
-	if(gid)
-		size = gid->gr_gid;
-	else {
-		TEST_SYNTAX_ERROR(test, 1, "Unknown group\n");
-		return 0;
+	for(;;) {
+		errno = 0;
+		gid = getgrnam(atom->argv[0]);
+		if(gid) {
+			size = gid->gr_gid;
+			break;
+		} else if(errno != EINTR) {
+			TEST_SYNTAX_ERROR(test, 1, "Unknown group\n");
+			return 0;
+		}
 	}
 
 	number = MALLOC(sizeof(*number));

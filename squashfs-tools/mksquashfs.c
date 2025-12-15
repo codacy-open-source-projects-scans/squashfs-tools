@@ -6352,11 +6352,16 @@ static int get_uid_from_arg(char *arg, unsigned int *uid)
 		*uid = res;
 		return 0;
 	} else {
-		struct passwd *id = getpwnam(arg);
+		struct passwd *id;
 
-		if(id) {
-			*uid = id->pw_uid;
-			return 0;
+		for(;;) {
+			errno = 0;
+			id = getpwnam(arg);
+			if(id) {
+				*uid = id->pw_uid;
+				return 0;
+			} else if(errno != EINTR)
+				break;
 		}
 	}
 
@@ -6377,11 +6382,16 @@ static int get_gid_from_arg(char *arg, unsigned int *gid)
 		*gid = res;
 		return 0;
 	} else {
-		struct group *id = getgrnam(arg);
+		struct group *id;
 
-		if(id) {
-			*gid = id->gr_gid;
-			return 0;
+		for(;;) {
+			errno = 0;
+			id = getgrnam(arg);
+			if(id) {
+				*gid = id->gr_gid;
+				return 0;
+			} else if(errno != EINTR)
+				break;
 		}
 	}
 
@@ -6626,7 +6636,9 @@ static int sqfstar(int argc, char *argv[])
 	always_use_fragments = TRUE;
 
 	for(i = 1; i < dest_index; i++) {
-		if(strcmp(argv[i], "-stream") == 0)
+		if(strcmp(argv[i], "-numeric-owner") == 0)
+			numeric_owner = TRUE;
+		else if(strcmp(argv[i], "-stream") == 0)
 			streaming = TRUE;
 		else if(strcmp(argv[i], "-no-pager") == 0)
 			; /* ignore, already parsed */
@@ -6652,25 +6664,29 @@ static int sqfstar(int argc, char *argv[])
 			readq = 4;
 		} else if(strcmp(argv[i], "-mkfs-time") == 0 ||
 				strcmp(argv[i], "-fstime") == 0) {
+			char *error;
+
 			if(++i == dest_index)
 				sqfstar_option_help(argv[i - 1], "sqfstar: %s missing time value\n", argv[i - 1]);
 			else if(strcmp(argv[i], "inode") == 0)
 				mkfs_inode_opt = TRUE;
 			else if(!parse_num_unsigned(argv[i], &mkfs_time) &&
-					!exec_date(argv[i], &mkfs_time))
-				sqfstar_option_help(argv[i - 1], "sqfstar: %s invalid time value\n", argv[i - 1]);
+					!exec_date(argv[i], &mkfs_time, &error))
+				sqfstar_option_help(argv[i - 1], "%ssqfstar: %s invalid time value\n", error, argv[i - 1]);
 			else {
 				mkfs_time_opt = TRUE;
 				clamping = FALSE;
 			}
 		} else if(strcmp(argv[i], "-all-time") == 0 || strcmp(argv[i], "-inode-time") == 0) {
+			char *error;
+
 			if(++i == dest_index)
 				sqfstar_option_help(argv[i - 1], "sqfstar: %s missing time value\n", argv[i - 1]);
 			else if(strcmp(argv[i], "inode") == 0)
 				inode_inode_opt = TRUE;
 			else if(!parse_num_unsigned(argv[i], &inode_time) &&
-					!exec_date(argv[i], &inode_time))
-				sqfstar_option_help(argv[i - 1], "sqfstar: %s invalid time value\n", argv[i - 1]);
+					!exec_date(argv[i], &inode_time, &error))
+				sqfstar_option_help(argv[i - 1], "%ssqfstar: %s invalid time value\n", error, argv[i - 1]);
 			else {
 				inode_time_opt = TRUE;
 				clamping = FALSE;
@@ -6684,11 +6700,13 @@ static int sqfstar(int argc, char *argv[])
 		else if(strcmp(argv[i], "-repro") == 0)
 			repro_opt = TRUE;
 		else if(strcmp(argv[i], "-repro-time") == 0) {
+			char *error;
+
 			if(++i == dest_index)
 				sqfstar_option_help(argv[i - 1], "sqfstar: -repro-time missing time value\n");
 			else if(!parse_num_unsigned(argv[i], &repro_time) &&
-					!exec_date(argv[i], &repro_time))
-				sqfstar_option_help(argv[i - 1], "sqfstar: -repro-time invalid time value\n", argv[i - 1]);
+					!exec_date(argv[i], &repro_time, &error))
+				sqfstar_option_help(argv[i - 1], "%ssqfstar: -repro-time invalid time value\n", error);
 			else
 				repro_time_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-mode") == 0) {
@@ -6728,13 +6746,15 @@ static int sqfstar(int argc, char *argv[])
 					sqfstar_option_help(argv[i - 1], "sqfstar: -uid-gid-offset invalid number\n");
 			}
 		} else if(strcmp(argv[i], "-root-time") == 0) {
+			char *error;
+
 			if(++i == dest_index)
 				sqfstar_option_help(argv[i - 1], "sqfstar: -root-time missing time value\n");
 			else if(strcmp(argv[i], "inode") == 0)
 				root_inode_opt = TRUE;
 			else if(!parse_num_unsigned(argv[i], &root_time) &&
-					!exec_date(argv[i], &root_time))
-				sqfstar_option_help(argv[i - 1], "sqfstar: -root-time invalid time value\n");
+					!exec_date(argv[i], &root_time, &error))
+				sqfstar_option_help(argv[i - 1], "%ssqfstar: -root-time invalid time value\n", error);
 			else
 				root_time_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-mode") == 0) {
@@ -7620,6 +7640,8 @@ int main(int argc, char *argv[])
 	for(i = option_offset; i < argc; i++) {
 		if(strcmp(argv[i], "-no-pager") == 0)
 			; /* ignore, already parsed */
+		else if(strcmp(argv[i], "-numeric-owner") == 0)
+			numeric_owner = TRUE;
 		else if(strcmp(argv[i], "-stream") == 0)
 			streaming = TRUE;
 		else if(strcmp(argv[i], "-cols") == 0)
@@ -7660,25 +7682,29 @@ int main(int argc, char *argv[])
 			force_single_threaded = TRUE;
 		} else if(strcmp(argv[i], "-mkfs-time") == 0 ||
 				strcmp(argv[i], "-fstime") == 0) {
+			char *error;
+
 			if(++i == argc)
 				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing time value\n", argv[i - 1]);
 			else if(strcmp(argv[i], "inode") == 0)
 				mkfs_inode_opt = TRUE;
 			else if(!parse_num_unsigned(argv[i], &mkfs_time) &&
-					!exec_date(argv[i], &mkfs_time))
-				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s invalid time value\n", argv[i - 1]);
+					!exec_date(argv[i], &mkfs_time, &error))
+				mksquashfs_option_help(argv[i - 1], "%smksquashfs: %s invalid time value\n", argv[i - 1], error);
 			else {
 				mkfs_time_opt = TRUE;
 				clamping = FALSE;
 			}
 		} else if(strcmp(argv[i], "-all-time") == 0 || strcmp(argv[i], "-inode-time") == 0) {
+			char *error;
+
 			if(++i == argc)
 				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s missing time value\n", argv[i - 1]);
 			else if(strcmp(argv[i], "inode") == 0)
 				inode_inode_opt = TRUE;
 			else if(!parse_num_unsigned(argv[i], &inode_time) &&
-					!exec_date(argv[i], &inode_time))
-				mksquashfs_option_help(argv[i - 1], "mksquashfs: %s invalid time value\n", argv[i - 1]);
+					!exec_date(argv[i], &inode_time, &error))
+				mksquashfs_option_help(argv[i - 1], "%smksquashfs: %s invalid time value\n", error, argv[i - 1]);
 			else {
 				inode_time_opt = TRUE;
 				clamping = FALSE;
@@ -7692,11 +7718,13 @@ int main(int argc, char *argv[])
 		else if(strcmp(argv[i], "-repro") == 0)
 			repro_opt = TRUE;
 		else if(strcmp(argv[i], "-repro-time") == 0) {
+			char *error;
+
 			if(++i == argc)
 				mksquashfs_option_help(argv[i - 1], "mksquashfs: -repro-time missing time value\n");
 			else if(!parse_num_unsigned(argv[i], &repro_time) &&
-					!exec_date(argv[i], &repro_time))
-				mksquashfs_option_help(argv[i - 1], "mksquashfs: -repro-time invalid time value\n");
+					!exec_date(argv[i], &repro_time, &error))
+				mksquashfs_option_help(argv[i - 1], "%smksquashfs: -repro-time invalid time value\n", error);
 			else
 				repro_time_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-mode") == 0) {
@@ -7736,13 +7764,15 @@ int main(int argc, char *argv[])
 					mksquashfs_option_help(argv[i - 1], "mksquashfs: -uid-gid-offset invalid number\n");
 			}
 		} else if(strcmp(argv[i], "-root-time") == 0) {
+			char *error;
+
 			if(++i == argc)
 				mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-time missing time value\n");
 			else if(strcmp(argv[i], "inode") == 0)
 				root_inode_opt = TRUE;
 			else if(!parse_num_unsigned(argv[i], &root_time) &&
-					!exec_date(argv[i], &root_time))
-				mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-time invalid time value\n");
+					!exec_date(argv[i], &root_time, &error))
+				mksquashfs_option_help(argv[i - 1], "%smksquashfs: -root-time invalid time value\n", error);
 			else
 				root_time_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-mode") == 0) {

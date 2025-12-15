@@ -34,6 +34,7 @@
 #include <grp.h>
 #include <time.h>
 #include <regex.h>
+#include <errno.h>
 
 #include "squashfs_fs.h"
 #include "mksquashfs.h"
@@ -57,6 +58,7 @@ int default_gid_opt = FALSE;
 unsigned int default_gid;
 int default_mode_opt = FALSE;
 struct mode_data *default_mode;
+int numeric_owner = FALSE;
 
 static long long sequence = 0;
 static struct reader *reader;
@@ -933,11 +935,13 @@ static int read_pax_header(struct tar_file *file, long long st_size)
 			if(file->buf.st_mtime != number)
 				goto failed;
 			file->have_mtime = TRUE;
-		} else if(strcmp(keyword, "uname") == 0)
-			file->uname = STRDUP(value);
-		else if(strcmp(keyword, "gname") == 0)
-			file->gname = STRDUP(value);
-		else if(strcmp(keyword, "path") == 0)
+		} else if(strcmp(keyword, "uname") == 0) {
+			if(!numeric_owner)
+				file->uname = STRDUP(value);
+		} else if(strcmp(keyword, "gname") == 0) {
+			if(!numeric_owner)
+				file->gname = STRDUP(value);
+		} else if(strcmp(keyword, "path") == 0)
 			file->pathname = STRDUP(skip_components(value, vsize, NULL));
 		else if(strcmp(keyword, "linkpath") == 0)
 			file->link = STRDUP(value);
@@ -1301,7 +1305,7 @@ static struct tar_file *read_tar_header(int *status)
 	struct tar_file *file;
 	long long res;
 	int size, type;
-	char *filename, *user, *group;
+	char *filename, *user = NULL, *group = NULL;
 	static struct tar_file *global = NULL;
 
 	file = MALLOC(sizeof(struct tar_file));
@@ -1479,15 +1483,27 @@ again:
 	 * fallback to using uid, either from PAX header (if have_uid TRUE),
 	 * or header.uid */
 	res = -1;
-	if(file->uname)
-		user = file->uname;
-	else
-		user = STRNDUP(header.user, 32);
 
-	if(strlen(user)) {
-		struct passwd *pwuid = getpwnam(user);
-		if(pwuid)
-			res = pwuid->pw_uid;
+	if(!numeric_owner) {
+		if(file->uname) {
+			user = file->uname;
+			file->uname = NULL;
+		} else
+			user = STRNDUP(header.user, 32);
+
+		if(strlen(user)) {
+			struct passwd *pwuid;
+
+			for(;;) {
+				errno = 0;
+				pwuid = getpwnam(user);
+				if(pwuid) {
+					res = pwuid->pw_uid;
+					break;
+				} else if(errno != EINTR)
+					break;
+			}
+		}
 	}
 		
 	if(res == -1) {
@@ -1510,15 +1526,27 @@ again:
 	 * fallback to using gid, either from PAX header (if have_gid TRUE),
 	 * or header.gid */
 	res = -1;
-	if(file->gname)
-		group = file->gname;
-	else
-		group = STRNDUP(header.group, 32);
 
-	if(strlen(group)) {
-		struct group *grgid = getgrnam(group);
-		if(grgid)
-			res = grgid->gr_gid;
+	if(!numeric_owner) {
+		if(file->gname) {
+			group = file->gname;
+			file->gname = NULL;
+		} else
+			group = STRNDUP(header.group, 32);
+
+		if(strlen(group)) {
+			struct group *grgid;
+
+			for(;;) {
+				errno = 0;
+				grgid = getgrnam(group);
+				if(grgid) {
+					res = grgid->gr_gid;
+					break;
+				} else if(errno != EINTR)
+					break;
+			}
+		}
 	}
 		
 	if(res == -1) {
