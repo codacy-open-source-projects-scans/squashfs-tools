@@ -30,7 +30,7 @@
 #include "alloc.h"
 
 int parse_octal_mode_args(char *source, char *cur_ptr, int args, char **argv,
-								void **data)
+						void **data, char **error)
 {
 	int n, bytes;
 	unsigned int mode;
@@ -77,7 +77,7 @@ int parse_octal_mode_args(char *source, char *cur_ptr, int args, char **argv,
  * PERMS = [rwxXst]+ or [ugo]
  */
 int parse_sym_mode_arg(char *source, char *cur_ptr, char *arg,
-	struct mode_data **head, struct mode_data **cur)
+	struct mode_data **head, struct mode_data **cur, char **error)
 {
 	struct mode_data *mode_data;
 	int mode;
@@ -214,13 +214,13 @@ failed:
 
 
 static int parse_sym_mode_args(char *source, char *cur_ptr, int args,
-				char **argv, void **data)
+				char **argv, void **data, char **error)
 {
 	int i, res = 1;
 	struct mode_data *head = NULL, *cur = NULL;
 
 	for (i = 0; i < args && res; i++)
-		res = parse_sym_mode_arg(source, cur_ptr, argv[i], &head, &cur);
+		res = parse_sym_mode_arg(source, cur_ptr, argv[i], &head, &cur, error);
 
 	*data = head;
 
@@ -229,19 +229,19 @@ static int parse_sym_mode_args(char *source, char *cur_ptr, int args,
 
 
 int parse_mode_args(char *source, char *cur_ptr, int args, char **argv,
-							void **data)
+						void **data, char **error)
 {
-	int res = parse_octal_mode_args(source, cur_ptr, args, argv, data);
+	int res = parse_octal_mode_args(source, cur_ptr, args, argv, data, error);
 
 	if(res >= 0)
 		/* Got an octal mode argument */
 		return res;
 	else  /* not an octal mode argument */
-		return parse_sym_mode_args(source, cur_ptr, args, argv, data);
+		return parse_sym_mode_args(source, cur_ptr, args, argv, data, error);
 }
 
 
-int parse_mode(char *source, struct mode_data **data)
+int parse_mode(char *source, struct mode_data **data, char **error)
 {
 	int args = 0, res = 0;
 	char **argv = NULL, *cur_ptr = source, *first = source;
@@ -260,7 +260,7 @@ int parse_mode(char *source, struct mode_data **data)
 	}
 
 	if(args) {
-		res = parse_mode_args(NULL, NULL, args, argv, (void **) data);
+		res = parse_mode_args(NULL, NULL, args, argv, (void **) data, error);
 
 		free(argv);
 	} else {

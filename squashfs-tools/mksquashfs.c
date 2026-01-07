@@ -6710,8 +6710,12 @@ static int sqfstar(int argc, char *argv[])
 			else
 				repro_time_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-mode") == 0) {
-			if((++i == dest_index) || !parse_mode(argv[i], &root_mode))
-				sqfstar_option_help(argv[i - 1], "sqfstar: -root-mode missing or invalid mode, symbolic mode or octal number expected\n");
+			char *error;
+
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -root-mode missing mode, symbolic mode or octal number expected\n");
+			else if(!parse_mode(argv[i], &root_mode, &error))
+				sqfstar_option_help(argv[i - 1], "%ssqfstar: -root-mode invalid mode, symbolic mode or octal number expected\n", error);
 			root_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-uid") == 0) {
 			if(++i == dest_index)
@@ -6758,8 +6762,12 @@ static int sqfstar(int argc, char *argv[])
 			else
 				root_time_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-mode") == 0) {
-			if((++i == dest_index) || !parse_mode(argv[i], &default_mode))
-				sqfstar_option_help(argv[i - 1], "sqfstar: -default-mode missing or invalid mode, symbolic mode or octal number expected\n");
+			char *error;
+
+			if(++i == dest_index)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -default-mode missing mode, symbolic mode or octal number expected\n");
+			else if(!parse_mode(argv[i], &default_mode, &error))
+				sqfstar_option_help(argv[i - 1], "%ssqfstar: -default-mode invalid mode, symbolic mode or octal number expected\n", error);
 			root_mode = default_mode;
 			default_mode_opt = root_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-uid") == 0) {
@@ -6927,12 +6935,20 @@ static int sqfstar(int argc, char *argv[])
 			global_uid = global_gid = 0;
 			global_uid_opt = global_gid_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-file-mode") == 0) {
-			if((++i == argc) || !parse_mode(argv[i], &global_file_mode))
-				sqfstar_option_help(argv[i - 1], "sqfstar: -force-file-mode missing or invalid mode, symbolic mode or octal number expected\n");
+			char *error;
+
+			if(++i == argc)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -force-file-mode missing mode, symbolic mode or octal number expected\n");
+			else if(!parse_mode(argv[i], &global_file_mode, &error))
+				sqfstar_option_help(argv[i - 1], "%ssqfstar: -force-file-mode invalid mode, symbolic mode or octal number expected\n", error);
 			global_file_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-dir-mode") == 0) {
-			if((++i == argc) || !parse_mode(argv[i], &global_dir_mode))
-				sqfstar_option_help(argv[i - 1], "sqfstar: -force-dir-mode missing or invalid mode, symbolic mode or octal number expected\n");
+			char *error;
+
+			if(++i == argc)
+				sqfstar_option_help(argv[i - 1], "sqfstar: -force-dir-mode missing mode, symbolic mode or octal number expected\n");
+			else if(!parse_mode(argv[i], &global_dir_mode, &error))
+				sqfstar_option_help(argv[i - 1], "%ssqfstar: -force-dir-mode invalid mode, symbolic mode or octal number expected\n", error);
 			global_dir_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-uid") == 0) {
 			if(++i == dest_index)
@@ -7728,8 +7744,12 @@ int main(int argc, char *argv[])
 			else
 				repro_time_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-mode") == 0) {
-			if((++i == argc) || !parse_mode(argv[i], &root_mode))
-				mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-mode missing or invalid mode, symbolic mode or octal number expected\n");
+			char *error;
+
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -root-mode missing mode, symbolic mode or octal number expected\n");
+			else if(!parse_mode(argv[i], &root_mode, &error))
+				mksquashfs_option_help(argv[i - 1], "%smksquashfs: -root-mode invalid mode, symbolic mode or octal number expected\n", error);
 			root_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-uid") == 0) {
 			if(++i == argc)
@@ -7776,8 +7796,12 @@ int main(int argc, char *argv[])
 			else
 				root_time_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-mode") == 0) {
-			if((++i == argc) || !parse_mode(argv[i], &default_mode))
-				mksquashfs_option_help(argv[i - 1], "mksquashfs: -default-mode missing or invalid mode, symbolic mode or octal number expected\n");
+			char *error;
+
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -default-mode invalid mode, symbolic mode or octal number expected\n");
+			else if(!parse_mode(argv[i], &default_mode, &error))
+				mksquashfs_option_help(argv[i - 1], "%smksquashfs: -default-mode invalid mode, symbolic mode or octal number expected\n", error);
 			root_mode = default_mode;
 			default_mode_opt = root_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-default-uid") == 0) {
@@ -8054,12 +8078,20 @@ int main(int argc, char *argv[])
 			global_uid = global_gid = 0;
 			global_uid_opt = global_gid_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-file-mode") == 0) {
-			if((++i == argc) || !parse_mode(argv[i], &global_file_mode))
-				mksquashfs_option_help(argv[i - 1], "mksquashfs: -force-file-mode missing or invalid mode, symbolic mode or octal number expected\n");
+			char *error;
+
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -force-file-mode missing mode, symbolic mode or octal number expected\n");
+			else if(!parse_mode(argv[i], &global_file_mode, &error))
+				mksquashfs_option_help(argv[i - 1], "%smksquashfs: -force-file-mode invalid mode, symbolic mode or octal number expected\n", error);
 			global_file_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-dir-mode") == 0) {
-			if((++i == argc) || !parse_mode(argv[i], &global_dir_mode))
-				mksquashfs_option_help(argv[i - 1], "mksquashfs: -force-dir-mode missing or invalid mode, symbolic mode or octal number expected\n");
+			char *error;
+
+			if(++i == argc)
+				mksquashfs_option_help(argv[i - 1], "mksquashfs: -force-dir-mode missing mode, symbolic mode or octal number expected\n");
+			else if(!parse_mode(argv[i], &global_dir_mode, &error))
+				mksquashfs_option_help(argv[i - 1], "%smksquashfs: -force-dir-mode invalid mode, symbolic mode or octal number expected\n", error);
 			global_dir_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-uid") == 0) {
 			if(++i == argc)
