@@ -3,7 +3,7 @@
  * filesystem.
  *
  * Copyright (c) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011,
- * 2012, 2013, 2014, 2017, 2019, 2020, 2021, 2022, 2023, 2024, 2025
+ * 2012, 2013, 2014, 2017, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -422,7 +422,7 @@ struct dir_info *scan1_opendir(char *pathname, char *subpath,
 							unsigned int depth);
 static void write_filesystem_tables(struct squashfs_super_block *sBlk);
 unsigned short get_checksum_mem(char *buff, int bytes);
-static void print_summary(struct squashfs_super_block *sBlk);
+static void print_summary();
 void write_destination(int fd, long long byte, long long bytes, void *buff);
 static int old_excluded(char *filename, struct stat *buf);
 static void write_superblock(struct squashfs_super_block *sBlk);
@@ -610,7 +610,7 @@ void restorefs()
 		unlink(recovery_file);
 
 	if(!quiet)
-		print_summary(&sBlk);
+		print_summary();
 
 	exit(1);
 }
@@ -5915,7 +5915,12 @@ static void write_filesystem_tables(struct squashfs_super_block *sBlk)
 
 static void write_superblock(struct squashfs_super_block *sBlk)
 {
-	long long block = streaming ? get_dpos() : SQUASHFS_START;
+	long long block;
+
+	if(streaming)
+		block = nopad ? get_dpos() : (get_dpos() + 4095) & ~4095;
+	else
+		block = SQUASHFS_START;
 
 	SQUASHFS_INSWAP_SUPER_BLOCK(sBlk);
 
@@ -6257,7 +6262,7 @@ static void print_version(char *string)
 }
 
 
-static void print_summary(struct squashfs_super_block *sBlk)
+static void print_summary()
 {
 	int i;
 
@@ -6271,10 +6276,10 @@ static void print_summary(struct squashfs_super_block *sBlk)
 		"compressed", noI || noId ? "uncompressed" : "compressed");
 	printf("\tduplicates are %sremoved\n", duplicate_checking ? "" :
 		"not ");
-	printf("Filesystem size %.2f Kbytes (%.2f Mbytes)\n", sBlk->bytes_used / 1024.0,
-		sBlk->bytes_used / (1024.0 * 1024.0));
+	printf("Filesystem size %.2f Kbytes (%.2f Mbytes)\n", get_dpos() / 1024.0,
+		get_dpos() / (1024.0 * 1024.0));
 	printf("\t%.2f%% of uncompressed filesystem size (%.2f Kbytes)\n",
-		((float) sBlk->bytes_used / total_bytes) * 100.0, total_bytes / 1024.0);
+		((float) get_dpos() / total_bytes) * 100.0, total_bytes / 1024.0);
 	printf("Inode table size %lld bytes (%.2f Kbytes)\n",
 		inode_bytes, inode_bytes / 1024.0);
 	printf("\t%.2f%% of uncompressed inode table size (%lld bytes)\n",
@@ -6464,12 +6469,17 @@ static void fix_file(char *filename)
 	if(res < sizeof(struct squashfs_super_block))
 		BAD_ERROR("Failed to read file \"%s\"\n", filename);
 
-	SQUASHFS_INSWAP_SUPER_BLOCK(&sblk);
-
-	if(sblk.s_magic != SQUASHFS_MAGIC_STREAMED)
+	if(sblk.s_magic != SQUASHFS_MAGIC_STREAMED && sblk.s_magic != SQUASHFS_MAGIC_STREAMED_SWAPPED)
 		BAD_ERROR("File \"%s\" is not a streamed Squashfs file, incorrect magic found!\n", filename);
 
-	offset = lseek(fd, -sizeof(struct squashfs_super_block), SEEK_END);
+	offset = lseek(fd, 0, SEEK_END);
+	if(offset == -1)
+		BAD_ERROR("Failed to lseek to end of file \"%s\"\n", filename);
+
+	if(offset < sizeof(struct squashfs_super_block))
+		BAD_ERROR("Filesystem too small, less than super block in size!\n");
+
+	offset = lseek(fd, offset - sizeof(struct squashfs_super_block), SEEK_SET);
 	if(offset == -1)
 		BAD_ERROR("Failed to lseek to end of file \"%s\"\n", filename);
 
@@ -6477,9 +6487,7 @@ static void fix_file(char *filename)
 	if(res < sizeof(struct squashfs_super_block))
 		BAD_ERROR("Failed to read file \"%s\"\n", filename);
 
-	SQUASHFS_INSWAP_SUPER_BLOCK(&sblk);
-
-	if(sblk.s_magic != SQUASHFS_MAGIC)
+	if(sblk.s_magic != SQUASHFS_MAGIC && sblk.s_magic != SQUASHFS_MAGIC_SWAP)
 		BAD_ERROR("File \"%s\" is not a streamed Squashfs file, incorrect magic found!\n", filename);
 
 	res = lseek(fd, SQUASHFS_START, SEEK_SET);
@@ -7435,9 +7443,8 @@ static int sqfstar(int argc, char *argv[])
 	}
 
 	if(!nopad && (i = get_dpos() & (4096 - 1))) {
-		long long block = get_and_inc_dpos(4096 - i);
 		char temp[4096] = {0};
-		write_destination(fd, block, 4096 - i, temp);
+		write_destination(fd, get_dpos(), 4096 - i, temp);
 	}
 
 	write_superblock(&sBlk);
@@ -7452,7 +7459,7 @@ static int sqfstar(int argc, char *argv[])
 		unlink(recovery_file);
 
 	if(!quiet)
-		print_summary(&sBlk);
+		print_summary();
 
 	if(logging)
 		fclose(log_fd);
@@ -8883,9 +8890,8 @@ int main(int argc, char *argv[])
 	}
 
 	if(!nopad && (i = get_dpos() & (4096 - 1))) {
-		long long block = get_and_inc_dpos(4096 - i);
 		char temp[4096] = {0};
-		write_destination(fd, block, 4096 - i, temp);
+		write_destination(fd, get_dpos(), 4096 - i, temp);
 	}
 
 	write_superblock(&sBlk);
@@ -8900,7 +8906,7 @@ int main(int argc, char *argv[])
 		unlink(recovery_file);
 
 	if(!quiet)
-		print_summary(&sBlk);
+		print_summary();
 
 	if(logging)
 		fclose(log_fd);
