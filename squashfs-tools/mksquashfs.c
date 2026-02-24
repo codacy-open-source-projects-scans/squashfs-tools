@@ -7223,8 +7223,8 @@ static int sqfstar(int argc, char *argv[])
 	 * Streaming is incompatible with the progress bar, percentage output,
 	 * info output to stdout, and summary output
 	 *
-	 * Complain if -force-progress or -percentage have been used, as they
-	 * produce a conflict
+	 * Complain if -force-progress, -percentage or -offset have been used,
+	 * as they produce a conflict
 	 */
 	if(streaming) {
 		if(force_progress)
@@ -7237,6 +7237,9 @@ static int sqfstar(int argc, char *argv[])
 		if(display_info && !info_file)
 			BAD_ERROR("-stream cannot be used with -info, use "
 				"-info-file instead\n");
+
+		if(start_offset)
+			BAD_ERROR("-stream cannot be used with -offset\n");
 
 		/*
 		 * When streaming Mksquashfs cannot do duplicate checking as it
@@ -8415,6 +8418,10 @@ int main(int argc, char *argv[])
 	if(tarfile && any_actions())
 		BAD_ERROR("Actions are unsupported when reading tar files\n");
 
+	/* If -tar option is set, then the -max-depth option cannot be used */
+	if(tarfile && max_depth_opt)
+		BAD_ERROR("-max-depth is not supported reading tar files\n");
+
 	/* If -tar option is set and there are exclude files (either -ef or -e),
 	 * then -wildcards must be set too.  The older legacy exclude code
 	 * cannot be used with tar files */
@@ -8440,8 +8447,8 @@ int main(int argc, char *argv[])
 	 * Streaming is incompatible with the progress bar, percentage output,
 	 * info output to stdout, and summary output
 	 *
-	 * Complain if -force-progress or -percentage have been used, as they
-	 * produce a conflict
+	 * Complain if -force-progress, -percentage or -offset have been used,
+	 * as they produce a conflict
 	 */
 	if(streaming) {
 		if(force_progress)
@@ -8449,6 +8456,9 @@ int main(int argc, char *argv[])
 
 		if(percentage)
 			BAD_ERROR("-stream cannot be used wih -percentage\n");
+
+		if(start_offset)
+			BAD_ERROR("-stream cannot be used with -offset\n");
 
 		/* -info cannot be used, unless it is to a file */
 		if(display_info && !info_file)
