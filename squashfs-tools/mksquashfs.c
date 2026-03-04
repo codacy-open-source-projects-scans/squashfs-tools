@@ -898,6 +898,9 @@ static int check_id_table_offset()
 {
 	int i;
 
+	if(uid_gid_offset == 0)
+		return TRUE;
+
 	INFO("Updating id table with -uid-gid-offset value %u", uid_gid_offset);
 
 	for(i = 0; i < id_count; i++) {
@@ -3369,7 +3372,9 @@ static struct inode_info *lookup_inode4(struct stat *buf, struct pseudo_dev *pse
 		 *   lazytime or relatime and the file has been created or
 		 *   modified since the last access.
 		 */
-#ifdef st_atime
+#ifdef __APPLE__
+		memset(&buf->st_atimespec, 0, sizeof(buf->st_atimespec));
+#elif defined(st_atime)
 		memset(&buf->st_atim, 0, sizeof(buf->st_atim));
 #else
 		memset(&buf->st_atime, 0, sizeof(buf->st_atime));
@@ -5214,12 +5219,19 @@ static squashfs_inode no_sources(int progress)
 	struct pseudo_dev *pseudo_dev;
 	struct pseudo *pseudo = get_pseudo();
 
-	if(pseudo == NULL || pseudo->names != 1 || strcmp(pseudo->head->name, "/") != 0) {
-		if(!pseudo_dir) {
-			ERROR_START("Source is \"-\", but no pseudo definition for \"/\"\n");
-			ERROR_EXIT("Did you forget to specify -cpiostyle or -tar?\n");
-			EXIT_MKSQUASHFS();
-		} else
+	if(!pseudo || pseudo->names != 1 || strcmp(pseudo->head->name, "/") != 0) {
+		if(!pseudo_dir)
+			BAD_ERROR("Source is \"-\", but no pseudo definition "
+				"for \"/\"\nDid you forget to specify "
+				"-cpiostyle or -tar?\n");
+		else
+			pseudo_dev = pseudo_dir;
+	} else if(!pseudo->head->dev) {
+		if(!pseudo_dir)
+			BAD_ERROR("Source is \"-\", but only XATTR pseudo "
+				"definition for \"/\"\nDid you forget to "
+				"specify -cpiostyle or -tar?\n");
+		else
 			pseudo_dev = pseudo_dir;
 	} else
 		pseudo_dev = pseudo->head->dev;

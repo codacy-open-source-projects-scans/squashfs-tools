@@ -1,5 +1,29 @@
 # SQUASHFS CHANGE LOG
 
+### 4.7.5 (01 MAR 2026): Bug fix release (mostly)
+
+1. New options & improvements
+    1. Mksquashfs/Sqfstar: new -numeric-owner option which uses the numeric uid and gid in the tarfile rather than the user name or the group name.
+    2. Error messages produced by the date command and symbolic mode parser printed by the pager rather than to stderr.
+
+2. Major bug fixes
+
+    1. Fix possible corruption of Squashfs filesystems if sparse files present (caused by elimination of "fragment block stall" in 4.7).
+    2. Fix pseudo file f/F definition (create file from output of command) when input has greater than a block of contiguous zeros (caused by sparse file reading optimisation in 4.7.3).
+    3. Fix issue where files which are larger than available buffer space will not be found to be a duplicate (caused by elimination of "fragment block stall" in 4.7).
+    4. Fix broken Mksquashfs -max-depth option.
+
+3. Minor bug fixes
+
+    1. Mksquashfs: segmentation fault if no sources and pseudo file root ("/") definition only defines an Xattr but no metadata.
+    2. Mksquashfs/Sqfstar: -offset should be rejected if -stream option used.
+    3. Mksquashfs: hard links to symbolic links may be ignored (first access to symbolic link after creation).
+    4. Pseudo files: a M (modify with timestamp) definition on a directory causes pseudo file definitions below it in hierarchy to be ignored.
+    5. Pseudo files: a m/M modify definition breaks checks that a directory exists and it is a directory (rather than something else).
+    6. Mksquashfs: -max-depth option marks empty directories as having excluded files.
+    7. Mksquashfs/Sqfstar should produce identical output with only pseudo files.
+    8. Define SEEK_DATA if not defined by C library.
+
 ### 4.7.4 (09 NOV 2025): Bug fix release
 
 1. Fix regression introduced by SEEK_DATA optimisation
@@ -50,7 +74,7 @@
 11. Fix BLOCK_READER_THREADS typo in Makefile (Alexandru Ardelean).
 
 
-## 4.7 (03 JUNE 2025): Parallel file reading, new help system, new reproducible filesystem image options, removal of "fragment block stall"
+## 4.7 (03 JUN 2025): Parallel file reading, new help system, new reproducible filesystem image options, removal of "fragment block stall"
 
 1. Mksquashfs now reads files in parallel from the input directories
 
@@ -101,7 +125,7 @@
 6. Other improvements for Unsquashfs/Sqfscat
 
 	1. New -mem option, which sets the amount of memory to be used, K, M and G can be used to specify Kbytes, Mbytes and Gbytes.
-	2. New -mem-percent option, which sets the anount of memory to be used as percentage of available physical memory.
+	2. New -mem-percent option, which sets the amount of memory to be used as percentage of available physical memory.
 	3. Memory specified is limited to 75% of physical memory or less.
 
 7. New environment variable SQFS_CMDLINE (Mksquashfs/Unsquashfs)
@@ -359,7 +383,7 @@
     7. Unsquashfs, fix sparse file writing when holes are larger than 2^31-1.
     8. Add external CFLAGS and LDFLAGS support to Makefile, and allow build options to be specified on command line.  Also don't over-write passed in CFLAGS definition.
 
-## 4.1 (19 SEPT 2010): Major filesystem and tools improvements
+## 4.1 (19 SEP 2010): Major filesystem and tools improvements
 
 1. Filesystem improvements:
 
@@ -527,7 +551,7 @@ A code optimisation after testing unfortunately broke sorting in Mksquashfs.  Th
 7. Special support for files larger than 256 MB has been added to the Squashfs kernel code for faster read access.
 8. Inode numbers are now stored within the inode rather than being computed from inode location on disk (this is not so much an improvement, but a change forced by the previously listed improvements).
 
-## 2.2-r2 (8 SEPT 2005): Second release of 2.2, this release fixes a couple of small bugs, a couple of small documentation mistakes, and adds a patch for kernel 2.6.13. 
+## 2.2-r2 (8 SEP 2005): Second release of 2.2, this release fixes a couple of small bugs, a couple of small documentation mistakes, and adds a patch for kernel 2.6.13. 
 
 1. Mksquashfs now deletes the output filesystem image file if an error occurs whilst generating the filesystem.  Previously on error the image file was left empty or partially written.
 2. Updated mksquashfs so that it doesn't allow you to generate filesystems with block sizes smaller than 4K.  Squashfs hasn't supported block sizes less than 4K since 2.0-alpha.
@@ -574,7 +598,7 @@ If you're using a 2.6.8 kernel or later then you must use this 2.6.8.1 patch.  I
 
 It is worth mentioning that this kernel bug potentially affects other filesystems.  If you receive odd results with other filesystems you may be experiencing this bug with that filesystem.  I submitted a patch but this has not yet gone into the kernel, hopefully the bug will be fixed in later kernels. 
 
-## 2.0 (13 JULY 2004): A couple of new options, and some bug fixes
+## 2.0 (13 JUL 2004): A couple of new options, and some bug fixes
 
 1. New mksquashfs -all-root, -root-owned, -force-uid, and -force-gid options.  These allow the uids/gids of files in the generated filesystem to be specified, overriding the uids/gids in the source filesystem.
 2. Initrds are now supported for kernels 2.6.x.
