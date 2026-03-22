@@ -56,9 +56,8 @@ extern unsigned int inswap_le32(unsigned int);
 #define LZ4_NON_DEFAULT		2
 #define LZ4_FLAGS_MASK		3
 
-/* Default acceleration and compression */
+/* Default acceleration */
 #define LZ4_ACC_DEFAULT		1
-#define LZ4_COMP_DEFAULT	12
 
 struct lz4_comp_opts_v1 {
 	int version;
@@ -71,6 +70,31 @@ struct lz4_comp_opts_v2 {
 	int data;
 };
 
-#define COMPRESS(src, dest, size, max)		 LZ4_compress_fast(src, dest, size, max, acceleration)
-#define COMPRESS_HC(src, dest, size, max)	 LZ4_compress_HC(src, dest, size, max, compression)
+#if LZ4_VERSION_NUMBER >= 10700
+#define OLD_LIBRARY_OPTION
+#define OLD_LIBRARY_EXTRACT
+#define COMPRESS(src, dest, size, max)		LZ4_compress_fast(src, dest, size, max, acceleration)
+#define COMPRESS_HC(src, dest, size, max)	LZ4_compress_HC(src, dest, size, max, compression)
+#define LZ4_COMP_DEFAULT			12
+#else
+#define OLD_LIBRARY_OPTION			{ \
+							if(acceleration_opt && acceleration != LZ4_ACC_DEFAULT) { \
+								fprintf(stderr, "lz4: lz4 library is too old (pre r129) " \
+									"to support acceleration!\n"); \
+								return -1; \
+							} \
+						}
+#define OLD_LIBRARY_EXTRACT			{ \
+							if(acceleration != LZ4_ACC_DEFAULT) { \
+								fprintf(stderr, "lz4: append filesystem uses " \
+									"non-default acceleration and the lz4 library " \
+									"is too old (pre r129) to support " \
+									"acceleration!\n"); \
+								return -1; \
+							} \
+						}
+#define COMPRESS(src, dest, size, max)		LZ4_compress_limitedOutput(src, dest, size, max)
+#define COMPRESS_HC(src, dest, size, max)	LZ4_compressHC2_limitedOutput(src, dest, size, max, compression)
+#define LZ4_COMP_DEFAULT			9
+#endif
 #endif

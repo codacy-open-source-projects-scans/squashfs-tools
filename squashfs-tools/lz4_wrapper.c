@@ -123,6 +123,8 @@ static int lz4_options_post(int block_size)
 		return -1;
 	}
 
+	OLD_LIBRARY_OPTION;
+
 	return 0;
 }
 
@@ -244,6 +246,8 @@ static int lz4_extract_options(int block_size, void *buffer, int size)
 			hc = TRUE;
 		} else
 			acceleration = comp_opts->data;
+
+		OLD_LIBRARY_EXTRACT;
 
 		return 0;
 	}
@@ -416,7 +420,7 @@ static void lz4_usage(FILE *stream, int cols)
 {
 	autowrap_print(stream, "\t  -Xhc\n", cols);
 	autowrap_print(stream, "\t\tCompress using LZ4 High Compression\n", cols);
-	autowrap_print(stream, "\t  -Xaccelerate <acceleration>\n\tAccelerate "
+	autowrap_print(stream, "\t  -Xacceleration <acceleration>\n\tAccelerate "
 		"compresssion by <acceleration>.  <acceleration> should be "
 		"between 1 .. 65537 (default 1).  Option doesn't apply to LZ4 "
 		"High Compression\n", cols);
