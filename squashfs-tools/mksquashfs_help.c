@@ -58,8 +58,9 @@ static char *mksquashfs_options[]={
 	/* pseudo options */
 	"-p", "-pd", "-pd", "-pf", "-pseudo-override", "", "", "",
 	/* filter options */
-	"-sort", "-ef", "-wildcards", "-regex", "-max-depth", "-one-file-system",
-	"-one-file-system-x", "", "", "",
+	"-dereference", "-deref", "-deref-path", "-ef", "-wildcards", "-regex",
+	"-max-depth", "-one-file-system", "-one-file-system-x", "-sort", "", "",
+	"",
 	/* xattrs options */
 	"-no-xattrs", "-xattrs", "-xattrs-exclude", "-xattrs-include",
 	"-xattrs-add", "", "", "",
@@ -141,7 +142,8 @@ static char *mksquashfs_args[]={
 	"<pseudo-definition>", "<d mode uid gid>", "<D time mode uid gid>",
 	"<pseudo-file>", "", "", "", "",
 	/* filter options */
-	"<sort-file>", "<exclude-file>", "", "", "<levels>", "", "", "", "", "",
+	"", "<response>", "<name>", "<exclude-file>", "", "", "<levels>", "",
+	"", "<sort-file>", "", "", "",
 	/* xattrs options */
 	"", "", "<regex>", "<regex>", "<name=val>", "", "", "",
 	/* runtime options */
@@ -316,10 +318,20 @@ static char *mksquashfs_text[]={
 		"should not be quoted\n",
 	"-pseudo-override\tmake pseudo file uids and gids override -all-root, "
 		"-force-uid and -force-gid options\n",
-	"\n", "Filesystem filter options:", "\n",
-	"-sort <sort-file>\tsort files according to priorities in <sort-file>."
-		"  One file or dir with priority per line.  Priority -32768 "
-		"to 32767, default priority 0\n",
+	"\n", "Filesystem filter and selection options:", "\n",
+	"-dereference\t\tfollow symbolic links, and store the files "
+		"they point to rather than the symbolic link.  If a "
+		"symbolic link cannot be dereferenced then delete it "
+		"(see -deref for an alternative)\n",
+	"-deref <response>\tfollow symbolic links like the -dereference "
+		"option, but where <response> determines what Mksquashfs does "
+		"if it cannot dereference the symbolic link.  \"keep\" keeps "
+		"the symbolic link, and \"delete\" deletes the symbolic link\n",
+	"-deref-path <name>\tfollow the symbolic link with pathname <name>, "
+		"and store the file(s) it points to, rather than the symbolic "
+		"link.  If the symbolic link cannot be dereferenced then "
+		"delete it (use deref action if you want to keep it).  "
+		"Pathname <name> refers to the output filesystem being built\n",
 	"-ef <exclude-file>\tlist of exclude dirs/files.  One per line\n",
 	"-wildcards\t\tallow extended shell wildcards (globbing) to be used "
 		"in exclude dirs/files\n",
@@ -334,6 +346,9 @@ static char *mksquashfs_text[]={
 	"-one-file-system-x\tdo not cross filesystem boundaries. Like "
 		"-one-file-system option except directories are also ignored "
 		"if they cross the boundary\n",
+	"-sort <sort-file>\tsort files according to priorities in <sort-file>."
+		"  One file or dir with priority per line.  Priority -32768 "
+		"to 32767, default priority 0\n",
 	"\n", "Filesystem extended attribute (xattrs) options:", "\n",
 	"-no-xattrs\t\tdo not store extended attributes" NOXOPT_STR "\n",
 	"-xattrs\t\t\tstore extended attributes" XOPT_STR "\n",
